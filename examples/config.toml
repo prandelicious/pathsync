@@ -1,0 +1,29 @@
+default_job = "vlog"
+parallel = 4
+
+[jobs.vlog]
+enabled = true
+source = "/Volumes/Go-Ultra/DCIM/Camera01"
+target = "/Volumes/T7/Videos/Vlog"
+extensions = ["mp4", "jpg"]
+compare = { mode = "size_mtime" }
+transfer = { mode = "adaptive", large_file_threshold_mb = 100 }
+layout = "year_month"
+
+[jobs.flat_example]
+enabled = true
+source = "/path/to/source"
+target = "/path/to/target"
+extensions = ["mp4", "jpg", "png"]
+compare = { mode = "path" }
+transfer = { mode = "standard" }
+layout = "flat"
+
+[jobs.template_example]
+enabled = false
+source = "/path/to/source"
+target = "/path/to/target"
+extensions = ["mp4", "jpg"]
+compare = { mode = "size_mtime" }
+transfer = { mode = "adaptive", large_file_threshold_mb = 250 }
+layout = { kind = "template", value = "{year}/{month}/{ext}/{filename}" }

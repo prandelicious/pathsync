@@ -1,0 +1,20 @@
+[package]
+name = "pathsync"
+version = "0.1.0"
+edition = "2024"
+default-run = "pathsync"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+chrono-tz = "0.10"
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+dirs = "6"
+exif = { package = "kamadak-exif", version = "0.6" }
+filetime = "0.2"
+indicatif = { version = "0.18", features = ["in_memory"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "0.9"
+walkdir = "2"
