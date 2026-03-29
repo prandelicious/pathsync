@@ -437,6 +437,7 @@ dependencies = [
  "filetime",
  "indicatif",
  "kamadak-exif",
+ "libc",
  "serde",
  "thiserror",
  "toml",

@@ -1,13 +1,14 @@
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use filetime::{FileTime, set_file_mtime};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write};
+use std::fs;
+use std::io::{self, ErrorKind, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::ResolvedJob;
+use crate::copy_fast_path::{CopyTransferError, CopyTransferOperation, copy_file_data};
 use crate::error::{CopyError, CopyFailure, CopyFailureClassification, CopyOperation};
 use crate::format::{format_duration, human_bytes, human_rate};
 use crate::plan::TransferPlan;
@@ -17,7 +18,6 @@ use crate::progress_format::{
 };
 use crate::progress_model::{PhaseKind, ProgressSnapshot, active_worker_slots, phase_label};
 
-const COPY_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const WORKER_NAME_WIDTH: usize = 36;
 const PLAIN_PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
 const SUMMARY_FILE_PREVIEW_LIMIT: usize = 8;
@@ -52,16 +52,11 @@ enum WorkerEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 enum SizeBucket {
     Large,
+    #[default]
     Small,
-}
-
-impl Default for SizeBucket {
-    fn default() -> Self {
-        Self::Small
-    }
 }
 
 #[derive(Debug, Default)]
@@ -418,70 +413,11 @@ fn copy_file(
     }
 
     let copy_result = (|| -> Result<u64, CopyFailure> {
-        let source_file = File::open(&plan.source).map_err(|err| {
-            copy_failure(
-                plan,
-                CopyOperation::OpenSource,
-                err,
-                format!("failed to open source file: {}", plan.source.display()),
-            )
-        })?;
-        let metadata = source_file.metadata().map_err(|err| {
-            copy_failure(
-                plan,
-                CopyOperation::OpenSource,
-                err,
-                format!("failed to stat source file: {}", plan.source.display()),
-            )
-        })?;
-        let mut reader = BufReader::with_capacity(COPY_BUFFER_SIZE, source_file);
-        let temp_file = File::create(&temp_dest).map_err(|err| {
-            copy_failure(
-                plan,
-                CopyOperation::CreateTemp,
-                err,
-                format!("failed to create temp file: {}", temp_dest.display()),
-            )
-        })?;
-        let mut writer = BufWriter::with_capacity(COPY_BUFFER_SIZE, temp_file);
-        let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
-        let mut copied = 0_u64;
-
-        loop {
-            let read = reader.read(&mut buffer).map_err(|err| {
-                copy_failure(
-                    plan,
-                    CopyOperation::Read,
-                    err,
-                    format!("failed reading {}", plan.source.display()),
-                )
-            })?;
-            if read == 0 {
-                break;
-            }
-
-            writer.write_all(&buffer[..read]).map_err(|err| {
-                copy_failure(
-                    plan,
-                    CopyOperation::Write,
-                    err,
-                    format!("failed writing {}", temp_dest.display()),
-                )
-            })?;
-            copied += read as u64;
-
+        let transfer = copy_file_data(&plan.source, &temp_dest, |copied| {
             let _ = tx.send(WorkerEvent::Progress { worker, copied });
-        }
-
-        writer.flush().map_err(|err| {
-            copy_failure(
-                plan,
-                CopyOperation::Flush,
-                err,
-                format!("failed flushing {}", temp_dest.display()),
-            )
-        })?;
-        drop(writer);
+        })
+        .map_err(|err| copy_transfer_failure(plan, err, &temp_dest))?;
+        let metadata = transfer.metadata;
 
         fs::set_permissions(&temp_dest, metadata.permissions()).map_err(|err| {
             copy_failure(
@@ -516,7 +452,7 @@ fn copy_file(
             )
         })?;
 
-        Ok(copied)
+        Ok(transfer.bytes)
     })();
 
     if copy_result.is_err() && temp_dest.exists() {
@@ -542,6 +478,61 @@ fn copy_failure(
         raw_os_error,
         classification: classify_failure(kind, raw_os_error, operation),
         message,
+    }
+}
+
+fn copy_transfer_failure(
+    plan: &TransferPlan,
+    error: CopyTransferError,
+    temp_dest: &Path,
+) -> CopyFailure {
+    match error {
+        CopyTransferError::UnsupportedNative { reason } => copy_failure(
+            plan,
+            CopyOperation::Read,
+            io::Error::new(
+                ErrorKind::Unsupported,
+                format!("native copy unsupported: {reason:?}"),
+            ),
+            format!(
+                "failed copying {} -> {}",
+                plan.source.display(),
+                temp_dest.display()
+            ),
+        ),
+        CopyTransferError::Io { operation, source } => {
+            let operation = match operation {
+                CopyTransferOperation::StatSource | CopyTransferOperation::OpenSource => {
+                    CopyOperation::OpenSource
+                }
+                CopyTransferOperation::CreateDestination => CopyOperation::CreateTemp,
+                CopyTransferOperation::ReadSource => CopyOperation::Read,
+                CopyTransferOperation::WriteDestination => CopyOperation::Write,
+                CopyTransferOperation::FlushDestination => CopyOperation::Flush,
+                CopyTransferOperation::NativeCopy => CopyOperation::Write,
+            };
+
+            let message = match operation {
+                CopyOperation::OpenSource => {
+                    format!("failed to open source file: {}", plan.source.display())
+                }
+                CopyOperation::CreateTemp => {
+                    format!("failed to create temp file: {}", temp_dest.display())
+                }
+                CopyOperation::Read => format!("failed reading {}", plan.source.display()),
+                CopyOperation::Write => {
+                    format!(
+                        "failed copying {} -> {}",
+                        plan.source.display(),
+                        temp_dest.display()
+                    )
+                }
+                CopyOperation::Flush => format!("failed flushing {}", temp_dest.display()),
+                _ => unreachable!("transfer failure maps only to data-path operations"),
+            };
+
+            copy_failure(plan, operation, source, message)
+        }
     }
 }
 
@@ -1399,5 +1390,24 @@ mod tests {
             ),
             Some(1)
         );
+    }
+
+    #[test]
+    fn copy_transfer_errors_map_to_existing_copy_failures() {
+        let plan = plan("photo.jpg", 48);
+        let error = CopyTransferError::io(
+            CopyTransferOperation::NativeCopy,
+            io::Error::new(ErrorKind::BrokenPipe, "boom"),
+        );
+
+        let temp_dest = PathBuf::from("/target/photo.jpg.pathsync-part");
+        let failure = copy_transfer_failure(&plan, error, &temp_dest);
+
+        assert_eq!(failure.source, plan.source);
+        assert_eq!(failure.dest, Some(plan.dest));
+        assert_eq!(failure.operation, CopyOperation::Write);
+        assert_eq!(failure.kind, ErrorKind::BrokenPipe);
+        assert_eq!(failure.raw_os_error, None);
+        assert_eq!(failure.classification, CopyFailureClassification::Local);
     }
 }
