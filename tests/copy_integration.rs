@@ -93,6 +93,18 @@ fn run_pathsync(args: &[&str]) -> CommandOutput {
     }
 }
 
+fn run_bench_copy(args: &[&str]) -> CommandOutput {
+    let output = Command::new(env!("CARGO_BIN_EXE_bench-copy"))
+        .args(args)
+        .output()
+        .expect("failed to run bench-copy");
+    CommandOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        status: output.status,
+    }
+}
+
 struct CommandOutput {
     stdout: String,
     stderr: String,
@@ -329,6 +341,71 @@ parallel = 2
     assert!(!copied_files_section.contains("photo-11.jpg"));
 }
 
+#[test]
+fn bench_copy_defaults_to_all_and_includes_native_method() {
+    let root = TempDir::new("pathsync-bench-all");
+    let source_dir = root.path().join("source");
+    let target = root.path().join("target");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    write_file(&source_dir.join("photo.jpg"), b"bench-all-bytes");
+
+    let output = run_bench_copy(&[
+        "--source",
+        source_dir.join("photo.jpg").to_str().unwrap(),
+        "--target-dir",
+        target.to_str().unwrap(),
+        "--runs",
+        "1",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(output.stdout.contains("method: native"));
+    assert!(output.stdout.contains("method: buffered"));
+    assert!(output.stdout.contains("method: stdio"));
+    assert!(output.stdout.contains("comparison:"));
+
+    let _ = fs::remove_dir_all(root.path());
+}
+
+#[test]
+fn bench_copy_accepts_explicit_native_method() {
+    let root = TempDir::new("pathsync-bench-native");
+    let source_dir = root.path().join("source");
+    let target = root.path().join("target");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    write_file(&source_dir.join("photo.jpg"), b"bench-native-bytes");
+
+    let output = run_bench_copy(&[
+        "--source",
+        source_dir.join("photo.jpg").to_str().unwrap(),
+        "--target-dir",
+        target.to_str().unwrap(),
+        "--runs",
+        "1",
+        "--method",
+        "native",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(output.stdout.contains("method: native"));
+    assert!(!output.stdout.contains("method: buffered"));
+    assert!(!output.stdout.contains("comparison:"));
+
+    let _ = fs::remove_dir_all(root.path());
+}
+
 #[cfg(unix)]
 #[test]
 fn failure_path_does_not_report_all_copies_complete() {
@@ -471,6 +548,38 @@ parallel = 2
     assert!(output.stdout.contains("[systemic]"));
     assert!(output.stdout.contains("Systemic"));
     assert!(output.stdout.contains("yes"));
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_rename_cleans_up_temp_file() {
+    let root = TempDir::new("pathsync-temp-cleanup");
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    write_file(&source.join("photo.jpg"), b"cleanup-bytes");
+
+    let final_dest = target.join("photo.jpg");
+    fs::create_dir_all(&final_dest).unwrap();
+    let temp_dest = target.join("photo.jpg.pathsync-part");
+
+    let config_path = write_config(&root, &source, &target, "path", "\"flat\"");
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap(), "--force"]);
+
+    assert!(
+        !output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        !temp_dest.exists(),
+        "temp file was left behind: {}",
+        temp_dest.display()
+    );
+    assert!(final_dest.is_dir());
+    assert!(output.stdout.contains("copy failed") || output.stderr.contains("copy failed"));
 }
 
 #[test]

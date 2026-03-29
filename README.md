@@ -111,6 +111,21 @@ Filename patterns are not used for date extraction.
 - `Systemic` becomes `yes` when a job-wide failure pattern is detected.
 - Permission failures start as local and are promoted to systemic after 3 prior permission failures in the same job.
 
+## Copy Performance
+
+`pathsync` now picks OS-native full-file copy paths automatically when the platform supports them. Production config and CLI behavior are unchanged: there is no new transfer mode, flag, or tuning knob for this.
+
+When a native path is unavailable or cannot be used safely, `pathsync` falls back to the existing manual copy loop.
+
+## Benchmarking
+
+The `bench-copy` binary compares copy strategies on the same source and target storage.
+
+- `--method all` runs `native`, `buffered`, and `stdio`, and is the default.
+- `--method native` measures the production native copy path directly.
+- `--method both` remains backward-compatible and means `buffered` plus `stdio`.
+- `--method buffered` and `--method stdio` still measure the existing non-native paths individually.
+
 ## Example
 
 ```toml
