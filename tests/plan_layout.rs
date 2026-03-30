@@ -145,6 +145,43 @@ fn build_plan_reports_destination_collisions() {
 }
 
 #[test]
+fn build_plan_returns_planning_stats() {
+    let temp = TempDir::new();
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
+    fs::create_dir_all(source.join("nested")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+
+    write_file(&source.join("nested/a.jpg"), b"aaaa");
+    write_file(&source.join("nested/b.jpg"), b"bbbbbb");
+    write_file(&target.join("nested/b.jpg"), b"bbbbbb");
+
+    let job = PlanJob {
+        source: source.clone(),
+        target: target.clone(),
+        extensions: vec!["jpg".to_string()],
+        compare_policy: ComparePolicy::PathSize,
+        template: "{source_rel_dir}/{filename}".to_string(),
+    };
+
+    let build = build_plan(&job, false, |path, _metadata| {
+        Ok(sample_context(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .expect("utf-8 filename"),
+        ))
+    })
+    .unwrap();
+
+    assert_eq!(build.plans.len(), 1);
+    assert_eq!(build.stats.scanned_files, 2);
+    assert_eq!(build.stats.planned_files, 1);
+    assert_eq!(build.stats.planned_bytes, 4);
+    assert_eq!(build.stats.skipped_existing_files, 1);
+    assert_eq!(build.stats.skipped_existing_bytes, 6);
+}
+
+#[test]
 fn source_path_helpers_extract_relative_tokens() {
     let temp = TempDir::new();
     let source = temp.path().join("source");

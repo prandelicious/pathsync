@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use config::{CompareConfig, Config, LayoutConfig, ResolvedJob, TransferConfig};
 use error::PathsyncError;
-use plan::{FileContext, PlanJob, TransferPlan};
+use plan::{FileContext, PlanBuild, PlanJob, TransferPlan};
 
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
@@ -42,7 +42,8 @@ pub fn run(options: RunOptions) -> Result<(), PathsyncError> {
         options.allow_disabled,
         options.extensions.as_deref(),
     )?;
-    let plans = build_transfer_plan(&job, options.force)?;
+    let plan_build = build_transfer_plan_with_stats(&job, options.force)?;
+    let plans = plan_build.plans;
 
     if plans.is_empty() {
         println!("no new files to copy for job `{}`", job.name);
@@ -54,13 +55,20 @@ pub fn run(options: RunOptions) -> Result<(), PathsyncError> {
         return Ok(());
     }
 
-    Ok(copy::run_copy(&job, plans)?)
+    Ok(copy::run_copy(&job, plans, plan_build.stats)?)
 }
 
 pub fn build_transfer_plan(
     job: &ResolvedJob,
     force: bool,
 ) -> Result<Vec<TransferPlan>, PathsyncError> {
+    Ok(build_transfer_plan_with_stats(job, force)?.plans)
+}
+
+pub fn build_transfer_plan_with_stats(
+    job: &ResolvedJob,
+    force: bool,
+) -> Result<PlanBuild, PathsyncError> {
     let plan_job = PlanJob {
         source: job.source.clone(),
         target: job.target.clone(),

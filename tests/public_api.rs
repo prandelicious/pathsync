@@ -3,7 +3,7 @@ use std::fs;
 use pathsync::config;
 use pathsync::error::{ConfigError, PathsyncError};
 use pathsync::policy::{ComparePolicy, TimezonePolicy, TransferPolicy};
-use pathsync::{RunOptions, build_transfer_plan};
+use pathsync::{RunOptions, build_transfer_plan, build_transfer_plan_with_stats};
 
 #[test]
 fn public_policy_types_are_exposed_through_resolved_jobs() {
@@ -100,6 +100,56 @@ fn public_build_transfer_plan_returns_typed_errors() {
         err,
         PathsyncError::Plan(pathsync::plan::PlanError::Collision { .. })
     ));
+}
+
+#[test]
+fn public_build_transfer_plan_with_stats_returns_planning_metrics() {
+    let root = std::env::temp_dir().join(format!(
+        "pathsync-public-api-stats-{}",
+        std::process::id()
+    ));
+    let source = root.join("source");
+    let target = root.join("target");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::write(source.join("one.jpg"), b"1111").unwrap();
+    fs::write(source.join("two.jpg"), b"2222").unwrap();
+    fs::write(target.join("two.jpg"), b"2222").unwrap();
+
+    let config = config::Config {
+        default_job: Some("sync".to_string()),
+        parallel: None,
+        timezone: None,
+        jobs: [(
+            "sync".to_string(),
+            config::JobConfig {
+                enabled: Some(true),
+                source: source.clone(),
+                target: target.clone(),
+                extensions: vec!["jpg".to_string()],
+                compare: Some(config::CompareConfig {
+                    mode: Some("size_mtime".to_string()),
+                }),
+                transfer: None,
+                parallel: None,
+                timezone: None,
+                layout: config::LayoutConfig::Preset("flat".to_string()),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+
+    let job = config::resolve_job(&config, None, None, false, None).unwrap();
+    let build = build_transfer_plan_with_stats(&job, false).unwrap();
+
+    assert_eq!(build.stats.scanned_files, 2);
+    assert_eq!(build.stats.planned_files, 1);
+    assert_eq!(build.stats.planned_bytes, 4);
+    assert_eq!(build.stats.skipped_existing_files, 1);
+    assert_eq!(build.stats.skipped_existing_bytes, 4);
+    assert_eq!(build.plans.len(), 1);
+    assert!(build_transfer_plan(&job, false).unwrap().len() == 1);
 }
 
 #[test]
