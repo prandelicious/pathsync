@@ -14,7 +14,19 @@ use std::path::{Path, PathBuf};
 
 use config::{CompareConfig, Config, LayoutConfig, ResolvedJob, TransferConfig};
 use error::PathsyncError;
-use plan::{FileContext, PlanJob, TransferPlan};
+use plan::{FileContext, PlanBuild, PlanJob, TransferPlan};
+use progress_format::{render_live_screen, render_post_run_screen};
+use progress_model::{
+    CategoryRowModel, ErrorRowModel, LiveScreenModel, PostRunScreenModel, ProgressBarModel,
+    SummaryMetric, WorkerRowModel,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewUiMode {
+    Live,
+    PostCopy,
+    All,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
@@ -26,9 +38,15 @@ pub struct RunOptions {
     pub allow_disabled: bool,
     pub extensions: Option<Vec<String>>,
     pub job: Option<String>,
+    pub preview_ui: Option<PreviewUiMode>,
 }
 
 pub fn run(options: RunOptions) -> Result<(), PathsyncError> {
+    if let Some(mode) = options.preview_ui {
+        print!("{}", preview_ui_output(mode));
+        return Ok(());
+    }
+
     let config_path = options.config.unwrap_or_else(config::default_config_path);
     let config = config::load_config(&config_path)?;
     if options.list_jobs {
@@ -43,7 +61,8 @@ pub fn run(options: RunOptions) -> Result<(), PathsyncError> {
         options.allow_disabled,
         options.extensions.as_deref(),
     )?;
-    let plans = build_transfer_plan(&job, options.force)?;
+    let plan_build = build_transfer_plan_with_stats(&job, options.force)?;
+    let plans = plan_build.plans;
 
     if plans.is_empty() {
         println!("no new files to copy for job `{}`", job.name);
@@ -55,13 +74,31 @@ pub fn run(options: RunOptions) -> Result<(), PathsyncError> {
         return Ok(());
     }
 
-    Ok(copy::run_copy(&job, plans)?)
+    Ok(copy::run_copy(&job, plans, plan_build.stats)?)
+}
+
+pub fn preview_ui_output(mode: PreviewUiMode) -> String {
+    let live = render_live_screen(&preview_live_screen_model()).join("\n");
+    let post = render_post_run_screen(&preview_post_run_screen_model()).join("\n");
+
+    match mode {
+        PreviewUiMode::Live => format!("{live}\n"),
+        PreviewUiMode::PostCopy => format!("{post}\n"),
+        PreviewUiMode::All => format!("{live}\n\n{post}\n"),
+    }
 }
 
 pub fn build_transfer_plan(
     job: &ResolvedJob,
     force: bool,
 ) -> Result<Vec<TransferPlan>, PathsyncError> {
+    Ok(build_transfer_plan_with_stats(job, force)?.plans)
+}
+
+pub fn build_transfer_plan_with_stats(
+    job: &ResolvedJob,
+    force: bool,
+) -> Result<PlanBuild, PathsyncError> {
     let plan_job = PlanJob {
         source: job.source.clone(),
         target: job.target.clone(),
@@ -189,5 +226,79 @@ fn transfer_config_summary(transfer: Option<&TransferConfig>) -> String {
             transfer.large_file_threshold_mb.unwrap_or(100)
         ),
         other => other.to_string(),
+    }
+}
+
+fn preview_live_screen_model() -> LiveScreenModel {
+    LiveScreenModel {
+        job_name: "vlog-sync".to_string(),
+        status: "LIVE / COPY-LARGE".to_string(),
+        summary: vec![
+            SummaryMetric::new("Scanned", "2,941"),
+            SummaryMetric::new("Planned", "318"),
+            SummaryMetric::new("Copied", "141"),
+            SummaryMetric::new("Failed", "1"),
+            SummaryMetric::new("Bytes", "58.2 GB / 133.0 GB"),
+            SummaryMetric::new("Rate", "142.4 MB/s"),
+            SummaryMetric::new("Elapsed", "7m08s"),
+            SummaryMetric::new("ETA", "8m46s"),
+        ],
+        overall_label: "Total copy progress".to_string(),
+        overall_progress: ProgressBarModel::new(43, 30),
+        overall_progress_text: "58.2 GB / 133.0 GB".to_string(),
+        phase_label: "overall  copying large files".to_string(),
+        workers: vec![
+            WorkerRowModel::active(
+                '⠋',
+                "W01",
+                64,
+                "A001_C014_0101AB.MP4",
+                "8.2 GB",
+                "78.4 MB/s",
+            ),
+            WorkerRowModel::active(
+                '⠙',
+                "W02",
+                51,
+                "A001_C015_0101AB.MP4",
+                "7.9 GB",
+                "64.0 MB/s",
+            ),
+            WorkerRowModel::active('⠹', "W03", 12, "GX010193.MP4", "2.1 GB", "41.8 MB/s"),
+            WorkerRowModel::idle("W04"),
+        ],
+    }
+}
+
+fn preview_post_run_screen_model() -> PostRunScreenModel {
+    PostRunScreenModel {
+        job_name: "vlog-sync".to_string(),
+        status: "COMPLETE WITH ERRORS".to_string(),
+        summary: vec![
+            SummaryMetric::new("Scanned", "2,941"),
+            SummaryMetric::new("Planned", "318"),
+            SummaryMetric::new("Copied", "316"),
+            SummaryMetric::new("Failed", "2"),
+            SummaryMetric::new("Bytes transferred", "131.6 GB"),
+            SummaryMetric::new("Avg rate", "121.7 MB/s"),
+            SummaryMetric::new("Elapsed", "18m01s"),
+            SummaryMetric::new("Skip rate", "89.2%"),
+        ],
+        completion_label: "Copy completion".to_string(),
+        completion_progress: ProgressBarModel::new(99, 30),
+        categories: vec![
+            CategoryRowModel::new("skipped existing", 2623, "0 B", "100.0%", "0.0s"),
+            CategoryRowModel::new("copied mp4", 204, "128.4 GB", "67.1%", "16m09s"),
+            CategoryRowModel::new("copied jpg", 112, "3.2 GB", "72.8%", "1m04s"),
+            CategoryRowModel::new("failed permission", 1, "14.2 MB", "0.0%", "--"),
+            CategoryRowModel::new("failed collision", 1, "8.7 MB", "0.0%", "--"),
+        ],
+        errors: vec![
+            ErrorRowModel::new("[local] GX010193.MP4", "permission denied"),
+            ErrorRowModel::new(
+                "[local] GX010194.MP4",
+                "destination collision after layout render",
+            ),
+        ],
     }
 }

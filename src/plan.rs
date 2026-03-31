@@ -37,6 +37,21 @@ pub struct TransferPlan {
     pub display_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlanningStats {
+    pub scanned_files: usize,
+    pub planned_files: usize,
+    pub planned_bytes: u64,
+    pub skipped_existing_files: usize,
+    pub skipped_existing_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanBuild {
+    pub plans: Vec<TransferPlan>,
+    pub stats: PlanningStats,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
     Io {
@@ -96,12 +111,13 @@ impl Error for PlanError {}
 
 pub type Result<T> = std::result::Result<T, PlanError>;
 
-pub fn build_plan<F>(job: &PlanJob, force: bool, mut context_for: F) -> Result<Vec<TransferPlan>>
+pub fn build_plan<F>(job: &PlanJob, force: bool, mut context_for: F) -> Result<PlanBuild>
 where
     F: FnMut(&Path, &fs::Metadata) -> Result<FileContext>,
 {
     let extensions = normalize_extensions(&job.extensions);
     let mut candidates = BTreeMap::<PathBuf, Vec<TransferPlan>>::new();
+    let mut stats = PlanningStats::default();
 
     for entry in WalkDir::new(&job.source).follow_links(false) {
         let entry = entry.map_err(|err| PlanError::Io {
@@ -123,6 +139,8 @@ where
         if !extensions.iter().any(|allowed| allowed == &ext) {
             continue;
         }
+
+        stats.scanned_files += 1;
 
         let metadata = fs::metadata(&source).map_err(|err| PlanError::Io {
             context: "failed to stat source file".to_string(),
@@ -168,13 +186,17 @@ where
             message: err.to_string(),
         })?;
         if !force && should_skip_existing(job.compare_policy, &source_metadata, &plan.dest)? {
+            stats.skipped_existing_files += 1;
+            stats.skipped_existing_bytes += plan.size;
             continue;
         }
+        stats.planned_files += 1;
+        stats.planned_bytes += plan.size;
         plans.push(plan);
     }
 
     plans.sort_by(|a, b| a.dest.cmp(&b.dest));
-    Ok(plans)
+    Ok(PlanBuild { plans, stats })
 }
 
 pub fn should_skip_existing(

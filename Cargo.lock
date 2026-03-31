@@ -432,6 +432,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
+ "console",
  "crossbeam-channel",
  "dirs",
  "filetime",

@@ -1,6 +1,6 @@
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use console::Term;
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use filetime::{FileTime, set_file_mtime};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::fs;
 use std::io::{self, ErrorKind, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -11,16 +11,23 @@ use crate::config::ResolvedJob;
 use crate::copy_fast_path::{CopyTransferError, CopyTransferOperation, copy_file_data};
 use crate::error::{CopyError, CopyFailure, CopyFailureClassification, CopyOperation};
 use crate::format::{format_duration, human_bytes, human_rate};
-use crate::plan::TransferPlan;
+use crate::plan::{PlanningStats, TransferPlan};
 use crate::policy::TransferPolicy;
 use crate::progress_format::{
-    overall_line, plain_progress_line, worker_label, worker_line, worker_prefix,
+    plain_progress_line, render_live_screen, render_post_run_screen, worker_label, worker_line,
+    worker_prefix,
 };
-use crate::progress_model::{PhaseKind, ProgressSnapshot, active_worker_slots, phase_label};
+use crate::progress_model::{
+    CategoryRowModel, ErrorRowModel, LiveScreenModel, PhaseKind, PostRunScreenModel,
+    ProgressBarModel, ProgressSnapshot, SummaryMetric, TransferCategory, WorkerRowModel,
+    active_worker_slots, phase_label,
+};
 
 const WORKER_NAME_WIDTH: usize = 36;
 const PLAIN_PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
+const SPINNER_REDRAW_INTERVAL: Duration = Duration::from_millis(80);
 const SUMMARY_FILE_PREVIEW_LIMIT: usize = 8;
+const BRAILLE_SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 #[derive(Debug)]
 enum WorkerEvent {
@@ -52,7 +59,7 @@ enum WorkerEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 enum SizeBucket {
     Large,
     #[default]
@@ -63,6 +70,7 @@ enum SizeBucket {
 struct WorkerState {
     label: String,
     copied: u64,
+    total: u64,
     started: Option<Instant>,
     bucket: SizeBucket,
 }
@@ -76,6 +84,7 @@ struct ProgressState {
     bytes_total: u64,
     phase: PhaseKind,
     failed: bool,
+    failed_count: usize,
     started: Instant,
 }
 
@@ -110,6 +119,7 @@ struct RenderContext {
     source_root: PathBuf,
     task_count: usize,
     total_bytes: u64,
+    planning_stats: PlanningStats,
 }
 
 impl CopyReport {
@@ -140,6 +150,7 @@ impl ProgressState {
             bytes_total,
             phase: PhaseKind::Adaptive,
             failed: false,
+            failed_count: 0,
             started: Instant::now(),
         }
     }
@@ -176,7 +187,11 @@ pub fn print_dry_run(job: &ResolvedJob, plans: &[TransferPlan]) {
     }
 }
 
-pub fn run_copy(job: &ResolvedJob, plans: Vec<TransferPlan>) -> Result<(), CopyError> {
+pub fn run_copy(
+    job: &ResolvedJob,
+    plans: Vec<TransferPlan>,
+    planning_stats: PlanningStats,
+) -> Result<(), CopyError> {
     let total_bytes: u64 = plans.iter().map(|plan| plan.size).sum();
     let task_count = plans.len();
     let large_file_count = count_large_files(job, &plans);
@@ -191,19 +206,11 @@ pub fn run_copy(job: &ResolvedJob, plans: Vec<TransferPlan>) -> Result<(), CopyE
         source_root,
         task_count,
         total_bytes,
+        planning_stats,
     };
 
     let ui_handle = if use_tty {
-        let progress = MultiProgress::new();
-        print_header_lines_tty(&progress, job, task_count, total_bytes, large_file_count)?;
-        let overall = progress.add(ProgressBar::new(total_bytes));
-        overall.set_style(overall_style()?);
-        overall.set_prefix("total");
-        overall.set_message(overall_line(
-            &ProgressState::new(task_count, total_bytes).snapshot(),
-        ));
-
-        thread::spawn(move || render_progress_tty(progress, overall, event_rx, render_context))
+        thread::spawn(move || render_progress_tty(event_rx, render_context))
     } else {
         print_header_lines_plain(job, task_count, total_bytes, large_file_count);
         thread::spawn(move || render_progress_plain(event_rx, render_context))
@@ -586,190 +593,121 @@ fn temp_path_for(dest: &Path) -> PathBuf {
     ))
 }
 
-fn render_progress_tty(
-    progress: MultiProgress,
-    overall: ProgressBar,
-    rx: Receiver<WorkerEvent>,
-    context: RenderContext,
-) -> Result<(), CopyError> {
+fn render_progress_tty(rx: Receiver<WorkerEvent>, context: RenderContext) -> Result<(), CopyError> {
+    let term = Term::stdout();
     let mut state = ProgressState::new(context.task_count, context.total_bytes);
     let mut report = CopyReport::default();
     let mut permission_failures = 0_usize;
-    let mut worker_bars: Vec<ProgressBar> = Vec::new();
     let mut worker_states: Vec<WorkerState> = Vec::new();
+    let mut last_line_count = 0_usize;
 
-    for event in rx {
-        match event {
-            WorkerEvent::PhaseStarted {
-                phase,
-                worker_count,
-            } => {
-                for bar in worker_bars.drain(..) {
-                    bar.finish_and_clear();
+    loop {
+        let should_redraw = match rx.recv_timeout(SPINNER_REDRAW_INTERVAL) {
+            Ok(event) => match event {
+                WorkerEvent::PhaseStarted {
+                    phase,
+                    worker_count,
+                } => {
+                    state.phase = phase;
+                    worker_states = (0..worker_count).map(|_| WorkerState::default()).collect();
+                    true
                 }
-
-                state.phase = phase;
-                worker_states = (0..worker_count).map(|_| WorkerState::default()).collect();
-                progress
-                    .println(format!("phase    : {}", phase_label(phase)))
-                    .map_err(|err| CopyError::Internal {
-                        message: err.to_string(),
-                    })?;
-
-                for worker in 0..worker_count {
-                    let bar = progress.add(ProgressBar::new(0));
-                    bar.set_style(worker_idle_style()?);
-                    bar.set_prefix(worker_prefix(worker));
-                    bar.set_message(worker_line("waiting", 0, Duration::ZERO));
-                    worker_bars.push(bar);
-                }
-            }
-            WorkerEvent::Started {
-                worker,
-                bucket,
-                name,
-                source,
-                total,
-            } => {
-                let label = worker_label(&name, &source, &context.source_root, WORKER_NAME_WIDTH);
-                let worker_state = &mut worker_states[worker];
-                worker_state.bucket = bucket;
-                worker_state.label = label.clone();
-                worker_state.copied = 0;
-                worker_state.started = Some(Instant::now());
-                state.active_workers += 1;
-
-                if let Some(bar) = worker_bars.get(worker) {
-                    bar.set_style(worker_active_style()?);
-                    bar.set_length(total);
-                    bar.set_position(0);
-                    bar.set_message(worker_line(&label, 0, Duration::ZERO));
-                    bar.enable_steady_tick(Duration::from_millis(120));
-                }
-            }
-            WorkerEvent::Progress { worker, copied } => {
-                let worker_state = &mut worker_states[worker];
-                if copied > worker_state.copied {
-                    let delta = copied - worker_state.copied;
-                    state.bytes_done += delta;
-                    overall.inc(delta);
-                }
-                worker_state.copied = copied;
-
-                let elapsed = worker_state
-                    .started
-                    .map(|started| started.elapsed())
-                    .unwrap_or(Duration::ZERO);
-                if let Some(bar) = worker_bars.get(worker) {
-                    bar.set_position(copied);
-                    bar.set_message(worker_line(&worker_state.label, copied, elapsed));
-                }
-            }
-            WorkerEvent::Finished {
-                worker,
-                bucket,
-                name,
-                source,
-                bytes,
-            } => {
-                let label = current_worker_label(
-                    &worker_states,
+                WorkerEvent::Started {
                     worker,
-                    &name,
-                    &source,
-                    &context.source_root,
-                );
-                let worker_state = &mut worker_states[worker];
-                if bytes > worker_state.copied {
-                    let delta = bytes - worker_state.copied;
-                    state.bytes_done += delta;
-                    overall.inc(delta);
-                }
-
-                worker_state.copied = 0;
-                worker_state.label.clear();
-                worker_state.started = None;
-                state.active_workers = state.active_workers.saturating_sub(1);
-                state.completed += 1;
-                report.record_copy(
                     bucket,
-                    relative_file_label(&context.source_root, &source),
-                    bytes,
-                );
-
-                if let Some(bar) = worker_bars.get(worker) {
-                    bar.disable_steady_tick();
-                    bar.set_style(worker_idle_style()?);
-                    bar.set_length(0);
-                    bar.set_position(0);
-                    bar.set_message(format!("done: {label}"));
+                    name,
+                    source,
+                    total,
+                } => {
+                    let label =
+                        worker_label(&name, &source, &context.source_root, WORKER_NAME_WIDTH);
+                    let worker_state = &mut worker_states[worker];
+                    worker_state.bucket = bucket;
+                    worker_state.label = label.clone();
+                    worker_state.copied = 0;
+                    worker_state.total = total;
+                    worker_state.started = Some(Instant::now());
+                    state.active_workers += 1;
+                    true
                 }
-            }
-            WorkerEvent::Error {
-                worker,
-                mut failure,
-            } => {
-                apply_failure_classification(&mut failure, &mut permission_failures);
-                let source = failure.source.clone();
-                let name = source
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("<unknown>")
-                    .to_string();
-                let label = current_worker_label(
-                    &worker_states,
+                WorkerEvent::Progress { worker, copied } => {
+                    let worker_state = &mut worker_states[worker];
+                    if copied > worker_state.copied {
+                        let delta = copied - worker_state.copied;
+                        state.bytes_done += delta;
+                    }
+                    worker_state.copied = copied;
+                    true
+                }
+                WorkerEvent::Finished {
                     worker,
-                    &name,
-                    &source,
-                    &context.source_root,
-                );
-                let worker_state = &mut worker_states[worker];
-                worker_state.copied = 0;
-                worker_state.label.clear();
-                worker_state.started = None;
-                state.active_workers = state.active_workers.saturating_sub(1);
-                state.failed = true;
-                report.record_failure(failure.clone());
+                    bucket,
+                    name: _,
+                    source,
+                    bytes,
+                } => {
+                    let worker_state = &mut worker_states[worker];
+                    if bytes > worker_state.copied {
+                        let delta = bytes - worker_state.copied;
+                        state.bytes_done += delta;
+                    }
 
-                if let Some(bar) = worker_bars.get(worker) {
-                    bar.disable_steady_tick();
-                    bar.set_style(worker_idle_style()?);
-                    bar.set_length(0);
-                    bar.set_position(0);
-                    bar.set_message(format!("failed: {label}"));
+                    worker_state.copied = 0;
+                    worker_state.total = 0;
+                    worker_state.label.clear();
+                    worker_state.started = None;
+                    state.active_workers = state.active_workers.saturating_sub(1);
+                    state.completed += 1;
+                    report.record_copy(
+                        bucket,
+                        relative_file_label(&context.source_root, &source),
+                        bytes,
+                    );
+                    true
                 }
+                WorkerEvent::Error {
+                    worker,
+                    mut failure,
+                } => {
+                    apply_failure_classification(&mut failure, &mut permission_failures);
+                    let worker_state = &mut worker_states[worker];
+                    worker_state.copied = 0;
+                    worker_state.total = 0;
+                    worker_state.label.clear();
+                    worker_state.started = None;
+                    state.active_workers = state.active_workers.saturating_sub(1);
+                    state.failed = true;
+                    state.failed_count += 1;
+                    report.record_failure(failure.clone());
+                    true
+                }
+            },
+            Err(RecvTimeoutError::Timeout) => state.active_workers > 0,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
 
-                progress
-                    .println(format!(
-                        "{} error: {label}: {}",
-                        worker_prefix(worker),
-                        failure.message
-                    ))
-                    .map_err(|err| CopyError::Internal {
-                        message: err.to_string(),
-                    })?;
-            }
+        if should_redraw {
+            let lines = render_live_screen(&build_live_screen_model(
+                &context,
+                &state,
+                &worker_states,
+                report.failures.len(),
+                Instant::now(),
+            ));
+            draw_frame(&term, &lines, &mut last_line_count)?;
         }
-
-        overall.set_message(overall_line(&state.snapshot()));
     }
-
-    clear_tty_progress(&overall, worker_bars);
 
     report.duration = state.started.elapsed();
     report.bytes_done = state.bytes_done;
     report.failed = state.failed;
-    print_copy_report_tty(
-        &progress,
-        summary_lines(
-            &context.job_name,
-            &context.target,
-            &context.source_root,
-            &report,
-            context.task_count,
-            context.total_bytes,
-        ),
-    )?;
+    let lines = render_post_run_screen(&build_post_run_screen_model(
+        &context,
+        &report,
+        context.planning_stats.skipped_existing_files,
+        context.planning_stats.skipped_existing_bytes,
+    ));
+    draw_frame(&term, &lines, &mut last_line_count)?;
 
     if report.failures.is_empty() {
         Ok(())
@@ -957,25 +895,323 @@ fn relative_file_label(source_root: &Path, source: &Path) -> String {
         .to_string()
 }
 
-fn print_copy_report_tty(progress: &MultiProgress, lines: Vec<String>) -> Result<(), CopyError> {
+fn draw_frame(term: &Term, lines: &[String], last_line_count: &mut usize) -> Result<(), CopyError> {
+    if *last_line_count > 0 {
+        term.clear_last_lines(*last_line_count)
+            .map_err(|err| CopyError::Internal {
+                message: err.to_string(),
+            })?;
+    }
+
     for line in lines {
-        progress.println(line).map_err(|err| CopyError::Internal {
+        term.write_line(line).map_err(|err| CopyError::Internal {
             message: err.to_string(),
         })?;
     }
+
+    *last_line_count = lines.len();
     Ok(())
+}
+
+fn build_live_screen_model(
+    context: &RenderContext,
+    state: &ProgressState,
+    worker_states: &[WorkerState],
+    failed_count: usize,
+    render_now: Instant,
+) -> LiveScreenModel {
+    let snapshot = state.snapshot();
+    let display_phase = display_phase(snapshot.phase, worker_states);
+    let rate = if snapshot.elapsed.is_zero() {
+        "--".to_string()
+    } else {
+        human_rate(snapshot.bytes_done, snapshot.elapsed)
+    };
+    let eta_value =
+        crate::progress_model::eta(snapshot.bytes_done, snapshot.bytes_total, snapshot.elapsed)
+            .map(format_duration)
+            .unwrap_or_else(|| "--".to_string());
+    let phase_text = match display_phase {
+        PhaseKind::LargeFiles => "copying large files",
+        PhaseKind::SmallFiles => "copying small files",
+        PhaseKind::Adaptive => "copying files",
+    };
+
+    let workers = worker_states
+        .iter()
+        .enumerate()
+        .map(|(worker, worker_state)| {
+            if worker_state.label.is_empty() || worker_state.total == 0 {
+                WorkerRowModel::idle(worker_prefix(worker))
+            } else {
+                let percent = if worker_state.total == 0 {
+                    0
+                } else {
+                    ((worker_state.copied * 100) / worker_state.total) as usize
+                };
+                let elapsed = worker_state
+                    .started
+                    .map(|started| render_now.saturating_duration_since(started))
+                    .unwrap_or(Duration::ZERO);
+                let worker_rate = if worker_state.copied == 0 || elapsed.is_zero() {
+                    "--".to_string()
+                } else {
+                    human_rate(worker_state.copied, elapsed)
+                };
+                WorkerRowModel::active(
+                    worker_spinner_frame(worker_state.started, worker, render_now),
+                    worker_prefix(worker),
+                    percent,
+                    worker_state.label.clone(),
+                    human_bytes(worker_state.total),
+                    worker_rate,
+                )
+            }
+        })
+        .collect();
+
+    LiveScreenModel {
+        job_name: context.job_name.clone(),
+        status: match display_phase {
+            PhaseKind::LargeFiles => "LIVE / COPY-LARGE".to_string(),
+            PhaseKind::SmallFiles => "LIVE / COPY-SMALL".to_string(),
+            PhaseKind::Adaptive => "LIVE / COPY".to_string(),
+        },
+        summary: vec![
+            SummaryMetric::new(
+                "Scanned",
+                format_count(context.planning_stats.scanned_files),
+            ),
+            SummaryMetric::new(
+                "Planned",
+                format_count(context.planning_stats.planned_files),
+            ),
+            SummaryMetric::new("Copied", format_count(snapshot.completed)),
+            SummaryMetric::new("Failed", format_count(failed_count)),
+            SummaryMetric::new(
+                "Bytes",
+                format!(
+                    "{} / {}",
+                    human_bytes(snapshot.bytes_done),
+                    human_bytes(snapshot.bytes_total)
+                ),
+            ),
+            SummaryMetric::new("Rate", rate),
+            SummaryMetric::new("Elapsed", format_duration(snapshot.elapsed)),
+            SummaryMetric::new("ETA", eta_value),
+        ],
+        overall_label: "Total copy progress".to_string(),
+        overall_progress: ProgressBarModel::new(
+            progress_percent(snapshot.bytes_done, snapshot.bytes_total),
+            30,
+        ),
+        overall_progress_text: format!(
+            "{} / {}",
+            human_bytes(snapshot.bytes_done),
+            human_bytes(snapshot.bytes_total)
+        ),
+        phase_label: format!("overall  {phase_text}"),
+        workers,
+    }
+}
+
+fn braille_spinner_frame(spinner_tick: usize) -> char {
+    BRAILLE_SPINNER_FRAMES[spinner_tick % BRAILLE_SPINNER_FRAMES.len()]
+}
+
+fn worker_spinner_frame(started: Option<Instant>, worker: usize, render_now: Instant) -> char {
+    let started = started.unwrap_or(render_now);
+    let elapsed = render_now.saturating_duration_since(started);
+    let frame = (elapsed.as_millis() / SPINNER_REDRAW_INTERVAL.as_millis()) as usize + worker;
+    braille_spinner_frame(frame)
+}
+
+fn display_phase(snapshot_phase: PhaseKind, worker_states: &[WorkerState]) -> PhaseKind {
+    if snapshot_phase != PhaseKind::Adaptive {
+        return snapshot_phase;
+    }
+
+    let active_bucket = worker_states
+        .iter()
+        .find(|worker| !worker.label.is_empty() && worker.total > 0)
+        .map(|worker| worker.bucket);
+
+    match active_bucket {
+        Some(SizeBucket::Large) => PhaseKind::LargeFiles,
+        Some(SizeBucket::Small) => PhaseKind::SmallFiles,
+        None => PhaseKind::Adaptive,
+    }
+}
+
+fn build_post_run_screen_model(
+    context: &RenderContext,
+    report: &CopyReport,
+    skipped_existing_files: usize,
+    skipped_existing_bytes: u64,
+) -> PostRunScreenModel {
+    let copied_count = report.copied_files.len();
+    let copied_bytes = report.bytes_done;
+    let skipped_rate = if context.planning_stats.scanned_files == 0 {
+        "0.0%".to_string()
+    } else {
+        format!(
+            "{:.1}%",
+            (skipped_existing_files as f64 / context.planning_stats.scanned_files as f64) * 100.0
+        )
+    };
+
+    let mut copied_mp4 = (0_usize, 0_u64);
+    let mut copied_jpg = (0_usize, 0_u64);
+    for file in &report.copied_files {
+        let lower = file.file.to_ascii_lowercase();
+        if lower.ends_with(".mp4") {
+            copied_mp4.0 += 1;
+            copied_mp4.1 += file.size;
+        } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+            copied_jpg.0 += 1;
+            copied_jpg.1 += file.size;
+        }
+    }
+
+    let failed_permission = report
+        .failures
+        .iter()
+        .filter(|failure| failure.kind == ErrorKind::PermissionDenied)
+        .count();
+    let failed_collision = report
+        .failures
+        .iter()
+        .filter(|failure| single_line_error(&failure.message).contains("collision"))
+        .count();
+
+    let mut categories = vec![CategoryRowModel::new(
+        TransferCategory::SkippedExisting.as_label(),
+        skipped_existing_files,
+        human_bytes(skipped_existing_bytes),
+        skipped_rate.clone(),
+        "0.0s",
+    )];
+
+    if copied_mp4.0 > 0 {
+        categories.push(CategoryRowModel::new(
+            TransferCategory::CopiedMp4.as_label(),
+            copied_mp4.0,
+            human_bytes(copied_mp4.1),
+            percent_string(copied_mp4.1, context.total_bytes),
+            format_duration(report.duration),
+        ));
+    }
+    if copied_jpg.0 > 0 {
+        categories.push(CategoryRowModel::new(
+            TransferCategory::CopiedJpg.as_label(),
+            copied_jpg.0,
+            human_bytes(copied_jpg.1),
+            percent_string(copied_jpg.1, context.total_bytes),
+            format_duration(report.duration),
+        ));
+    }
+    if failed_permission > 0 {
+        categories.push(CategoryRowModel::new(
+            TransferCategory::FailedPermission.as_label(),
+            failed_permission,
+            "0 B",
+            "0.0%",
+            "--",
+        ));
+    }
+    if failed_collision > 0 {
+        categories.push(CategoryRowModel::new(
+            TransferCategory::FailedCollision.as_label(),
+            failed_collision,
+            "0 B",
+            "0.0%",
+            "--",
+        ));
+    }
+
+    let errors = report
+        .failures
+        .iter()
+        .map(|failure| {
+            ErrorRowModel::new(
+                format!(
+                    "[{}] {}",
+                    failure.classification,
+                    failure
+                        .source
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("<unknown>")
+                ),
+                single_line_error(&failure.message),
+            )
+        })
+        .collect();
+
+    PostRunScreenModel {
+        job_name: context.job_name.clone(),
+        status: if report.failed {
+            "COMPLETE WITH ERRORS".to_string()
+        } else {
+            "COMPLETE".to_string()
+        },
+        summary: vec![
+            SummaryMetric::new(
+                "Scanned",
+                format_count(context.planning_stats.scanned_files),
+            ),
+            SummaryMetric::new(
+                "Planned",
+                format_count(context.planning_stats.planned_files),
+            ),
+            SummaryMetric::new("Copied", format_count(copied_count)),
+            SummaryMetric::new("Failed", format_count(report.failures.len())),
+            SummaryMetric::new("Bytes transferred", human_bytes(copied_bytes)),
+            SummaryMetric::new("Avg rate", average_rate(copied_bytes, report.duration)),
+            SummaryMetric::new("Elapsed", format_duration(report.duration)),
+            SummaryMetric::new("Skip rate", skipped_rate),
+        ],
+        completion_label: "Copy completion".to_string(),
+        completion_progress: ProgressBarModel::new(
+            progress_percent(copied_bytes, context.total_bytes),
+            30,
+        ),
+        categories,
+        errors,
+    }
+}
+
+fn progress_percent(done: u64, total: u64) -> usize {
+    if total == 0 {
+        0
+    } else {
+        ((done.min(total) * 100) / total) as usize
+    }
+}
+
+fn percent_string(done: u64, total: u64) -> String {
+    if total == 0 {
+        "0.0%".to_string()
+    } else {
+        format!("{:.1}%", (done as f64 / total as f64) * 100.0)
+    }
+}
+
+fn format_count(value: usize) -> String {
+    let digits = value.to_string();
+    let mut result = String::new();
+    for (index, ch) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    result.chars().rev().collect()
 }
 
 fn print_copy_report_plain(lines: Vec<String>) {
     for line in lines {
         println!("{line}");
-    }
-}
-
-fn clear_tty_progress(overall: &ProgressBar, worker_bars: Vec<ProgressBar>) {
-    overall.finish_and_clear();
-    for bar in worker_bars {
-        bar.finish_and_clear();
     }
 }
 
@@ -1122,52 +1358,6 @@ fn truncate_right(value: &str, max_chars: usize) -> String {
     result
 }
 
-fn overall_style() -> Result<ProgressStyle, CopyError> {
-    ProgressStyle::with_template("{prefix:>8} [{bar:40.cyan/white.dim}] {percent:>3}% {msg}")
-        .map(|style| style.progress_chars(dense_block_chars()))
-        .map_err(|err| CopyError::Internal {
-            message: err.to_string(),
-        })
-}
-
-fn worker_active_style() -> Result<ProgressStyle, CopyError> {
-    ProgressStyle::with_template(
-        "{prefix:>6.cyan} {spinner:.green} [{bar:24.magenta/white.dim}] {percent:>3}% {msg}",
-    )
-    .map(|style| {
-        style
-            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
-            .progress_chars(dense_block_chars())
-    })
-    .map_err(|err| CopyError::Internal {
-        message: err.to_string(),
-    })
-}
-
-fn worker_idle_style() -> Result<ProgressStyle, CopyError> {
-    ProgressStyle::with_template("{prefix:>6.cyan}          {msg}").map_err(|err| {
-        CopyError::Internal {
-            message: err.to_string(),
-        }
-    })
-}
-
-fn print_header_lines_tty(
-    progress: &MultiProgress,
-    job: &ResolvedJob,
-    task_count: usize,
-    total_bytes: u64,
-    large_file_count: usize,
-) -> Result<(), CopyError> {
-    for line in header_lines(job, task_count, total_bytes, large_file_count) {
-        progress.println(line).map_err(|err| CopyError::Internal {
-            message: err.to_string(),
-        })?;
-    }
-
-    Ok(())
-}
-
 fn print_header_lines_plain(
     job: &ResolvedJob,
     task_count: usize,
@@ -1201,10 +1391,6 @@ fn header_lines(
         format!("large    : {} file(s)", large_file_count),
         String::new(),
     ]
-}
-
-fn dense_block_chars() -> &'static str {
-    "█▉▊▋▌▍▎▏░"
 }
 
 fn transfer_policy_label(policy: &TransferPolicy) -> String {
@@ -1296,7 +1482,6 @@ fn apply_failure_classification(failure: &mut CopyFailure, permission_failures: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indicatif::{InMemoryTerm, MultiProgress, ProgressDrawTarget};
 
     fn plan(name: &str, size: u64) -> TransferPlan {
         TransferPlan {
@@ -1347,31 +1532,6 @@ mod tests {
     }
 
     #[test]
-    fn clear_tty_progress_removes_total_bar_before_summary_output() {
-        let term = InMemoryTerm::new(20, 120);
-        let progress =
-            MultiProgress::with_draw_target(ProgressDrawTarget::term_like(Box::new(term.clone())));
-        let overall = progress.add(ProgressBar::new(10));
-        overall.set_style(overall_style().unwrap());
-        overall.set_prefix("total");
-        overall.set_position(10);
-        overall.set_message("all copies complete");
-
-        clear_tty_progress(&overall, Vec::new());
-        progress.println("SYNC COMPLETE").unwrap();
-
-        let contents = term.contents();
-        assert!(contents.contains("SYNC COMPLETE"));
-        assert!(!contents.contains("total"));
-        assert!(!contents.contains("all copies complete"));
-    }
-
-    #[test]
-    fn dense_block_chars_use_visible_incomplete_segment() {
-        assert_eq!(dense_block_chars().chars().last(), Some('░'));
-    }
-
-    #[test]
     fn adaptive_scheduler_backfills_small_work_when_large_item_does_not_fit() {
         let pending = vec![
             plan("large-a.jpg", 600),
@@ -1390,6 +1550,199 @@ mod tests {
             ),
             Some(1)
         );
+    }
+
+    #[test]
+    fn live_screen_model_uses_canonical_status_and_worker_rows() {
+        let mut state = ProgressState::new(3, 1_300);
+        state.phase = PhaseKind::LargeFiles;
+        state.active_workers = 1;
+        state.bytes_done = 584;
+
+        let mut worker_states = vec![WorkerState::default(), WorkerState::default()];
+        worker_states[0].label = "b/photo2.jpg".to_string();
+        worker_states[0].copied = 600;
+        worker_states[0].total = 1_000;
+        worker_states[0].started = Some(Instant::now() - Duration::from_secs(4));
+
+        let context = RenderContext {
+            job_name: "demo".to_string(),
+            target: PathBuf::from("/target"),
+            source_root: PathBuf::from("/source"),
+            task_count: 3,
+            total_bytes: 1_300,
+            planning_stats: PlanningStats {
+                scanned_files: 3,
+                planned_files: 3,
+                planned_bytes: 1_300,
+                skipped_existing_files: 0,
+                skipped_existing_bytes: 0,
+            },
+        };
+
+        let render_now = Instant::now();
+        worker_states[0].started = Some(render_now - Duration::from_secs(4));
+        let model = build_live_screen_model(&context, &state, &worker_states, 0, render_now);
+
+        assert_eq!(model.status, "LIVE / COPY-LARGE");
+        assert_eq!(model.summary[0].label, "Scanned");
+        assert_eq!(model.summary[1].label, "Planned");
+        assert_eq!(model.overall_label, "Total copy progress");
+        assert_eq!(model.workers[0].spinner_frame, Some('⠋'));
+        assert_eq!(model.workers[0].worker_tag, "W01");
+        assert!(!model.workers[0].idle);
+        assert!(model.workers[1].idle);
+    }
+
+    #[test]
+    fn live_screen_model_maps_adaptive_runs_to_active_large_bucket() {
+        let mut state = ProgressState::new(3, 1_300);
+        state.phase = PhaseKind::Adaptive;
+        state.active_workers = 1;
+        state.bytes_done = 584;
+
+        let mut worker_states = vec![WorkerState::default(), WorkerState::default()];
+        worker_states[0].label = "b/photo2.jpg".to_string();
+        worker_states[0].bucket = SizeBucket::Large;
+        worker_states[0].copied = 600;
+        worker_states[0].total = 1_000;
+        let render_now = Instant::now();
+        worker_states[0].started = Some(render_now - Duration::from_secs(4));
+
+        let context = RenderContext {
+            job_name: "demo".to_string(),
+            target: PathBuf::from("/target"),
+            source_root: PathBuf::from("/source"),
+            task_count: 3,
+            total_bytes: 1_300,
+            planning_stats: PlanningStats {
+                scanned_files: 3,
+                planned_files: 3,
+                planned_bytes: 1_300,
+                skipped_existing_files: 0,
+                skipped_existing_bytes: 0,
+            },
+        };
+
+        let model = build_live_screen_model(&context, &state, &worker_states, 0, render_now);
+
+        assert_eq!(model.status, "LIVE / COPY-LARGE");
+        assert_eq!(model.phase_label, "overall  copying large files");
+        assert_eq!(model.workers[0].spinner_frame, Some('⠋'));
+        assert_eq!(model.workers[0].size, "1000 B");
+        assert_eq!(model.workers[0].time, "150 B/s");
+    }
+
+    #[test]
+    fn adaptive_live_screen_uses_active_worker_bucket_for_display_phase() {
+        let mut state = ProgressState::new(3, 1_300);
+        state.phase = PhaseKind::Adaptive;
+        state.active_workers = 1;
+        state.bytes_done = 584;
+
+        let mut worker_states = vec![WorkerState::default(), WorkerState::default()];
+        worker_states[0].bucket = SizeBucket::Large;
+        worker_states[0].label = "clip.mp4".to_string();
+        worker_states[0].copied = 600;
+        worker_states[0].total = 1_000;
+        let render_now = Instant::now();
+        worker_states[0].started = Some(render_now - Duration::from_secs(4));
+
+        let context = RenderContext {
+            job_name: "demo".to_string(),
+            target: PathBuf::from("/target"),
+            source_root: PathBuf::from("/source"),
+            task_count: 3,
+            total_bytes: 1_300,
+            planning_stats: PlanningStats {
+                scanned_files: 3,
+                planned_files: 3,
+                planned_bytes: 1_300,
+                skipped_existing_files: 0,
+                skipped_existing_bytes: 0,
+            },
+        };
+
+        let model = build_live_screen_model(&context, &state, &worker_states, 0, render_now);
+
+        assert_eq!(model.status, "LIVE / COPY-LARGE");
+        assert_eq!(model.phase_label, "overall  copying large files");
+    }
+
+    #[test]
+    fn braille_spinner_frame_cycles_through_braille_sequence() {
+        assert_eq!(braille_spinner_frame(0), '⠋');
+        assert_eq!(braille_spinner_frame(1), '⠙');
+        assert_eq!(braille_spinner_frame(9), '⠏');
+        assert_eq!(braille_spinner_frame(10), '⠋');
+    }
+
+    #[test]
+    fn worker_spinner_frame_offsets_each_worker_independently() {
+        let render_now = Instant::now();
+        let started = render_now - Duration::from_millis(10);
+
+        assert_eq!(worker_spinner_frame(Some(started), 0, render_now), '⠋');
+        assert_eq!(worker_spinner_frame(Some(started), 1, render_now), '⠙');
+        assert_eq!(worker_spinner_frame(Some(started), 2, render_now), '⠹');
+    }
+
+    #[test]
+    fn post_run_screen_model_groups_categories_and_errors() {
+        let context = RenderContext {
+            job_name: "demo".to_string(),
+            target: PathBuf::from("/target"),
+            source_root: PathBuf::from("/source"),
+            task_count: 4,
+            total_bytes: 2_000,
+            planning_stats: PlanningStats {
+                scanned_files: 4,
+                planned_files: 4,
+                planned_bytes: 2_000,
+                skipped_existing_files: 2,
+                skipped_existing_bytes: 800,
+            },
+        };
+        let report = CopyReport {
+            duration: Duration::from_secs(8),
+            bytes_done: 1_200,
+            copied_files: vec![
+                CopiedFileRecord {
+                    file: "one/video.mp4".to_string(),
+                    size: 1_000,
+                },
+                CopiedFileRecord {
+                    file: "two/image.jpg".to_string(),
+                    size: 200,
+                },
+            ],
+            failures: vec![CopyFailure {
+                source: PathBuf::from("/source/GX010193.MP4"),
+                dest: Some(PathBuf::from("/target/GX010193.MP4")),
+                operation: CopyOperation::Write,
+                kind: ErrorKind::PermissionDenied,
+                raw_os_error: None,
+                classification: CopyFailureClassification::Local,
+                message: "permission denied".to_string(),
+            }],
+            large: PhaseTotals::default(),
+            small: PhaseTotals::default(),
+            failed: true,
+            systemic_detected: false,
+        };
+
+        let model = build_post_run_screen_model(&context, &report, 2, 800);
+
+        assert_eq!(model.status, "COMPLETE WITH ERRORS");
+        assert!(model.categories.iter().any(|row| row.label == "copied mp4"));
+        assert!(model.categories.iter().any(|row| row.label == "copied jpg"));
+        assert!(
+            model
+                .categories
+                .iter()
+                .any(|row| row.label == "failed permission")
+        );
+        assert_eq!(model.errors[0].detail, "permission denied");
     }
 
     #[test]
