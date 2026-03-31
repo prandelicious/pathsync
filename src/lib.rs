@@ -1,5 +1,6 @@
 pub mod config;
 pub mod copy;
+mod copy_fast_path;
 pub mod date;
 pub mod error;
 pub mod format;

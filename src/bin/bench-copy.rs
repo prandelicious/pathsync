@@ -5,6 +5,9 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+#[path = "../copy_fast_path.rs"]
+mod copy_fast_path;
+
 #[derive(Parser, Debug)]
 #[command(name = "bench-copy")]
 #[command(about = "Benchmark copy strategies on real source/target storage")]
@@ -21,7 +24,7 @@ struct Cli {
     #[arg(long, default_value_t = 8)]
     buffer_mb: usize,
 
-    #[arg(long, value_enum, default_value_t = Method::Both)]
+    #[arg(long, value_enum, default_value_t = Method::All)]
     method: Method,
 
     #[arg(long, default_value_t = true)]
@@ -32,7 +35,21 @@ struct Cli {
 enum Method {
     Buffered,
     Stdio,
+    Native,
     Both,
+    All,
+}
+
+impl Method {
+    fn label(self) -> &'static str {
+        match self {
+            Method::Buffered => "buffered",
+            Method::Stdio => "stdio",
+            Method::Native => "native",
+            Method::Both => "both",
+            Method::All => "all",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -63,18 +80,15 @@ fn main() -> Result<()> {
     let methods = selected_methods(cli.method);
     let mut all_results = Vec::new();
 
-    for method in methods {
-        println!("method: {method}");
+    for method in &methods {
+        let method_name = method.label();
+        println!("method: {method_name}");
         let mut method_results = Vec::new();
 
         for run in 1..=cli.runs {
-            let destination = temp_destination(&cli.target_dir, method, run);
+            let destination = temp_destination(&cli.target_dir, method_name, run);
             let started = Instant::now();
-            let bytes = match method {
-                "buffered" => copy_buffered(&cli.source, &destination, buffer_size, cli.fsync)?,
-                "stdio" => copy_stdio(&cli.source, &destination, cli.fsync)?,
-                _ => unreachable!("unexpected benchmark method"),
-            };
+            let bytes = run_method(*method, &cli.source, &destination, buffer_size, cli.fsync)?;
             let elapsed = started.elapsed().as_secs_f64();
 
             fs::remove_file(&destination).with_context(|| {
@@ -85,7 +99,7 @@ fn main() -> Result<()> {
             })?;
 
             let result = RunResult {
-                method,
+                method: method_name,
                 run,
                 bytes,
                 seconds: elapsed,
@@ -105,8 +119,8 @@ fn main() -> Result<()> {
         println!();
     }
 
-    if all_results.len() > cli.runs {
-        print_comparison(&all_results, cli.runs);
+    if methods.len() > 1 {
+        print_comparison(&all_results, &methods);
     }
 
     Ok(())
@@ -128,16 +142,53 @@ fn validate_args(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn selected_methods(method: Method) -> Vec<&'static str> {
+fn selected_methods(method: Method) -> Vec<Method> {
     match method {
-        Method::Buffered => vec!["buffered"],
-        Method::Stdio => vec!["stdio"],
-        Method::Both => vec!["buffered", "stdio"],
+        Method::Buffered => vec![Method::Buffered],
+        Method::Stdio => vec![Method::Stdio],
+        Method::Native => vec![Method::Native],
+        Method::Both => vec![Method::Buffered, Method::Stdio],
+        Method::All => vec![Method::Native, Method::Buffered, Method::Stdio],
     }
 }
 
 fn temp_destination(target_dir: &Path, method: &str, run: usize) -> PathBuf {
     target_dir.join(format!(".pathsync-bench-{method}-{run}.tmp"))
+}
+
+fn run_method(
+    method: Method,
+    source: &Path,
+    dest: &Path,
+    buffer_size: usize,
+    fsync_enabled: bool,
+) -> Result<u64> {
+    match method {
+        Method::Buffered => copy_buffered(source, dest, buffer_size, fsync_enabled),
+        Method::Stdio => copy_stdio(source, dest, fsync_enabled),
+        Method::Native => copy_native(source, dest, fsync_enabled),
+        Method::Both => unreachable!("both is a selector, not a benchmark mode"),
+        Method::All => unreachable!("all is a selector, not a benchmark mode"),
+    }
+}
+
+fn copy_native(source: &Path, dest: &Path, fsync_enabled: bool) -> Result<u64> {
+    let outcome = copy_fast_path::copy_file_data(source, dest, |_| {}).map_err(|err| {
+        anyhow::anyhow!(
+            "failed native copying {} -> {}: {err:?}",
+            source.display(),
+            dest.display()
+        )
+    })?;
+
+    if fsync_enabled {
+        File::open(dest)
+            .with_context(|| format!("failed to open destination file: {}", dest.display()))?
+            .sync_all()
+            .with_context(|| format!("failed syncing destination file: {}", dest.display()))?;
+    }
+
+    Ok(outcome.bytes)
 }
 
 fn copy_buffered(
@@ -212,33 +263,47 @@ fn print_summary(results: &[RunResult]) {
     );
 }
 
-fn print_comparison(results: &[RunResult], runs: usize) {
-    let buffered_avg = average_rate(results, "buffered", runs);
-    let stdio_avg = average_rate(results, "stdio", runs);
+fn print_comparison(results: &[RunResult], methods: &[Method]) {
     println!("comparison:");
-    println!("  buffered avg : {}", human_rate_f64(buffered_avg));
-    println!("  stdio avg    : {}", human_rate_f64(stdio_avg));
-    if buffered_avg > 0.0 && stdio_avg > 0.0 {
-        let faster = if buffered_avg >= stdio_avg {
-            "buffered"
-        } else {
-            "stdio"
-        };
-        let ratio = if buffered_avg >= stdio_avg {
-            buffered_avg / stdio_avg
-        } else {
-            stdio_avg / buffered_avg
-        };
-        println!("  faster       : {faster} ({ratio:.2}x)");
+    let mut rates = Vec::new();
+    for method in methods {
+        let label = method.label();
+        let rate = average_rate(results, label);
+        println!("  {label:<12}: {}", human_rate_f64(rate));
+        if rate > 0.0 {
+            rates.push((label, rate));
+        }
+    }
+    rates.sort_by(|a, b| b.1.total_cmp(&a.1));
+    if let Some((faster, fastest_rate)) = rates.first().copied()
+        && let Some((_, next_best_rate)) = rates.get(1).copied()
+    {
+        println!(
+            "  faster       : {faster} ({:.2}x)",
+            fastest_rate / next_best_rate
+        );
     }
 }
 
-fn average_rate(results: &[RunResult], method: &str, runs: usize) -> f64 {
+#[cfg(test)]
+fn fastest_rate<'a>(results: &'a [(&'a str, f64)]) -> Option<(&'a str, f64)> {
+    let mut iter = results.iter().copied();
+    let first = iter.next()?;
+    Some(iter.fold(first, |best, candidate| {
+        if candidate.1 > best.1 {
+            candidate
+        } else {
+            best
+        }
+    }))
+}
+
+fn average_rate(results: &[RunResult], method: &str) -> f64 {
     let filtered: Vec<&RunResult> = results
         .iter()
         .filter(|result| result.method == method)
         .collect();
-    if filtered.is_empty() || runs == 0 {
+    if filtered.is_empty() {
         return 0.0;
     }
 
@@ -272,5 +337,133 @@ fn human_size(mut value: f64, units: &[&str]) -> String {
         format!("{value:.0} {}", units[unit])
     } else {
         format!("{value:.1} {}", units[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "pathsync-bench-copy-{prefix}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    fn write_file(path: &Path, contents: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("failed to create parent directory");
+        }
+        let mut file = File::create(path).expect("failed to create file");
+        file.write_all(contents).expect("failed to write file");
+    }
+
+    #[test]
+    fn method_selection_includes_native_for_all() {
+        assert_eq!(
+            selected_methods(Method::Both),
+            vec![Method::Buffered, Method::Stdio]
+        );
+        assert_eq!(
+            selected_methods(Method::All),
+            vec![Method::Native, Method::Buffered, Method::Stdio]
+        );
+        assert_eq!(selected_methods(Method::Native), vec![Method::Native]);
+    }
+
+    #[test]
+    fn cli_defaults_to_all() {
+        let root = temp_dir("cli-default");
+        let source_dir = root.join("source");
+        let target_dir = root.join("target");
+        fs::create_dir_all(&source_dir).expect("failed to create source dir");
+        fs::create_dir_all(&target_dir).expect("failed to create target dir");
+        let source = source_dir.join("source.bin");
+        write_file(&source, b"default");
+
+        let cli = Cli::try_parse_from([
+            "bench-copy",
+            "--source",
+            source.to_str().expect("source path utf8"),
+            "--target-dir",
+            target_dir.to_str().expect("target path utf8"),
+        ])
+        .expect("cli parse should succeed");
+
+        assert_eq!(cli.method, Method::All);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn native_copy_uses_production_backend() {
+        let root = temp_dir("native-copy");
+        let source_dir = root.join("source");
+        let target_dir = root.join("target");
+        fs::create_dir_all(&source_dir).expect("failed to create source dir");
+        fs::create_dir_all(&target_dir).expect("failed to create target dir");
+        let source = source_dir.join("source.bin");
+        let dest = target_dir.join("dest.bin");
+        let payload = b"native-bench-bytes";
+        write_file(&source, payload);
+
+        let copied = copy_native(&source, &dest, false).expect("native copy should succeed");
+        assert_eq!(copied, payload.len() as u64);
+        assert_eq!(
+            fs::read(&dest).expect("failed to read destination"),
+            payload
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn average_rate_handles_empty_input() {
+        assert_eq!(average_rate(&[], "buffered"), 0.0);
+        assert_eq!(average_rate(&[], "native"), 0.0);
+    }
+
+    #[test]
+    fn comparison_helpers_pick_fastest_method() {
+        let results = vec![
+            RunResult {
+                method: "native",
+                run: 1,
+                bytes: 10,
+                seconds: 1.0,
+            },
+            RunResult {
+                method: "buffered",
+                run: 1,
+                bytes: 10,
+                seconds: 2.0,
+            },
+            RunResult {
+                method: "stdio",
+                run: 1,
+                bytes: 10,
+                seconds: 4.0,
+            },
+        ];
+
+        assert!(average_rate(&results, "native") > average_rate(&results, "buffered"));
+        assert!(average_rate(&results, "buffered") > average_rate(&results, "stdio"));
+        assert_eq!(
+            fastest_rate(&[("native", 10.0), ("buffered", 4.0), ("stdio", 1.0)]),
+            Some(("native", 10.0))
+        );
+    }
+
+    #[test]
+    fn human_rate_formats_rates() {
+        assert!(human_rate_f64(1_500_000.0).contains("MB/s"));
     }
 }
