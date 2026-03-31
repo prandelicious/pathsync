@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -7,6 +7,9 @@ use std::path::PathBuf;
 #[command(about = "Config-driven file sync with template-based target layout")]
 #[command(version)]
 struct Cli {
+    #[arg(long, value_enum, help = "Render a canned UI preview and exit")]
+    preview_ui: Option<PreviewUiArg>,
+
     #[arg(long, help = "Path to the TOML configuration file")]
     config: Option<PathBuf>,
 
@@ -39,9 +42,21 @@ struct Cli {
     job: Option<String>,
 }
 
+#[derive(Clone, Debug, ValueEnum)]
+enum PreviewUiArg {
+    Live,
+    PostCopy,
+    All,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     Ok(pathsync::run(pathsync::RunOptions {
+        preview_ui: cli.preview_ui.map(|mode| match mode {
+            PreviewUiArg::Live => pathsync::PreviewUiMode::Live,
+            PreviewUiArg::PostCopy => pathsync::PreviewUiMode::PostCopy,
+            PreviewUiArg::All => pathsync::PreviewUiMode::All,
+        }),
         config: cli.config,
         list_jobs: cli.list_jobs,
         dry_run: cli.dry_run,

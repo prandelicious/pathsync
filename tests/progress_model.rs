@@ -67,7 +67,7 @@ fn overall_message_reports_success_and_failure_outcomes() {
 fn canonical_screen_model_constructors_preserve_display_values() {
     let metric = SummaryMetric::new("Scanned", "2,941");
     let progress = ProgressBarModel::new(43, 24);
-    let active = WorkerRowModel::active("W01", 64, "clip.mp4", "8.2 GB", "4s");
+    let active = WorkerRowModel::active('⠋', "W01", 64, "clip.mp4", "8.2 GB", "4s");
     let idle = WorkerRowModel::idle("W04");
     let category = CategoryRowModel::new("copied mp4", 204, "128.4 GB", "67.1%", "16m09s");
     let error = ErrorRowModel::new("[local] GX010193.MP4", "permission denied");
@@ -76,10 +76,12 @@ fn canonical_screen_model_constructors_preserve_display_values() {
     assert_eq!(metric.value, "2,941");
     assert_eq!(progress.percent, 43);
     assert_eq!(progress.width, 24);
+    assert_eq!(active.spinner_frame, Some('⠋'));
     assert_eq!(active.worker_tag, "W01");
     assert_eq!(active.percent, 64);
     assert!(!active.idle);
     assert_eq!(idle.item, "idle");
+    assert_eq!(idle.spinner_frame, None);
     assert!(idle.idle);
     assert_eq!(category.label, "copied mp4");
     assert_eq!(category.files, 204);
@@ -88,9 +90,18 @@ fn canonical_screen_model_constructors_preserve_display_values() {
 
 #[test]
 fn transfer_category_labels_match_canonical_ui_taxonomy() {
-    assert_eq!(TransferCategory::SkippedExisting.as_label(), "skipped existing");
+    assert_eq!(
+        TransferCategory::SkippedExisting.as_label(),
+        "skipped existing"
+    );
     assert_eq!(TransferCategory::CopiedMp4.as_label(), "copied mp4");
     assert_eq!(TransferCategory::CopiedJpg.as_label(), "copied jpg");
-    assert_eq!(TransferCategory::FailedPermission.as_label(), "failed permission");
-    assert_eq!(TransferCategory::FailedCollision.as_label(), "failed collision");
+    assert_eq!(
+        TransferCategory::FailedPermission.as_label(),
+        "failed permission"
+    );
+    assert_eq!(
+        TransferCategory::FailedCollision.as_label(),
+        "failed collision"
+    );
 }

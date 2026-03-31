@@ -2,14 +2,16 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::format::{human_bytes, human_rate};
-pub use crate::progress_model::{PhaseKind, ProgressSnapshot, phase_label};
 use crate::progress_model::{
     LiveScreenModel, PostRunScreenModel, ProgressBarModel, WorkerRowModel, overall_message,
 };
+pub use crate::progress_model::{PhaseKind, ProgressSnapshot, phase_label};
 
 pub const CANONICAL_WIDTH: usize = 80;
-const LIVE_BAR_WIDTH: usize = 24;
-const WORKER_BAR_WIDTH: usize = 22;
+const LIVE_BAR_WIDTH: usize = 30;
+const WORKER_BAR_WIDTH: usize = 18;
+const VISIBLE_WORKER_ROWS: usize = 4;
+const SUMMARY_RIGHT_COLUMN: usize = 27;
 
 pub fn worker_label(display_name: &str, source: &Path, root: &Path, max_chars: usize) -> String {
     let relative = source
@@ -85,17 +87,26 @@ pub fn render_live_screen(model: &LiveScreenModel) -> Vec<String> {
     let mut lines = vec![
         header_line(&model.job_name, &model.status),
         divider(),
-        summary_row(&model.summary[..4]),
-        summary_row(&model.summary[4..8]),
+        live_counts_row(&model.summary),
+        live_bytes_rate_row(&model.summary),
+        live_elapsed_eta_row(&model.summary),
         blank_line(),
-        progress_line(&model.overall_label, &model.overall_progress),
+        progress_line(
+            &model.overall_label,
+            &model.overall_progress,
+            Some(&model.overall_progress_text),
+        ),
         blank_line(),
-        phase_line(&model.phase_label, &model.phase_progress_text),
+        phase_line(&model.phase_label),
     ];
 
-    for worker in &model.workers {
+    for worker in model.workers.iter().take(VISIBLE_WORKER_ROWS) {
         lines.push(render_worker_row(worker));
     }
+    for worker in model.workers.len()..VISIBLE_WORKER_ROWS {
+        lines.push(render_worker_row(&WorkerRowModel::idle(worker_tag(worker))));
+    }
+    lines.push(divider());
 
     lines
 }
@@ -104,10 +115,11 @@ pub fn render_post_run_screen(model: &PostRunScreenModel) -> Vec<String> {
     let mut lines = vec![
         header_line(&model.job_name, &model.status),
         divider(),
-        summary_row(&model.summary[..4]),
-        summary_row(&model.summary[4..8]),
+        post_run_counts_row(&model.summary),
+        post_run_bytes_rate_row(&model.summary),
+        post_run_elapsed_skip_row(&model.summary),
         blank_line(),
-        progress_line(&model.completion_label, &model.completion_progress),
+        progress_line(&model.completion_label, &model.completion_progress, None),
         blank_line(),
         pad_to_width("By Category"),
         divider(),
@@ -141,70 +153,43 @@ fn blank_line() -> String {
     " ".repeat(CANONICAL_WIDTH)
 }
 
-fn summary_row(metrics: &[crate::progress_model::SummaryMetric]) -> String {
-    let grid_labels = ["Scanned", "Planned", "Copied", "Failed"];
-    if metrics.len() == 4
-        && metrics
-            .iter()
-            .map(|metric| metric.label.as_str())
-            .eq(grid_labels)
-    {
-        let cols: Vec<String> = metrics
-            .iter()
-            .map(|metric| format!("{}: {}", metric.label, metric.value))
-            .collect();
-        return pad_to_width(&format!(
-            "{:<21}{:<20}{:<20}{:<19}",
-            cols[0], cols[1], cols[2], cols[3]
-        ));
+fn progress_line(label: &str, model: &ProgressBarModel, trailing: Option<&str>) -> String {
+    let percent = model.percent.min(100);
+    let bar = rounded_progress_bar_string(percent, model.width.max(LIVE_BAR_WIDTH));
+    let trailing = trailing.unwrap_or("");
+    if trailing.is_empty() {
+        return pad_to_width(&format!("{label:<19}  {bar}  {percent:>2}%"));
     }
 
-    let content = metrics
-        .iter()
-        .enumerate()
-        .fold(String::new(), |mut acc, (index, metric)| {
-            let separator = if index == 0 { "" } else { "  " };
-            let full = format!("{separator}{}: {}", metric.label, metric.value);
-            if acc.chars().count() + full.chars().count() <= CANONICAL_WIDTH {
-                acc.push_str(&full);
-                return acc;
-            }
-
-            let fallback = format!("{separator}{}: ", metric.label);
-            if acc.chars().count() + fallback.chars().count() <= CANONICAL_WIDTH {
-                acc.push_str(&fallback);
-            }
-            acc
-        });
-    pad_to_width(&content)
+    pad_to_width(&format!("{label:<19}  {bar}  {percent:>2}%  {trailing}"))
 }
 
-fn progress_line(label: &str, model: &ProgressBarModel) -> String {
-    let percent = model.percent.min(100);
-    let bar = progress_bar_string(percent, LIVE_BAR_WIDTH);
-    pad_to_width(&format!("{label:<19}  {bar}  {percent:>2}%"))
-}
-
-fn phase_line(label: &str, progress: &str) -> String {
-    let gap = CANONICAL_WIDTH.saturating_sub(label.chars().count() + progress.chars().count());
-    format!("{label}{}{progress}", " ".repeat(gap))
+fn phase_line(label: &str) -> String {
+    pad_to_width(label)
 }
 
 fn render_worker_row(worker: &WorkerRowModel) -> String {
     let bar = if worker.idle {
-        "░".repeat(WORKER_BAR_WIDTH)
+        "▒".repeat(WORKER_BAR_WIDTH)
     } else {
         rounded_progress_bar_string(worker.percent, WORKER_BAR_WIDTH)
     };
-    let item_width = if worker.idle { 28 } else { 30 };
+    let item_width = 24;
+    let detail = if worker.time.is_empty() {
+        "--".to_string()
+    } else {
+        worker.time.clone()
+    };
+
+    let spinner = worker.spinner_frame.unwrap_or(' ');
 
     pad_to_width(&format!(
-        "{}  {}  {:<item_width$}  {:>8}  {:>8}",
+        "{spinner} {}  {}  {:<item_width$}  {:>8}  {:>10}",
         worker.worker_tag,
         bar,
         truncate_middle(&worker.item, item_width),
         worker.size,
-        worker.time,
+        detail,
         item_width = item_width
     ))
 }
@@ -226,14 +211,95 @@ fn render_error_row(label: &str, detail: &str) -> String {
     pad_to_width(&format!("{}  {}", truncate_middle(label, 24), detail))
 }
 
-fn progress_bar_string(percent: usize, width: usize) -> String {
-    let filled = (percent.min(100) * width) / 100;
-    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+fn rounded_progress_bar_string(percent: usize, width: usize) -> String {
+    let filled = filled_cells(percent, width);
+    format!(
+        "{}{}",
+        "█".repeat(filled.min(width)),
+        "▒".repeat(width.saturating_sub(filled.min(width)))
+    )
 }
 
-fn rounded_progress_bar_string(percent: usize, width: usize) -> String {
-    let filled = ((percent.min(100) * width) + 50) / 100;
-    format!("{}{}", "█".repeat(filled.min(width)), "░".repeat(width.saturating_sub(filled.min(width))))
+fn filled_cells(percent: usize, width: usize) -> usize {
+    let percent = percent.min(100);
+    if percent >= 100 {
+        return width;
+    }
+
+    let rounded = ((percent * width) + 50) / 100;
+    rounded.clamp(0, width.saturating_sub(1))
+}
+
+fn live_counts_row(metrics: &[crate::progress_model::SummaryMetric]) -> String {
+    summary_two_column_row(
+        &metric_pair(metrics, "Scanned"),
+        &format!(
+            "{}, {}, {}",
+            metric_pair(metrics, "Planned"),
+            metric_pair(metrics, "Copied"),
+            metric_pair(metrics, "Failed")
+        ),
+    )
+}
+
+fn live_bytes_rate_row(metrics: &[crate::progress_model::SummaryMetric]) -> String {
+    summary_two_column_row(
+        &metric_pair(metrics, "Bytes"),
+        &metric_pair(metrics, "Rate"),
+    )
+}
+
+fn live_elapsed_eta_row(metrics: &[crate::progress_model::SummaryMetric]) -> String {
+    summary_two_column_row(
+        &metric_pair(metrics, "Elapsed"),
+        &metric_pair(metrics, "ETA"),
+    )
+}
+
+fn post_run_counts_row(metrics: &[crate::progress_model::SummaryMetric]) -> String {
+    summary_two_column_row(
+        &metric_pair(metrics, "Scanned"),
+        &format!(
+            "{}, {}, {}",
+            metric_pair(metrics, "Planned"),
+            metric_pair(metrics, "Copied"),
+            metric_pair(metrics, "Failed")
+        ),
+    )
+}
+
+fn post_run_bytes_rate_row(metrics: &[crate::progress_model::SummaryMetric]) -> String {
+    summary_two_column_row(
+        &metric_pair(metrics, "Bytes transferred"),
+        &metric_pair(metrics, "Avg rate"),
+    )
+}
+
+fn post_run_elapsed_skip_row(metrics: &[crate::progress_model::SummaryMetric]) -> String {
+    summary_two_column_row(
+        &metric_pair(metrics, "Elapsed"),
+        &metric_pair(metrics, "Skip rate"),
+    )
+}
+
+fn summary_two_column_row(left: &str, right: &str) -> String {
+    let left_width = SUMMARY_RIGHT_COLUMN.max(left.chars().count() + 1);
+    pad_to_width(&format!(
+        "{left:<left_width$}{right}",
+        left_width = left_width
+    ))
+}
+
+fn metric_pair(metrics: &[crate::progress_model::SummaryMetric], label: &str) -> String {
+    format!("{label}: {}", metric_value(metrics, label))
+}
+
+fn metric_value<'a>(metrics: &'a [crate::progress_model::SummaryMetric], label: &str) -> &'a str {
+    metrics
+        .iter()
+        .find(|metric| metric.label == label)
+        .map(|metric| metric.value.as_str())
+        .unwrap_or("--")
 }
 
 fn pad_to_width(value: &str) -> String {

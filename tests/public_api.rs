@@ -3,7 +3,10 @@ use std::fs;
 use pathsync::config;
 use pathsync::error::{ConfigError, PathsyncError};
 use pathsync::policy::{ComparePolicy, TimezonePolicy, TransferPolicy};
-use pathsync::{RunOptions, build_transfer_plan, build_transfer_plan_with_stats};
+use pathsync::{
+    PreviewUiMode, RunOptions, build_transfer_plan, build_transfer_plan_with_stats,
+    preview_ui_output,
+};
 
 #[test]
 fn public_policy_types_are_exposed_through_resolved_jobs() {
@@ -104,10 +107,8 @@ fn public_build_transfer_plan_returns_typed_errors() {
 
 #[test]
 fn public_build_transfer_plan_with_stats_returns_planning_metrics() {
-    let root = std::env::temp_dir().join(format!(
-        "pathsync-public-api-stats-{}",
-        std::process::id()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("pathsync-public-api-stats-{}", std::process::id()));
     let source = root.join("source");
     let target = root.join("target");
     fs::create_dir_all(&source).unwrap();
@@ -164,4 +165,18 @@ fn public_run_returns_typed_config_errors() {
         err,
         PathsyncError::Config(ConfigError::ReadConfig { .. })
     ));
+}
+
+#[test]
+fn public_preview_ui_output_can_render_live_and_post_copy_screens() {
+    let live = preview_ui_output(PreviewUiMode::Live);
+    let post = preview_ui_output(PreviewUiMode::PostCopy);
+    let all = preview_ui_output(PreviewUiMode::All);
+
+    assert!(live.contains("LIVE / COPY-LARGE"));
+    assert!(!live.contains("COMPLETE WITH ERRORS"));
+    assert!(post.contains("COMPLETE WITH ERRORS"));
+    assert!(!post.contains("LIVE / COPY-LARGE"));
+    assert!(all.contains("LIVE / COPY-LARGE"));
+    assert!(all.contains("COMPLETE WITH ERRORS"));
 }

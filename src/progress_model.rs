@@ -56,6 +56,7 @@ impl ProgressBarModel {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerRowModel {
+    pub spinner_frame: Option<char>,
     pub worker_tag: String,
     pub percent: usize,
     pub item: String,
@@ -66,6 +67,7 @@ pub struct WorkerRowModel {
 
 impl WorkerRowModel {
     pub fn active(
+        spinner_frame: char,
         worker_tag: impl Into<String>,
         percent: usize,
         item: impl Into<String>,
@@ -73,6 +75,7 @@ impl WorkerRowModel {
         time: impl Into<String>,
     ) -> Self {
         Self {
+            spinner_frame: Some(spinner_frame),
             worker_tag: worker_tag.into(),
             percent,
             item: item.into(),
@@ -84,6 +87,7 @@ impl WorkerRowModel {
 
     pub fn idle(worker_tag: impl Into<String>) -> Self {
         Self {
+            spinner_frame: None,
             worker_tag: worker_tag.into(),
             percent: 0,
             item: "idle".to_string(),
@@ -164,8 +168,8 @@ pub struct LiveScreenModel {
     pub summary: Vec<SummaryMetric>,
     pub overall_label: String,
     pub overall_progress: ProgressBarModel,
+    pub overall_progress_text: String,
     pub phase_label: String,
-    pub phase_progress_text: String,
     pub workers: Vec<WorkerRowModel>,
 }
 

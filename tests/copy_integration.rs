@@ -82,10 +82,23 @@ layout = {layout}
 }
 
 fn run_pathsync(args: &[&str]) -> CommandOutput {
-    let output = Command::new(env!("CARGO_BIN_EXE_pathsync"))
-        .args(args)
-        .output()
-        .expect("failed to run pathsync");
+    run_pathsync_with_env(args, &[])
+}
+
+fn run_pathsync_with_env(args: &[&str], extra_env: &[(&str, &str)]) -> CommandOutput {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pathsync"));
+    command
+        .env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        .env("COLUMNS", "120")
+        .env("LC_ALL", "C")
+        .args(args);
+
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+
+    let output = command.output().expect("failed to run pathsync");
     CommandOutput {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -114,6 +127,40 @@ fn version_flag_prints_binary_version() {
         output.stdout.trim(),
         format!("pathsync {}", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn preview_ui_flag_renders_canned_live_and_post_copy_screens_without_config() {
+    let live = run_pathsync(&["--preview-ui", "live"]);
+    let post = run_pathsync(&["--preview-ui", "post-copy"]);
+    let all = run_pathsync(&["--preview-ui", "all"]);
+
+    assert!(
+        live.status.success(),
+        "stdout={}\nstderr={}",
+        live.stdout,
+        live.stderr
+    );
+    assert!(live.stdout.contains("LIVE / COPY-LARGE"));
+    assert!(!live.stdout.contains("COMPLETE WITH ERRORS"));
+
+    assert!(
+        post.status.success(),
+        "stdout={}\nstderr={}",
+        post.stdout,
+        post.stderr
+    );
+    assert!(post.stdout.contains("COMPLETE WITH ERRORS"));
+    assert!(!post.stdout.contains("LIVE / COPY-LARGE"));
+
+    assert!(
+        all.status.success(),
+        "stdout={}\nstderr={}",
+        all.stdout,
+        all.stderr
+    );
+    assert!(all.stdout.contains("LIVE / COPY-LARGE"));
+    assert!(all.stdout.contains("COMPLETE WITH ERRORS"));
 }
 
 #[test]
@@ -175,6 +222,7 @@ fn real_copy_preserves_contents_and_mtime() {
     let copied_mtime = FileTime::from_last_modification_time(&fs::metadata(&copied).unwrap());
     assert_eq!(copied_mtime.unix_seconds(), mtime.unix_seconds());
     assert!(output.stdout.contains("SYNC COMPLETE"));
+    assert!(output.stdout.contains("Result       success"));
     assert!(output.stdout.contains("\nSummary\n"));
     assert!(output.stdout.contains("\nCounts\n"));
     assert!(output.stdout.contains("\nCopied Files\n"));
@@ -221,7 +269,7 @@ fn rerun_under_size_mtime_skips_unchanged_files() {
 }
 
 #[test]
-fn non_tty_copy_emits_plain_progress_lines_with_phase_and_relative_labels() {
+fn non_tty_copy_emits_plain_progress_lines_with_console_ui_contract() {
     let root = TempDir::new("pathsync-progress-plain");
     let source = root.path().join("source");
     let target = root.path().join("target");
@@ -259,16 +307,17 @@ parallel = 2
         output.stderr
     );
     assert!(output.stdout.contains("phase    : adaptive"));
+    assert!(output.stdout.contains("copying files |"));
+    assert!(output.stdout.contains("copy complete |"));
+    assert!(output.stdout.contains("W01"));
+    assert!(output.stdout.contains("W02"));
+    assert!(!output.stdout.contains("[W00]"));
+    assert!(!output.stdout.contains("[W01]"));
     assert!(!output.stdout.contains("phase    : large files"));
     assert!(!output.stdout.contains("phase    : small files"));
-    assert!(output.stdout.contains("0/2 files"));
     assert!(output.stdout.contains("one/photo.jpg"));
     assert!(output.stdout.contains("two/photo.jpg"));
-    assert!(
-        output
-            .stdout
-            .contains("============================== SYNC COMPLETE")
-    );
+    assert!(output.stdout.contains("SYNC COMPLETE"));
     assert!(
         output
             .stdout
@@ -331,7 +380,7 @@ parallel = 2
 
 #[cfg(unix)]
 #[test]
-fn failure_path_does_not_report_all_copies_complete() {
+fn failure_path_reports_complete_with_errors_and_never_success_text() {
     let root = TempDir::new("pathsync-progress-failure");
     let source = root.path().join("source");
     let target = root.path().join("target");
@@ -354,8 +403,8 @@ fn failure_path_does_not_report_all_copies_complete() {
         output.stderr
     );
     assert!(!output.stdout.contains("all copies complete"));
+    assert!(output.stdout.contains("ATTENTION ITEMS") || output.stderr.contains("ATTENTION ITEMS"));
     assert!(output.stdout.contains("copy failed") || output.stderr.contains("copy failed"));
-    assert!(output.stdout.contains("ATTENTION ITEMS"));
     assert!(output.stdout.contains("\nFailures\n"));
 }
 
@@ -410,9 +459,13 @@ parallel = 2
     assert!(target.join("open/small.jpg").exists());
     assert!(!target.join("blocked/large.jpg").exists());
     assert!(output.stdout.contains("phase    : adaptive"));
+    assert!(output.stdout.contains("copying files |"));
+    assert!(output.stdout.contains("W01"));
+    assert!(!output.stdout.contains("[W00]"));
     assert!(!output.stdout.contains("phase    : large files"));
     assert!(!output.stdout.contains("phase    : small files"));
     assert!(output.stdout.contains("[local]"));
+    assert!(output.stdout.contains("ATTENTION ITEMS"));
     assert!(output.stdout.contains("Systemic"));
     assert!(output.stdout.contains("no"));
 }

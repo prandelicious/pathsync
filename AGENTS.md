@@ -62,6 +62,22 @@ Use this default decomposition pattern for complex requests:
 4. Integrate the results.
 5. Verify the combined outcome before reporting completion.
 
+## Subagent Strategy
+
+- When `.codex/agents/` defines project-local subagents, prefer them over generic delegation prompts for the matching role.
+- Keep the immediate blocking task with the main agent. Delegate sidecar exploration, independent review, API verification, or isolated implementation only when the delegated output will unblock a clear next step.
+- Use `code-mapper` before editing when the affected execution path, ownership boundary, or change surface is not yet precise.
+- Use `code-reviewer` for branch review, risky diffs, or before merge when you need concrete defect and regression findings rather than a general summary.
+- Use `rust-engineer` for Rust implementation or debugging work involving ownership, lifetimes, concurrency, async behavior, error propagation, or performance-sensitive code paths.
+- Use `refactoring-specialist` when the goal is behavior-preserving cleanup, seam extraction, modularization, or complexity reduction without mixing in feature work.
+- Use `documentation-engineer` when the task is to write or update technical documentation that must stay faithful to current code paths, commands, file locations, prerequisites, and operator workflows.
+- Use `docs_researcher` when a change depends on framework, library, CLI, or API behavior that should be verified against primary documentation before implementation or review conclusions.
+- For review-style workflows, prefer this pattern: `code-mapper` maps the affected path, `code-reviewer` identifies real risks in the diff, and `docs_researcher` verifies any external APIs or framework assumptions the patch relies on.
+- For implementation-style workflows, keep feature design and final integration local, and delegate at most one specialized implementation track per area, such as `rust-engineer` for the Rust fix and `docs_researcher` for API confirmation.
+- For documentation-style workflows, keep source-of-truth code inspection local or pair it with `code-mapper`, use `documentation-engineer` to draft or revise the docs, and use `docs_researcher` only when the docs depend on external framework behavior that must be cited or verified.
+- Do not spawn subagents when the task is simple, when the main agent is already on the critical path, or when overlapping scopes would cause duplicate work or conflicting edits.
+- Require every subagent result to include concrete file ownership, assumptions, evidence, and the fastest next action for unresolved uncertainty.
+
 ## Planning Rules
 
 - For non-trivial work, produce a short plan before implementation.
@@ -71,8 +87,7 @@ Use this default decomposition pattern for complex requests:
 
 ## Task Management
 
-- For non-trivial work, track the plan in `tasks/todo.md` when that path is available and appropriate for the repo.
-- If `tasks/todo.md` does not exist or should not be added, keep the same checklist in the working response or plan tool.
+- **MUST** Always use the CLI ticket system `tk` for task management. Run `tk help` when you need to use it. If `tk` is not in the system, fallback to `docs/todo.md`
 - Mark progress as work completes. Do not keep stale tasks open after scope changes.
 - Before finishing, confirm each planned step is complete, removed, or explicitly deferred.
 
