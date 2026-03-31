@@ -2,6 +2,44 @@
 
 `pathsync` is a config-driven file sync tool that scans source trees, renders destination paths from a template, and copies files into a target directory.
 
+## Build and Install
+
+`pathsync` is a Rust CLI. Install a current Rust toolchain with `cargo` first.
+
+Build a release binary from this repository:
+
+```bash
+cargo build --release
+```
+
+The compiled binary will be available at `target/release/pathsync`.
+
+Install `pathsync` into Cargo's binary directory from a local checkout:
+
+```bash
+cargo install --path .
+```
+
+If you also want the benchmark helper binary, install all binaries from the repository:
+
+```bash
+cargo install --path . --bins
+```
+
+After installation, verify the CLI is available:
+
+```bash
+pathsync --help
+```
+
+Run a job with an explicit config file:
+
+```bash
+pathsync --config /path/to/config.toml JOB_NAME
+```
+
+If `--config` is omitted, `pathsync` reads `~/.config/pathsync/config.toml` by default unless `XDG_CONFIG_HOME` is set.
+
 ## Config
 
 Configuration is TOML. The top-level keys are:
