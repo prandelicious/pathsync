@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use filetime::{FileTime, set_file_mtime};
-use pathsync::error::PathsyncError;
 use pathsync::{build_transfer_plan, config};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -636,14 +635,14 @@ fn failed_rename_cleans_up_temp_file() {
 }
 
 #[test]
-fn planning_failure_precedes_copy_on_collisions() {
+fn planning_dedupes_identical_collisions_before_copy() {
     let root = TempDir::new("pathsync-collision");
     let source = root.path().join("source");
     let target = root.path().join("target");
     fs::create_dir_all(&source).unwrap();
     fs::create_dir_all(&target).unwrap();
     write_file(&source.join("one/photo.jpg"), b"1111");
-    write_file(&source.join("two/photo.jpg"), b"2222");
+    write_file(&source.join("two/photo.jpg"), b"1111");
 
     let config_path = write_config(
         &root,
@@ -654,12 +653,10 @@ fn planning_failure_precedes_copy_on_collisions() {
     );
     let config = config::load_config(&config_path).unwrap();
     let job = config::resolve_job(&config, None, None, false, None).unwrap();
-    let err = build_transfer_plan(&job, false).unwrap_err();
-    assert!(matches!(
-        err,
-        PathsyncError::Plan(pathsync::plan::PlanError::Collision { .. })
-    ));
-    assert!(!target.join("photo.jpg").exists());
+
+    let plans = build_transfer_plan(&job, false).unwrap();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].dest, target.join("photo.jpg"));
 }
 
 fn load_job(source: &Path, target: &Path, compare_mode: &str) -> config::ResolvedJob {

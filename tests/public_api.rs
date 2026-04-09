@@ -58,9 +58,55 @@ fn public_policy_types_are_exposed_through_resolved_jobs() {
 }
 
 #[test]
-fn public_build_transfer_plan_returns_typed_errors() {
+fn public_build_transfer_plan_dedupes_identical_collision_sources() {
     let root = std::env::temp_dir().join(format!(
         "pathsync-public-api-collision-{}",
+        std::process::id()
+    ));
+    let source = root.join("source");
+    let target = root.join("target");
+    fs::create_dir_all(source.join("one")).unwrap();
+    fs::create_dir_all(source.join("two")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::write(source.join("one/photo.jpg"), b"1111").unwrap();
+    fs::write(source.join("two/photo.jpg"), b"1111").unwrap();
+
+    let config = config::Config {
+        default_job: Some("sync".to_string()),
+        parallel: None,
+        timezone: None,
+        jobs: [(
+            "sync".to_string(),
+            config::JobConfig {
+                enabled: Some(true),
+                source: source.clone(),
+                target: target.clone(),
+                extensions: vec!["jpg".to_string()],
+                compare: None,
+                transfer: None,
+                parallel: None,
+                timezone: None,
+                layout: config::LayoutConfig::Detailed(config::LayoutDetailed {
+                    kind: "template".to_string(),
+                    value: Some("{filename}".to_string()),
+                }),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+
+    let job = config::resolve_job(&config, None, None, false, None).unwrap();
+    let plans = build_transfer_plan(&job, false).unwrap();
+
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].dest, target.join("photo.jpg"));
+}
+
+#[test]
+fn public_build_transfer_plan_returns_typed_collision_errors_for_distinct_content() {
+    let root = std::env::temp_dir().join(format!(
+        "pathsync-public-api-collision-distinct-{}",
         std::process::id()
     ));
     let source = root.join("source");

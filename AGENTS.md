@@ -107,6 +107,7 @@ Use this default decomposition pattern for complex requests:
 ## Tool and Source Policy
 
 - Use tools for repo facts, file contents, command output, and anything time-sensitive.
+- Use the fff MCP tools for all file search operations instead of default tools.
 - Prefer primary sources for technical claims.
 - Verify any "latest", "current", or date-sensitive statement before repeating it.
 - Use absolute dates when clarifying relative dates.
@@ -162,7 +163,15 @@ Run cargo test for affected suites and report any blocked checks.
 
 ## Project Workflow
 
-For this Rust project, prefer these checks when relevant:
+For this Rust project, use `just` to invoke common tasks:
+
+| Command | Description |
+|---------|-------------|
+| `just build` | Build release binary to `target/release/pathsync` |
+| `just install` | Build and install binary to `~/.local/bin/` |
+| `just clean` | Remove build artifacts |
+
+For code quality checks, run these directly:
 
 1. `cargo fmt --check`
 2. `cargo clippy --all-targets --all-features -- -D warnings`

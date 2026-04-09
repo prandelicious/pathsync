@@ -103,7 +103,40 @@ fn render_layout_accepts_relative_templates() {
 }
 
 #[test]
-fn build_plan_reports_destination_collisions() {
+fn build_plan_dedupes_identical_collision_sources() {
+    let temp = TempDir::new();
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+
+    write_file(&source.join("one/photo.jpg"), b"1111");
+    write_file(&source.join("two/photo.jpg"), b"1111");
+
+    let job = PlanJob {
+        source: source.clone(),
+        target: target.clone(),
+        extensions: vec!["jpg".to_string()],
+        compare_policy: ComparePolicy::PathSize,
+        template: "{filename}".to_string(),
+    };
+
+    let build = build_plan(&job, false, |path, _metadata| {
+        Ok(sample_context(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .expect("utf-8 filename"),
+        ))
+    })
+    .unwrap();
+
+    assert_eq!(build.plans.len(), 1);
+    assert_eq!(build.plans[0].dest, target.join("photo.jpg"));
+    assert!(build.plans[0].source.ends_with("one/photo.jpg"));
+}
+
+#[test]
+fn build_plan_reports_collision_for_distinct_content() {
     let temp = TempDir::new();
     let source = temp.path().join("source");
     let target = temp.path().join("target");

@@ -1,51 +1,111 @@
 # pathsync
 
-`pathsync` is a config-driven file sync tool that scans source trees, renders destination paths from a template, and copies files into a target directory.
+`pathsync` is a Rust CLI for config-driven file sync jobs. It scans a source tree, renders each destination path from a layout, skips files that already match the selected compare policy, and copies the remaining files into a target directory.
 
-## Build and Install
+The repository currently ships two binaries:
 
-`pathsync` is a Rust CLI. Install a current Rust toolchain with `cargo` first.
+- `pathsync`: the sync CLI
+- `bench-copy`: a helper for benchmarking copy backends on real storage
 
-Build a release binary from this repository:
+## Current capabilities
+
+- Multiple named jobs in one TOML config
+- CLI overrides for job name, config path, parallelism, extensions, and disabled jobs
+- Dry-run planning without writing files
+- Flat, year/month, and fully templated destination layouts
+- Date extraction from EXIF for JPEG/TIFF, with filesystem mtime fallback
+- Timezone-aware filesystem date extraction
+- `path`, `path_size`, and `size_mtime` compare policies
+- `standard` and adaptive transfer scheduling
+- Best-effort runtime copy handling with end-of-run failure summaries
+- Collision protection for rendered destination paths
+  - identical files that collide collapse to one planned copy
+  - distinct files that collide fail planning
+- Preview screens for the live and post-copy terminal UI
+- Native-copy benchmarking through `bench-copy`
+
+## Build and install
+
+Install a current Rust toolchain first.
+
+### Using `just`
+
+This repo defines the common workflows in `Justfile`:
+
+```bash
+just build
+just install
+just clean
+```
+
+- `just build` builds `target/release/pathsync`
+- `just install` copies that binary to `~/.local/bin/pathsync`
+- `just clean` removes build artifacts
+
+### Using Cargo directly
 
 ```bash
 cargo build --release
-```
-
-The compiled binary will be available at `target/release/pathsync`.
-
-Install `pathsync` into Cargo's binary directory from a local checkout:
-
-```bash
-cargo install --path .
-```
-
-If you also want the benchmark helper binary, install all binaries from the repository:
-
-```bash
 cargo install --path . --bins
 ```
 
-After installation, verify the CLI is available:
+After installation:
 
 ```bash
 pathsync --help
+bench-copy --help
 ```
 
-Run a job with an explicit config file:
+## CLI usage
+
+Run the default job from the default config location:
+
+```bash
+pathsync
+```
+
+Run a specific job from an explicit config file:
 
 ```bash
 pathsync --config /path/to/config.toml JOB_NAME
 ```
 
-If `--config` is omitted, `pathsync` reads `~/.config/pathsync/config.toml` by default unless `XDG_CONFIG_HOME` is set.
+List configured jobs without validating source or target directories:
 
-## Config
+```bash
+pathsync --config examples/config.toml --list-jobs
+```
 
-Configuration is TOML. The top-level keys are:
+Preview the terminal UI without loading config:
 
-- `default_job`: optional job name to use when no job is passed on the CLI
-- `parallel`: optional default worker count for jobs that do not set their own
+```bash
+pathsync --preview-ui all
+```
+
+Useful flags:
+
+- `--config <PATH>`: read a specific TOML config
+- `--list-jobs`: print configured jobs and exit
+- `--dry-run`: print planned copies without writing files
+- `--force`: copy files even when the compare policy would skip them
+- `--parallel <N>`: override the resolved worker count
+- `--extensions <csv>`: override the configured extension allow-list
+- `--allow-disabled`: run a job even if `enabled = false`
+- `--preview-ui <live|post-copy|all>`: render canned UI previews and exit
+
+If `--config` is omitted, `pathsync` reads:
+
+- `$XDG_CONFIG_HOME/pathsync/config.toml`, when `XDG_CONFIG_HOME` is set
+- otherwise `~/.config/pathsync/config.toml`
+
+If no job name is passed, `pathsync` uses `default_job` when present. Otherwise it picks the first enabled job. If `default_job` points at a disabled job, it falls back to the first enabled job.
+
+## Configuration
+
+Configuration is TOML with these top-level keys:
+
+- `default_job`: optional default job name
+- `parallel`: optional default worker count
 - `timezone`: optional default timezone for filesystem-mtime date extraction
 - `jobs`: map of job names to job definitions
 
@@ -54,58 +114,71 @@ Each job supports:
 - `enabled`: optional boolean, defaults to `true`
 - `source`: source directory to scan
 - `target`: destination directory root
-- `extensions`: list of allowed file extensions, without leading dots
+- `extensions`: allowed file extensions
 - `compare`: optional compare policy
 - `transfer`: optional transfer policy
-- `parallel`: optional per-job worker count
-- `timezone`: optional per-job timezone override for filesystem-mtime date extraction
+- `parallel`: optional per-job worker count override
+- `timezone`: optional per-job timezone override
 - `layout`: destination layout preset or template
 
-## Compare Modes
+Notes:
+
+- `source` and `target` must already exist as directories
+- extensions are normalized by trimming whitespace, removing any leading `.`, and lowercasing
+- `parallel` defaults to `4` when neither the CLI nor config sets it
+- `parallel = 0` is rejected
+
+## Compare policies
 
 `compare.mode` accepts:
 
 - `path`
 - `path_size`
-- `size_mtime`
+- `size_mtime` (default)
 
-If `compare.mode` is omitted, `size_mtime` is the default.
+Behavior:
 
-- `path` only checks whether the destination path already exists
-- `path_size` checks destination existence plus file size
-- `size_mtime` checks file size and modified time
+- `path`: skip when the rendered destination path already exists
+- `path_size`: skip when the destination exists and the file size matches
+- `size_mtime`: skip when file size and modified time match
 
-## Transfer Modes
+## Transfer policies
 
 `transfer.mode` accepts:
 
-- `standard`
+- `standard` (default)
 - `adaptive`
 
-If `transfer.mode` is omitted, `standard` is the default.
+### `standard`
 
-- `standard` uses the resolved `parallel` value as a fixed worker count for all files.
-- `adaptive` uses the resolved `parallel` value as a slot budget.
+Uses the resolved `parallel` value as a fixed worker count.
 
-Adaptive transfer options:
+### `adaptive`
 
-- `large_file_threshold_mb`: files at or above this size are treated as large. Defaults to `100`.
-- `large_file_slots`: slot cost for each large file. Defaults to the resolved `parallel` value.
+Uses the resolved `parallel` value as a slot budget.
 
-Adaptive scheduling rules:
+Options:
 
-- Small files consume `1` slot.
-- Large files consume `large_file_slots`.
-- `pathsync` prefers larger files first and backfills smaller files when they fit the remaining slot budget.
-- Setting `large_file_slots = parallel` preserves the original behavior of running large files one at a time.
+- `large_file_threshold_mb`: files at or above this size are large, default `100`
+- `large_file_slots`: slot cost for each large file, default `parallel`
 
-## Layouts
+Rules:
+
+- small files consume `1` slot
+- large files consume `large_file_slots`
+- larger files are scheduled first, then smaller files backfill remaining slots
+- `large_file_slots` must be between `1` and `parallel`
+- `large_file_slots = parallel` preserves the old one-large-file-at-a-time behavior
+
+## Layouts and template tokens
 
 `layout` may be:
 
 - `"flat"`: place files directly under the target root
-- `"year_month"`: group by extracted year and month
-- `{ kind = "template", value = "..." }`: use an explicit template
+- `"year_month"`: place files under `{year}/{month}/`
+- `{ kind = "flat" }`
+- `{ kind = "year_month" }`
+- `{ kind = "template", value = "..." }`
 
 Available template tokens:
 
@@ -117,54 +190,74 @@ Available template tokens:
 - `{filename}`
 - `{source_rel_dir}`
 
-## Date Extraction
+Template safety rules:
+
+- rendered paths must stay relative to the job target
+- absolute paths are rejected
+- escaping paths such as `..` are rejected
+- unresolved template tokens are rejected
+
+## Date extraction and timezones
 
 `pathsync` derives `{year}`, `{month}`, and `{day}` like this:
 
-- JPEG/TIFF images: EXIF capture date first, then filesystem modified time if EXIF is missing or unreadable
-- Other files including videos: filesystem modified time
+- JPEG and TIFF: EXIF capture date first, then filesystem modified time if EXIF is missing or unreadable
+- all other files, including videos: filesystem modified time
 
 Timezone rules:
 
-- Filesystem mtimes use the resolved timezone policy for the job.
-- Timezone precedence is job `timezone`, then top-level `timezone`, then implicit `"local"`.
-- Supported values are `"local"`, `"UTC"`, and IANA names like `"America/Los_Angeles"`.
-- EXIF-derived dates are treated as literal captured calendar values and are not reinterpreted through the configured timezone.
+- filesystem mtimes use the resolved timezone policy
+- precedence is job `timezone`, then top-level `timezone`, then implicit `local`
+- supported values are `local`, `UTC`, and IANA names such as `America/Los_Angeles`
+- EXIF-derived dates are treated as literal captured calendar values and are not reinterpreted through the configured timezone
 
-Filename patterns are not used for date extraction.
+Filename-based date parsing is not used.
 
-## Safety Rules
+## Planning and copy behavior
 
-- Rendered destination paths must remain relative to the job target.
-- Absolute rendered paths are rejected.
-- Escaping paths such as `..` segments are rejected.
-- Unresolved template tokens are rejected.
-- If two source files resolve to the same destination, planning fails instead of silently picking one.
+Before copying, `pathsync` builds a plan from the source tree.
 
-## Copy Failure Reporting
+- files outside the extension allow-list are ignored
+- if no files need copying, the CLI prints `no new files to copy for job ...`
+- a dry run prints the planned source → destination mappings
+- if two different source files render to the same destination:
+  - identical content collapses to one planned copy
+  - distinct content aborts planning with a collision error
 
-- Planning and config failures still abort before copying starts.
-- Runtime copy failures are best-effort: `pathsync` continues through the rest of the planned files and reports all failures at the end.
-- The final summary marks each runtime failure as `[local]` or `[systemic]`.
-- `Systemic` becomes `yes` when a job-wide failure pattern is detected.
-- Permission failures start as local and are promoted to systemic after 3 prior permission failures in the same job.
+During copying:
 
-## Copy Performance
+- `pathsync` preserves file modification times on copied files
+- runtime copy failures are best-effort; later files still run when possible
+- planning and config failures still stop the run before copying starts
+- final summaries classify failures as `[local]` or `[systemic]`
+- repeated permission failures can be promoted from local to systemic
 
-`pathsync` now picks OS-native full-file copy paths automatically when the platform supports them. Production config and CLI behavior are unchanged: there is no new transfer mode, flag, or tuning knob for this.
+For terminal output:
 
-When a native path is unavailable or cannot be used safely, `pathsync` falls back to the existing manual copy loop.
+- TTY runs render the full-screen live/post-copy UI
+- non-TTY runs emit plain progress lines and a text summary
 
-## Benchmarking
+## Copy backend and benchmarking
 
-The `bench-copy` binary compares copy strategies on the same source and target storage.
+Production `pathsync` automatically uses OS-native full-file copy paths when they are available and safe. There is no extra transfer mode or CLI flag for this behavior.
 
-- `--method all` runs `native`, `buffered`, and `stdio`, and is the default.
-- `--method native` measures the production native copy path directly.
-- `--method both` remains backward-compatible and means `buffered` plus `stdio`.
-- `--method buffered` and `--method stdio` still measure the existing non-native paths individually.
+When a native path is unavailable, `pathsync` falls back to the existing manual copy loop.
 
-## Example
+Use `bench-copy` to compare copy methods on the same source and target storage:
+
+```bash
+bench-copy --source /path/to/file --target-dir /path/to/dir --runs 3 --method all
+```
+
+Supported benchmark methods:
+
+- `native`
+- `buffered`
+- `stdio`
+- `both` (`buffered` + `stdio`)
+- `all` (`native` + `buffered` + `stdio`, default)
+
+## Example config
 
 ```toml
 default_job = "vlog"
@@ -177,23 +270,22 @@ source = "/Volumes/Go-Ultra/DCIM/Camera01"
 target = "/Volumes/T7/Videos/Vlog"
 extensions = ["mp4", "jpg"]
 compare = { mode = "size_mtime" }
-transfer = { mode = "adaptive", large_file_threshold_mb = 100 }
+transfer = { mode = "adaptive", large_file_threshold_mb = 100, large_file_slots = 3 }
 timezone = "America/Los_Angeles"
 layout = "year_month"
 ```
 
-Example with backfill-friendly adaptive settings:
+Template-based layout example:
 
 ```toml
-default_job = "vlog"
-parallel = 4
-
-[jobs.vlog]
-enabled = true
-source = "/Volumes/Go-Ultra/DCIM/Camera01"
-target = "/Volumes/T7/Videos/Vlog"
+[jobs.template_example]
+enabled = false
+source = "/path/to/source"
+target = "/path/to/target"
 extensions = ["mp4", "jpg"]
 compare = { mode = "size_mtime" }
-transfer = { mode = "adaptive", large_file_threshold_mb = 100, large_file_slots = 3 }
-layout = "year_month"
+transfer = { mode = "adaptive", large_file_threshold_mb = 250 }
+layout = { kind = "template", value = "{year}/{month}/{ext}/{source_rel_dir}/{filename}" }
 ```
+
+See `/Users/francis/Developer/projects/pathsync/examples/config.toml` for a checked-in sample config.

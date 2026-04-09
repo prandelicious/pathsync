@@ -1,9 +1,10 @@
 use filetime::FileTime;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::hash::Hash;
+use std::io::{self, BufReader, Read};
 use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -18,7 +19,7 @@ pub struct PlanJob {
     pub template: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FileContext {
     pub year: String,
     pub month: String,
@@ -111,12 +112,44 @@ impl Error for PlanError {}
 
 pub type Result<T> = std::result::Result<T, PlanError>;
 
+/// A unique identifier for a file based on its device and inode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FileId {
+    device: u64,
+    inode: u64,
+}
+
+impl From<&fs::Metadata> for FileId {
+    fn from(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            FileId {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // On non-Unix, use file path as fallback (may have collisions)
+            let path = "";
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            path.hash(&mut h);
+            FileId {
+                device: 0,
+                inode: h.finish(),
+            }
+        }
+    }
+}
+
 pub fn build_plan<F>(job: &PlanJob, force: bool, mut context_for: F) -> Result<PlanBuild>
 where
     F: FnMut(&Path, &fs::Metadata) -> Result<FileContext>,
 {
     let extensions = normalize_extensions(&job.extensions);
     let mut candidates = BTreeMap::<PathBuf, Vec<TransferPlan>>::new();
+    let mut seen_files: HashSet<FileId> = HashSet::new();
     let mut stats = PlanningStats::default();
 
     for entry in WalkDir::new(&job.source).follow_links(false) {
@@ -147,6 +180,13 @@ where
             path: Some(source.clone()),
             message: err.to_string(),
         })?;
+
+        // Deduplicate by inode/device to handle symlinked directories
+        // where the same physical file may be discovered via multiple paths
+        let file_id = FileId::from(&metadata);
+        if !seen_files.insert(file_id) {
+            continue; // Skip this file, already processed via another path
+        }
         let file_name = file_name_string(&source)?;
         let mut ctx = context_for(&source, &metadata)?;
         if ctx.source_rel_dir.is_empty() {
@@ -164,19 +204,7 @@ where
         candidates.entry(dest).or_default().push(plan);
     }
 
-    if let Some((destination, plans)) = candidates
-        .iter()
-        .find(|(_, plans)| plans.len() > 1)
-        .map(|(destination, plans)| (destination.clone(), plans.clone()))
-    {
-        let mut sources: Vec<PathBuf> = plans.into_iter().map(|plan| plan.source).collect();
-        sources.sort();
-        sources.dedup();
-        return Err(PlanError::Collision {
-            destination,
-            sources,
-        });
-    }
+    resolve_collisions(&mut candidates)?;
 
     let mut plans = Vec::new();
     for plan in candidates.into_values().flatten() {
@@ -197,6 +225,99 @@ where
 
     plans.sort_by(|a, b| a.dest.cmp(&b.dest));
     Ok(PlanBuild { plans, stats })
+}
+
+fn resolve_collisions(candidates: &mut BTreeMap<PathBuf, Vec<TransferPlan>>) -> Result<()> {
+    let collisions: Vec<(PathBuf, Vec<TransferPlan>)> = candidates
+        .iter()
+        .filter(|(_, plans)| plans.len() > 1)
+        .map(|(dest, plans)| (dest.clone(), plans.clone()))
+        .collect();
+
+    for (destination, plans) in collisions {
+        let Some(plan) = dedupe_identical_collision_sources(&plans)? else {
+            let mut sources: Vec<PathBuf> = plans.into_iter().map(|plan| plan.source).collect();
+            sources.sort();
+            sources.dedup();
+            return Err(PlanError::Collision {
+                destination,
+                sources,
+            });
+        };
+
+        candidates.insert(destination, vec![plan]);
+    }
+
+    Ok(())
+}
+
+fn dedupe_identical_collision_sources(plans: &[TransferPlan]) -> Result<Option<TransferPlan>> {
+    if plans.len() < 2 {
+        return Ok(plans.first().cloned());
+    }
+
+    let mut sorted = plans.to_vec();
+    sorted.sort_by(|a, b| a.source.cmp(&b.source));
+
+    let first = &sorted[0];
+    if sorted.iter().any(|plan| plan.size != first.size) {
+        return Ok(None);
+    }
+
+    for plan in sorted.iter().skip(1) {
+        if !files_match(&first.source, &plan.source)? {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(first.clone()))
+}
+
+fn files_match(left: &Path, right: &Path) -> Result<bool> {
+    const BUFFER_SIZE: usize = 64 * 1024;
+
+    let left_file = fs::File::open(left).map_err(|err| PlanError::Io {
+        context: "failed to open source file for collision comparison".to_string(),
+        path: Some(left.to_path_buf()),
+        message: err.to_string(),
+    })?;
+    let right_file = fs::File::open(right).map_err(|err| PlanError::Io {
+        context: "failed to open source file for collision comparison".to_string(),
+        path: Some(right.to_path_buf()),
+        message: err.to_string(),
+    })?;
+
+    let mut left_reader = BufReader::new(left_file);
+    let mut right_reader = BufReader::new(right_file);
+    let mut left_buf = [0u8; BUFFER_SIZE];
+    let mut right_buf = [0u8; BUFFER_SIZE];
+
+    loop {
+        let left_read = left_reader
+            .read(&mut left_buf)
+            .map_err(|err| PlanError::Io {
+                context: "failed to read source file for collision comparison".to_string(),
+                path: Some(left.to_path_buf()),
+                message: err.to_string(),
+            })?;
+        let right_read = right_reader
+            .read(&mut right_buf)
+            .map_err(|err| PlanError::Io {
+                context: "failed to read source file for collision comparison".to_string(),
+                path: Some(right.to_path_buf()),
+                message: err.to_string(),
+            })?;
+
+        if left_read != right_read {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+        if left_buf[..left_read] != right_buf[..right_read] {
+            return Ok(false);
+        }
+    }
 }
 
 pub fn should_skip_existing(
