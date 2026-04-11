@@ -13,7 +13,7 @@ use crate::policy::{ComparePolicy, normalize_extensions};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanJob {
     pub source: PathBuf,
-    pub target: PathBuf,
+    pub targets: Vec<PathBuf>,
     pub extensions: Vec<String>,
     pub compare_policy: ComparePolicy,
     pub template: String,
@@ -193,15 +193,17 @@ where
             ctx.source_rel_dir = relative_source_dir(&job.source, &source)?;
         }
         let rel_dest = render_layout(&job.template, &ctx)?;
-        let dest = job.target.join(rel_dest);
-        let plan = TransferPlan {
-            source: source.clone(),
-            dest: dest.clone(),
-            size: metadata.len(),
-            display_name: file_name,
-        };
+        for target in &job.targets {
+            let dest = target.join(&rel_dest);
+            let plan = TransferPlan {
+                source: source.clone(),
+                dest: dest.clone(),
+                size: metadata.len(),
+                display_name: file_name.clone(),
+            };
 
-        candidates.entry(dest).or_default().push(plan);
+            candidates.entry(dest).or_default().push(plan);
+        }
     }
 
     resolve_collisions(&mut candidates)?;

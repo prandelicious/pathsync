@@ -115,7 +115,7 @@ fn build_plan_dedupes_identical_collision_sources() {
 
     let job = PlanJob {
         source: source.clone(),
-        target: target.clone(),
+        targets: vec![target.clone()],
         extensions: vec!["jpg".to_string()],
         compare_policy: ComparePolicy::PathSize,
         template: "{filename}".to_string(),
@@ -148,7 +148,7 @@ fn build_plan_reports_collision_for_distinct_content() {
 
     let job = PlanJob {
         source: source.clone(),
-        target: target.clone(),
+        targets: vec![target.clone()],
         extensions: vec!["jpg".to_string()],
         compare_policy: ComparePolicy::PathSize,
         template: "{filename}".to_string(),
@@ -178,6 +178,99 @@ fn build_plan_reports_collision_for_distinct_content() {
 }
 
 #[test]
+fn build_plan_expands_each_source_across_targets() {
+    let temp = TempDir::new();
+    let source = temp.path().join("source");
+    let target_a = temp.path().join("target-a");
+    let target_b = temp.path().join("target-b");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target_a).unwrap();
+    fs::create_dir_all(&target_b).unwrap();
+
+    write_file(&source.join("photo.jpg"), b"1111");
+
+    let job = PlanJob {
+        source: source.clone(),
+        targets: vec![target_a.clone(), target_b.clone()],
+        extensions: vec!["jpg".to_string()],
+        compare_policy: ComparePolicy::PathSize,
+        template: "{filename}".to_string(),
+    };
+
+    let build = build_plan(&job, false, |path, _metadata| {
+        Ok(sample_context(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .expect("utf-8 filename"),
+        ))
+    })
+    .unwrap();
+
+    assert_eq!(build.stats.scanned_files, 1);
+    assert_eq!(build.stats.planned_files, 2);
+    assert_eq!(build.stats.planned_bytes, 8);
+    assert_eq!(build.plans.len(), 2);
+    assert!(
+        build
+            .plans
+            .iter()
+            .any(|plan| plan.dest == target_a.join("photo.jpg"))
+    );
+    assert!(
+        build
+            .plans
+            .iter()
+            .any(|plan| plan.dest == target_b.join("photo.jpg"))
+    );
+}
+
+#[test]
+fn build_plan_skips_existing_per_final_destination() {
+    let temp = TempDir::new();
+    let source = temp.path().join("source");
+    let target_a = temp.path().join("target-a");
+    let target_b = temp.path().join("target-b");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target_a).unwrap();
+    fs::create_dir_all(&target_b).unwrap();
+
+    write_file(&source.join("nested/photo.jpg"), b"1111");
+    write_file(&target_a.join("nested/photo.jpg"), b"1111");
+
+    let job = PlanJob {
+        source: source.clone(),
+        targets: vec![target_a.clone(), target_b.clone()],
+        extensions: vec!["jpg".to_string()],
+        compare_policy: ComparePolicy::PathSize,
+        template: "{source_rel_dir}/{filename}".to_string(),
+    };
+
+    let build = build_plan(&job, false, |path, _metadata| {
+        Ok(sample_context(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .expect("utf-8 filename"),
+        ))
+    })
+    .unwrap();
+
+    assert_eq!(build.stats.scanned_files, 1);
+    assert_eq!(build.stats.planned_files, 1);
+    assert_eq!(build.stats.planned_bytes, 4);
+    assert_eq!(build.stats.skipped_existing_files, 1);
+    assert_eq!(build.stats.skipped_existing_bytes, 4);
+    assert_eq!(
+        build.plans,
+        vec![pathsync::plan::TransferPlan {
+            source: source.join("nested/photo.jpg"),
+            dest: target_b.join("nested/photo.jpg"),
+            size: 4,
+            display_name: "photo.jpg".to_string(),
+        }]
+    );
+}
+
+#[test]
 fn build_plan_returns_planning_stats() {
     let temp = TempDir::new();
     let source = temp.path().join("source");
@@ -191,7 +284,7 @@ fn build_plan_returns_planning_stats() {
 
     let job = PlanJob {
         source: source.clone(),
-        target: target.clone(),
+        targets: vec![target.clone()],
         extensions: vec!["jpg".to_string()],
         compare_policy: ComparePolicy::PathSize,
         template: "{source_rel_dir}/{filename}".to_string(),

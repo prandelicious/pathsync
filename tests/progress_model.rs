@@ -89,6 +89,20 @@ fn canonical_screen_model_constructors_preserve_display_values() {
 }
 
 #[test]
+fn error_row_models_preserve_target_specific_details() {
+    let error = ErrorRowModel::new(
+        "[local] GX010193.MP4",
+        "/Volumes/Archive/Vlog/2026/03/GX010193.MP4: permission denied",
+    );
+
+    assert_eq!(error.label, "[local] GX010193.MP4");
+    assert_eq!(
+        error.detail,
+        "/Volumes/Archive/Vlog/2026/03/GX010193.MP4: permission denied"
+    );
+}
+
+#[test]
 fn transfer_category_labels_match_canonical_ui_taxonomy() {
     assert_eq!(
         TransferCategory::SkippedExisting.as_label(),

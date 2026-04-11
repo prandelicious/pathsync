@@ -261,7 +261,187 @@ layout = "flat"
     assert_eq!(job.template, "{filename}");
     assert_eq!(job.timezone_policy, TimezonePolicy::Local);
     assert_eq!(job.source, input);
-    assert_eq!(job.target, output);
+    assert_eq!(job.targets, vec![output]);
+}
+
+#[test]
+fn resolve_job_normalizes_single_target_into_targets_vec() {
+    let root = unique_temp_dir("pathsync-config-single-target");
+    let input = root.join("input");
+    let output = root.join("output");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+
+    let raw = r#"
+default_job = "vlog"
+
+[jobs.vlog]
+enabled = true
+source = "{input}"
+target = "{output}"
+extensions = ["jpg"]
+layout = "flat"
+"#;
+    let raw = raw
+        .replace("{input}", &input.display().to_string())
+        .replace("{output}", &output.display().to_string());
+
+    let config: config::Config = toml::from_str(&raw).unwrap();
+    let job = config::resolve_job(&config, None, None, false, None).unwrap();
+
+    assert_eq!(job.targets, vec![output]);
+}
+
+#[test]
+fn resolve_job_preserves_multiple_targets_in_order() {
+    let root = unique_temp_dir("pathsync-config-multi-target");
+    let input = root.join("input");
+    let output_a = root.join("output-a");
+    let output_b = root.join("output-b");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output_a).unwrap();
+    fs::create_dir_all(&output_b).unwrap();
+
+    let raw = r#"
+default_job = "vlog"
+
+[jobs.vlog]
+enabled = true
+source = "{input}"
+targets = ["{output_a}", "{output_b}"]
+extensions = ["jpg"]
+layout = "flat"
+"#;
+    let raw = raw
+        .replace("{input}", &input.display().to_string())
+        .replace("{output_a}", &output_a.display().to_string())
+        .replace("{output_b}", &output_b.display().to_string());
+
+    let config: config::Config = toml::from_str(&raw).unwrap();
+    let job = config::resolve_job(&config, None, None, false, None).unwrap();
+
+    assert_eq!(job.targets, vec![output_a, output_b]);
+}
+
+#[test]
+fn resolve_job_rejects_jobs_with_both_target_and_targets() {
+    let root = unique_temp_dir("pathsync-config-both-target-forms");
+    let input = root.join("input");
+    let output_a = root.join("output-a");
+    let output_b = root.join("output-b");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output_a).unwrap();
+    fs::create_dir_all(&output_b).unwrap();
+
+    let raw = r#"
+default_job = "vlog"
+
+[jobs.vlog]
+enabled = true
+source = "{input}"
+target = "{output_a}"
+targets = ["{output_b}"]
+extensions = ["jpg"]
+layout = "flat"
+"#;
+    let raw = raw
+        .replace("{input}", &input.display().to_string())
+        .replace("{output_a}", &output_a.display().to_string())
+        .replace("{output_b}", &output_b.display().to_string());
+
+    let config: config::Config = toml::from_str(&raw).unwrap();
+    let err = config::resolve_job(&config, None, None, false, None).unwrap_err();
+
+    assert!(matches!(
+        err,
+        ConfigError::ConflictingTargetSettings { name, .. } if name == "vlog"
+    ));
+}
+
+#[test]
+fn resolve_job_rejects_jobs_without_any_target_setting() {
+    let root = unique_temp_dir("pathsync-config-no-targets");
+    let input = root.join("input");
+    fs::create_dir_all(&input).unwrap();
+
+    let raw = r#"
+default_job = "vlog"
+
+[jobs.vlog]
+enabled = true
+source = "{input}"
+extensions = ["jpg"]
+layout = "flat"
+"#;
+    let raw = raw.replace("{input}", &input.display().to_string());
+
+    let config: config::Config = toml::from_str(&raw).unwrap();
+    let err = config::resolve_job(&config, None, None, false, None).unwrap_err();
+
+    assert!(matches!(
+        err,
+        ConfigError::MissingTargetSetting { name, .. } if name == "vlog"
+    ));
+}
+
+#[test]
+fn resolve_job_rejects_empty_targets_array() {
+    let root = unique_temp_dir("pathsync-config-empty-targets");
+    let input = root.join("input");
+    fs::create_dir_all(&input).unwrap();
+
+    let raw = r#"
+default_job = "vlog"
+
+[jobs.vlog]
+enabled = true
+source = "{input}"
+targets = []
+extensions = ["jpg"]
+layout = "flat"
+"#;
+    let raw = raw.replace("{input}", &input.display().to_string());
+
+    let config: config::Config = toml::from_str(&raw).unwrap();
+    let err = config::resolve_job(&config, None, None, false, None).unwrap_err();
+
+    assert!(matches!(
+        err,
+        ConfigError::EmptyTargets { name, .. } if name == "vlog"
+    ));
+}
+
+#[test]
+fn resolve_job_reports_missing_directory_from_targets_list() {
+    let root = unique_temp_dir("pathsync-config-missing-target");
+    let input = root.join("input");
+    let output_ok = root.join("output-ok");
+    let missing = root.join("missing-target");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output_ok).unwrap();
+
+    let raw = r#"
+default_job = "vlog"
+
+[jobs.vlog]
+enabled = true
+source = "{input}"
+targets = ["{output_ok}", "{missing}"]
+extensions = ["jpg"]
+layout = "flat"
+"#;
+    let raw = raw
+        .replace("{input}", &input.display().to_string())
+        .replace("{output_ok}", &output_ok.display().to_string())
+        .replace("{missing}", &missing.display().to_string());
+
+    let config: config::Config = toml::from_str(&raw).unwrap();
+    let err = config::resolve_job(&config, None, None, false, None).unwrap_err();
+
+    assert!(matches!(
+        err,
+        ConfigError::TargetFolderNotFound { path } if path == missing
+    ));
 }
 
 #[test]

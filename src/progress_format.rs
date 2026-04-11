@@ -208,7 +208,10 @@ fn render_category_row(category: &crate::progress_model::CategoryRowModel) -> St
 }
 
 fn render_error_row(label: &str, detail: &str) -> String {
-    pad_to_width(&format!("{}  {}", truncate_middle(label, 24), detail))
+    let label = truncate_middle(label, 24);
+    let detail_width = CANONICAL_WIDTH.saturating_sub(label.chars().count() + 2);
+    let detail = truncate_middle(detail, detail_width);
+    pad_to_width(&format!("{label}  {detail}"))
 }
 
 fn rounded_progress_bar_string(percent: usize, width: usize) -> String {

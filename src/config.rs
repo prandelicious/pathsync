@@ -22,7 +22,8 @@ pub struct Config {
 pub struct JobConfig {
     pub enabled: Option<bool>,
     pub source: PathBuf,
-    pub target: PathBuf,
+    pub target: Option<PathBuf>,
+    pub targets: Option<Vec<PathBuf>>,
     pub extensions: Vec<String>,
     pub compare: Option<CompareConfig>,
     pub transfer: Option<TransferConfig>,
@@ -60,13 +61,21 @@ pub struct LayoutDetailed {
 pub struct ResolvedJob {
     pub name: String,
     pub source: PathBuf,
-    pub target: PathBuf,
+    pub targets: Vec<PathBuf>,
     pub extensions: Vec<String>,
     pub compare_policy: ComparePolicy,
     pub transfer_policy: TransferPolicy,
     pub timezone_policy: TimezonePolicy,
     pub parallel: usize,
     pub template: String,
+}
+
+impl ResolvedJob {
+    pub fn primary_target(&self) -> &Path {
+        self.targets
+            .first()
+            .expect("resolved jobs always contain at least one target")
+    }
 }
 
 #[allow(dead_code)]
@@ -162,11 +171,7 @@ pub fn resolve_job(
             path: job.source.clone(),
         });
     }
-    if !job.target.is_dir() {
-        return Err(ConfigError::TargetFolderNotFound {
-            path: job.target.clone(),
-        });
-    }
+    let targets = resolve_targets(&job_name, job)?;
 
     let template = layout_to_template(&job.layout)?;
     let extensions = normalize_extensions(cli_extensions.unwrap_or(&job.extensions));
@@ -181,7 +186,7 @@ pub fn resolve_job(
     Ok(ResolvedJob {
         name: job_name.clone(),
         source: job.source.clone(),
-        target: job.target.clone(),
+        targets,
         extensions,
         compare_policy,
         transfer_policy,
@@ -189,6 +194,38 @@ pub fn resolve_job(
         parallel,
         template,
     })
+}
+
+fn resolve_targets(job_name: &str, job: &JobConfig) -> Result<Vec<PathBuf>, ConfigError> {
+    let targets = match (&job.target, &job.targets) {
+        (Some(_), Some(_)) => {
+            return Err(ConfigError::ConflictingTargetSettings {
+                name: job_name.to_string(),
+            });
+        }
+        (None, None) => {
+            return Err(ConfigError::MissingTargetSetting {
+                name: job_name.to_string(),
+            });
+        }
+        (Some(target), None) => vec![target.clone()],
+        (None, Some(targets)) if targets.is_empty() => {
+            return Err(ConfigError::EmptyTargets {
+                name: job_name.to_string(),
+            });
+        }
+        (None, Some(targets)) => targets.clone(),
+    };
+
+    for target in &targets {
+        if !target.is_dir() {
+            return Err(ConfigError::TargetFolderNotFound {
+                path: target.clone(),
+            });
+        }
+    }
+
+    Ok(targets)
 }
 
 pub fn normalize_extensions_public(extensions: &[String]) -> Vec<String> {

@@ -3,12 +3,12 @@
     "phases": {
       "brainstorm": "pending",
       "plan": "pending",
-      "execute": "active",
-      "verify": "pending",
+      "execute": "complete",
+      "verify": "active",
       "review": "pending",
       "finish": "pending"
     },
-    "currentPhase": "execute",
+    "currentPhase": "verify",
     "artifacts": {
       "brainstorm": null,
       "plan": null,
@@ -20,25 +20,31 @@
     "prompted": {
       "brainstorm": false,
       "plan": false,
-      "execute": false,
+      "execute": true,
       "verify": false,
       "review": false,
       "finish": false
     }
   },
   "tdd": {
-    "phase": "red",
+    "phase": "red-pending",
     "testFiles": [
-      "/Users/francis/Developer/projects/pathsync/tests/copy_integration.rs",
+      "/Users/francis/Developer/projects/pathsync/tests/config_date.rs",
+      "/Users/francis/Developer/projects/pathsync/tests/public_api.rs",
       "/Users/francis/Developer/projects/pathsync/tests/plan_layout.rs",
-      "/Users/francis/Developer/projects/pathsync/tests/public_api.rs"
+      "/Users/francis/Developer/projects/pathsync/tests/copy_integration.rs",
+      "/Users/francis/Developer/projects/pathsync/tests/progress_format.rs",
+      "/Users/francis/Developer/projects/pathsync/tests/progress_model.rs"
     ],
     "sourceFiles": [
+      "/Users/francis/Developer/projects/pathsync/src/config.rs",
+      "/Users/francis/Developer/projects/pathsync/src/error.rs",
+      "/Users/francis/Developer/projects/pathsync/src/lib.rs",
+      "/Users/francis/Developer/projects/pathsync/src/copy.rs",
       "/Users/francis/Developer/projects/pathsync/src/plan.rs",
-      "/Users/francis/Developer/projects/pathsync/src/plan_fixed.rs",
-      "/Users/francis/Developer/projects/pathsync/src/copy.rs"
+      "/Users/francis/Developer/projects/pathsync/src/progress_format.rs"
     ],
-    "redVerificationPending": false
+    "redVerificationPending": true
   },
   "debug": {
     "active": false,

@@ -116,6 +116,7 @@ struct CopyReport {
 struct RenderContext {
     job_name: String,
     target: PathBuf,
+    target_count: usize,
     source_root: PathBuf,
     task_count: usize,
     total_bytes: u64,
@@ -198,11 +199,12 @@ pub fn run_copy(
     let (event_tx, event_rx) = unbounded::<WorkerEvent>();
     let source_root = job.source.clone();
     let job_name = job.name.clone();
-    let target = job.target.clone();
+    let target = job.primary_target().to_path_buf();
     let use_tty = io::stdout().is_terminal();
     let render_context = RenderContext {
         job_name,
         target,
+        target_count: job.targets.len(),
         source_root,
         task_count,
         total_bytes,
@@ -709,7 +711,9 @@ fn render_progress_tty(rx: Receiver<WorkerEvent>, context: RenderContext) -> Res
     ));
     draw_frame(&term, &lines, &mut last_line_count)?;
 
-    if report.failures.is_empty() {
+    if report.failures.is_empty()
+        || has_only_nonfatal_multi_target_failures(context.target_count, &report)
+    {
         Ok(())
     } else {
         Err(CopyError::RunFailed {
@@ -854,7 +858,9 @@ fn render_progress_plain(
         context.total_bytes,
     ));
 
-    if report.failures.is_empty() {
+    if report.failures.is_empty()
+        || has_only_nonfatal_multi_target_failures(context.target_count, &report)
+    {
         Ok(())
     } else {
         Err(CopyError::RunFailed {
@@ -863,6 +869,16 @@ fn render_progress_plain(
             systemic_detected: report.systemic_detected,
         })
     }
+}
+
+fn has_only_nonfatal_multi_target_failures(target_count: usize, report: &CopyReport) -> bool {
+    target_count > 1
+        && !report.failures.is_empty()
+        && !report.systemic_detected
+        && report
+            .failures
+            .iter()
+            .all(|failure| failure.classification == CopyFailureClassification::Local)
 }
 
 fn current_worker_label(
@@ -1133,6 +1149,15 @@ fn build_post_run_screen_model(
         .failures
         .iter()
         .map(|failure| {
+            let detail = match &failure.dest {
+                Some(dest) => format!(
+                    "{}: {}",
+                    dest.display(),
+                    single_line_error(&failure.message)
+                ),
+                None => single_line_error(&failure.message),
+            };
+
             ErrorRowModel::new(
                 format!(
                     "[{}] {}",
@@ -1143,7 +1168,7 @@ fn build_post_run_screen_model(
                         .and_then(|value| value.to_str())
                         .unwrap_or("<unknown>")
                 ),
-                single_line_error(&failure.message),
+                detail,
             )
         })
         .collect();
@@ -1378,7 +1403,7 @@ fn header_lines(
     vec![
         format!("job      : {}", job.name),
         format!("source   : {}", job.source.display()),
-        format!("target   : {}", job.target.display()),
+        format!("target   : {}", job.primary_target().display()),
         format!("layout   : {}", job.template),
         format!("transfer : {}", transfer_policy_label(&job.transfer_policy)),
         format!("parallel : {}", job.parallel),
@@ -1568,6 +1593,7 @@ mod tests {
         let context = RenderContext {
             job_name: "demo".to_string(),
             target: PathBuf::from("/target"),
+            target_count: 1,
             source_root: PathBuf::from("/source"),
             task_count: 3,
             total_bytes: 1_300,
@@ -1612,6 +1638,7 @@ mod tests {
         let context = RenderContext {
             job_name: "demo".to_string(),
             target: PathBuf::from("/target"),
+            target_count: 1,
             source_root: PathBuf::from("/source"),
             task_count: 3,
             total_bytes: 1_300,
@@ -1651,6 +1678,7 @@ mod tests {
         let context = RenderContext {
             job_name: "demo".to_string(),
             target: PathBuf::from("/target"),
+            target_count: 1,
             source_root: PathBuf::from("/source"),
             task_count: 3,
             total_bytes: 1_300,
@@ -1692,6 +1720,7 @@ mod tests {
         let context = RenderContext {
             job_name: "demo".to_string(),
             target: PathBuf::from("/target"),
+            target_count: 1,
             source_root: PathBuf::from("/source"),
             task_count: 4,
             total_bytes: 2_000,
@@ -1742,7 +1771,10 @@ mod tests {
                 .iter()
                 .any(|row| row.label == "failed permission")
         );
-        assert_eq!(model.errors[0].detail, "permission denied");
+        assert_eq!(
+            model.errors[0].detail,
+            "/target/GX010193.MP4: permission denied"
+        );
     }
 
     #[test]

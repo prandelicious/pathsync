@@ -25,7 +25,8 @@ fn public_policy_types_are_exposed_through_resolved_jobs() {
             config::JobConfig {
                 enabled: Some(true),
                 source: source.clone(),
-                target: target.clone(),
+                target: Some(target.clone()),
+                targets: None,
                 extensions: vec!["jpg".to_string()],
                 compare: Some(config::CompareConfig {
                     mode: Some("path".to_string()),
@@ -46,6 +47,7 @@ fn public_policy_types_are_exposed_through_resolved_jobs() {
 
     let job = config::resolve_job(&config, None, None, false, None).unwrap();
 
+    assert_eq!(job.targets, vec![target]);
     assert_eq!(job.compare_policy, ComparePolicy::Path);
     assert_eq!(
         job.transfer_policy,
@@ -55,6 +57,60 @@ fn public_policy_types_are_exposed_through_resolved_jobs() {
         }
     );
     assert_eq!(job.timezone_policy, TimezonePolicy::Utc);
+}
+
+#[test]
+fn public_build_transfer_plan_expands_multi_target_jobs() {
+    let root = std::env::temp_dir().join(format!(
+        "pathsync-public-api-multi-target-{}",
+        std::process::id()
+    ));
+    let source = root.join("source");
+    let target_a = root.join("target-a");
+    let target_b = root.join("target-b");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target_a).unwrap();
+    fs::create_dir_all(&target_b).unwrap();
+    fs::write(source.join("photo.jpg"), b"1111").unwrap();
+
+    let config = config::Config {
+        default_job: Some("sync".to_string()),
+        parallel: None,
+        timezone: None,
+        jobs: [(
+            "sync".to_string(),
+            config::JobConfig {
+                enabled: Some(true),
+                source: source.clone(),
+                target: None,
+                targets: Some(vec![target_a.clone(), target_b.clone()]),
+                extensions: vec!["jpg".to_string()],
+                compare: None,
+                transfer: None,
+                parallel: None,
+                timezone: None,
+                layout: config::LayoutConfig::Preset("flat".to_string()),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+
+    let job = config::resolve_job(&config, None, None, false, None).unwrap();
+    let plans = build_transfer_plan(&job, false).unwrap();
+
+    assert_eq!(job.targets, vec![target_a.clone(), target_b.clone()]);
+    assert_eq!(plans.len(), 2);
+    assert!(
+        plans
+            .iter()
+            .any(|plan| plan.dest == target_a.join("photo.jpg"))
+    );
+    assert!(
+        plans
+            .iter()
+            .any(|plan| plan.dest == target_b.join("photo.jpg"))
+    );
 }
 
 #[test]
@@ -80,7 +136,8 @@ fn public_build_transfer_plan_dedupes_identical_collision_sources() {
             config::JobConfig {
                 enabled: Some(true),
                 source: source.clone(),
-                target: target.clone(),
+                target: Some(target.clone()),
+                targets: None,
                 extensions: vec!["jpg".to_string()],
                 compare: None,
                 transfer: None,
@@ -126,7 +183,8 @@ fn public_build_transfer_plan_returns_typed_collision_errors_for_distinct_conten
             config::JobConfig {
                 enabled: Some(true),
                 source: source.clone(),
-                target: target.clone(),
+                target: Some(target.clone()),
+                targets: None,
                 extensions: vec!["jpg".to_string()],
                 compare: None,
                 transfer: None,
@@ -172,7 +230,8 @@ fn public_build_transfer_plan_with_stats_returns_planning_metrics() {
             config::JobConfig {
                 enabled: Some(true),
                 source: source.clone(),
-                target: target.clone(),
+                target: Some(target.clone()),
+                targets: None,
                 extensions: vec!["jpg".to_string()],
                 compare: Some(config::CompareConfig {
                     mode: Some("size_mtime".to_string()),
@@ -196,7 +255,7 @@ fn public_build_transfer_plan_with_stats_returns_planning_metrics() {
     assert_eq!(build.stats.skipped_existing_files, 1);
     assert_eq!(build.stats.skipped_existing_bytes, 4);
     assert_eq!(build.plans.len(), 1);
-    assert!(build_transfer_plan(&job, false).unwrap().len() == 1);
+    assert_eq!(build_transfer_plan(&job, false).unwrap().len(), 1);
 }
 
 #[test]

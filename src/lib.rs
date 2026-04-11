@@ -101,7 +101,7 @@ pub fn build_transfer_plan_with_stats(
 ) -> Result<PlanBuild, PathsyncError> {
     let plan_job = PlanJob {
         source: job.source.clone(),
-        target: job.target.clone(),
+        targets: job.targets.clone(),
         extensions: job.extensions.clone(),
         compare_policy: job.compare_policy,
         template: job.template.clone(),
@@ -167,7 +167,7 @@ fn print_jobs(config: &Config) {
         println!("{name}");
         println!("  enabled    : {}", job.enabled.unwrap_or(true));
         println!("  source     : {}", job.source.display());
-        println!("  target     : {}", job.target.display());
+        print_configured_targets(job);
         println!(
             "  extensions : {}",
             config::normalize_extensions(&job.extensions).join(", ")
@@ -193,6 +193,28 @@ fn print_jobs(config: &Config) {
             job.parallel.or(config.parallel).unwrap_or(4)
         );
         println!();
+    }
+}
+
+fn print_configured_targets(job: &config::JobConfig) {
+    match (job.target.as_ref(), job.targets.as_ref()) {
+        (Some(target), None) => println!("  target     : {}", target.display()),
+        (None, Some(targets)) if !targets.is_empty() => {
+            println!("  targets    : {}", targets[0].display());
+            for target in targets.iter().skip(1) {
+                println!("               {}", target.display());
+            }
+        }
+        (Some(target), Some(targets)) => {
+            println!("  target     : {}", target.display());
+            if let Some((first, rest)) = targets.split_first() {
+                println!("  targets    : {}", first.display());
+                for target in rest {
+                    println!("               {}", target.display());
+                }
+            }
+        }
+        _ => println!("  target     : <missing>"),
     }
 }
 

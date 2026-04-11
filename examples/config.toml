@@ -1,5 +1,6 @@
 default_job = "vlog"
 parallel = 4
+timezone = "UTC"
 
 [jobs.vlog]
 enabled = true
@@ -7,7 +8,21 @@ source = "/Volumes/Go-Ultra/DCIM/Camera01"
 target = "/Volumes/T7/Videos/Vlog"
 extensions = ["mp4", "jpg"]
 compare = { mode = "size_mtime" }
-transfer = { mode = "adaptive", large_file_threshold_mb = 100 }
+transfer = { mode = "adaptive", large_file_threshold_mb = 100, large_file_slots = 3 }
+timezone = "America/Los_Angeles"
+layout = "year_month"
+
+[jobs.backup_vlog]
+enabled = true
+source = "/Volumes/Go-Ultra/DCIM/Camera01"
+targets = [
+  "/Volumes/T7/Videos/Vlog",
+  "/Volumes/Archive/Videos/Vlog",
+]
+extensions = ["mp4", "jpg"]
+compare = { mode = "size_mtime" }
+transfer = { mode = "adaptive", large_file_threshold_mb = 100, large_file_slots = 3 }
+timezone = "America/Los_Angeles"
 layout = "year_month"
 
 [jobs.flat_example]
@@ -26,4 +41,4 @@ target = "/path/to/target"
 extensions = ["mp4", "jpg"]
 compare = { mode = "size_mtime" }
 transfer = { mode = "adaptive", large_file_threshold_mb = 250 }
-layout = { kind = "template", value = "{year}/{month}/{ext}/{filename}" }
+layout = { kind = "template", value = "{year}/{month}/{ext}/{source_rel_dir}/{filename}" }

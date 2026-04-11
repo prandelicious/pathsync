@@ -32,6 +32,12 @@ pub enum ConfigError {
     SourceFolderNotFound { path: PathBuf },
     #[error("target folder not found: {path}")]
     TargetFolderNotFound { path: PathBuf },
+    #[error("job `{name}` cannot set both `target` and `targets`")]
+    ConflictingTargetSettings { name: String },
+    #[error("job `{name}` must set either `target` or `targets`")]
+    MissingTargetSetting { name: String },
+    #[error("job `{name}` must include at least one target path")]
+    EmptyTargets { name: String },
     #[error("job `{name}` has no valid extensions")]
     NoValidExtensions { name: String },
     #[error("unsupported compare mode: {mode}")]

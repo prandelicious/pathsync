@@ -80,6 +80,41 @@ layout = {layout}
     config_path
 }
 
+fn write_multi_target_config(
+    root: &TempDir,
+    source: &Path,
+    targets: &[&Path],
+    compare_mode: &str,
+    layout: &str,
+) -> PathBuf {
+    let config_path = root.path().join("config.toml");
+    let targets = targets
+        .iter()
+        .map(|target| format!("\"{}\"", target.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let text = format!(
+        r#"
+default_job = "sync"
+
+[jobs.sync]
+enabled = true
+source = "{source}"
+targets = [{targets}]
+extensions = ["jpg"]
+compare = {{ mode = "{compare_mode}" }}
+transfer = {{ mode = "standard" }}
+layout = {layout}
+"#,
+        source = source.display(),
+        targets = targets,
+        compare_mode = compare_mode,
+        layout = layout,
+    );
+    fs::write(&config_path, text).expect("failed to write config");
+    config_path
+}
+
 fn run_pathsync(args: &[&str]) -> CommandOutput {
     run_pathsync_with_env(args, &[])
 }
@@ -204,6 +239,77 @@ fn dry_run_reports_planned_copies_without_writing_files() {
             .contains(&target.join("photo.jpg").display().to_string())
     );
     assert!(!target.join("photo.jpg").exists());
+}
+
+#[test]
+fn dry_run_reports_each_multi_target_mapping_without_writing_files() {
+    let root = TempDir::new("pathsync-dry-run-multi-target");
+    let source = root.path().join("source");
+    let target_a = root.path().join("target-a");
+    let target_b = root.path().join("target-b");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target_a).unwrap();
+    fs::create_dir_all(&target_b).unwrap();
+    write_file(&source.join("photo.jpg"), b"dry-run-bytes");
+
+    let config_path = write_multi_target_config(
+        &root,
+        &source,
+        &[&target_a, &target_b],
+        "size_mtime",
+        "\"flat\"",
+    );
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap(), "--dry-run"]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(output.stdout.contains("dry run for job `sync`: 2 file(s)"));
+    assert!(
+        output
+            .stdout
+            .contains(&target_a.join("photo.jpg").display().to_string())
+    );
+    assert!(
+        output
+            .stdout
+            .contains(&target_b.join("photo.jpg").display().to_string())
+    );
+    assert!(!target_a.join("photo.jpg").exists());
+    assert!(!target_b.join("photo.jpg").exists());
+}
+
+#[test]
+fn list_jobs_reports_all_multi_target_roots() {
+    let root = TempDir::new("pathsync-list-jobs-multi-target");
+    let source = root.path().join("source");
+    let target_a = root.path().join("target-a");
+    let target_b = root.path().join("target-b");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target_a).unwrap();
+    fs::create_dir_all(&target_b).unwrap();
+
+    let config_path = write_multi_target_config(
+        &root,
+        &source,
+        &[&target_a, &target_b],
+        "size_mtime",
+        "\"flat\"",
+    );
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap(), "--list-jobs"]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(output.stdout.contains("targets    :"));
+    assert!(output.stdout.contains(&target_a.display().to_string()));
+    assert!(output.stdout.contains(&target_b.display().to_string()));
 }
 
 #[test]
@@ -486,6 +592,44 @@ fn failure_path_reports_complete_with_errors_and_never_success_text() {
 
 #[cfg(unix)]
 #[test]
+fn multi_target_local_failure_completes_with_errors_but_returns_success() {
+    let root = TempDir::new("pathsync-multi-target-local-failure");
+    let source = root.path().join("source");
+    let blocked = root.path().join("blocked-target");
+    let open = root.path().join("open-target");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&blocked).unwrap();
+    fs::create_dir_all(&open).unwrap();
+    write_file(&source.join("photo.jpg"), b"multi-target-bytes");
+
+    let blocked_permissions = fs::metadata(&blocked).unwrap().permissions();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let config_path =
+        write_multi_target_config(&root, &source, &[&blocked, &open], "path", "\"flat\"");
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap()]);
+
+    fs::set_permissions(&blocked, blocked_permissions).unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(!blocked.join("photo.jpg").exists());
+    assert!(open.join("photo.jpg").exists());
+    assert!(output.stdout.contains("ATTENTION ITEMS"));
+    assert!(output.stdout.contains("photo.jpg"));
+    assert!(
+        output
+            .stdout
+            .contains(&blocked.join("photo.jpg").display().to_string())
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn local_failure_still_allows_later_phases_and_successful_copies() {
     let root = TempDir::new("pathsync-best-effort-local");
     let source = root.path().join("source");
@@ -669,7 +813,8 @@ fn load_job(source: &Path, target: &Path, compare_mode: &str) -> config::Resolve
             config::JobConfig {
                 enabled: Some(true),
                 source: source.to_path_buf(),
-                target: target.to_path_buf(),
+                target: Some(target.to_path_buf()),
+                targets: None,
                 extensions: vec!["jpg".to_string()],
                 compare: Some(config::CompareConfig {
                     mode: Some(compare_mode.to_string()),

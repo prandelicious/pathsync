@@ -231,6 +231,21 @@ fn post_run_error_screen_renders_exact_80_column_layout() {
 }
 
 #[test]
+fn rendered_post_run_errors_keep_target_specific_destination_context() {
+    let mut model = post_run_model();
+    model.errors = vec![ErrorRowModel::new(
+        "[local] GX010193.MP4",
+        "/Volumes/Archive/Vlog/2026/03/GX010193.MP4: permission denied",
+    )];
+
+    let lines = render_post_run_screen(&model);
+    let rendered = lines.join("\n");
+
+    assert!(rendered.contains("Archive"));
+    assert!(rendered.contains("permission denied"));
+}
+
+#[test]
 fn transfer_category_labels_match_mockup_taxonomy() {
     assert_eq!(
         TransferCategory::SkippedExisting.as_label(),

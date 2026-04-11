@@ -27,7 +27,6 @@ If two instructions conflict at the same level, prefer the more specific and rec
 
 ## Superpowers Skills
 
-- Always invoke `using-superpowers` first at the start of the task.
 - Always use relevant superpowers skills before exploring, planning, coding, debugging, reviewing, or declaring completion.
 - Treat process skills as mandatory when they apply. This includes `brainstorming`, `systematic-debugging`, `test-driven-development`, `writing-plans`, `receiving-code-review`, `requesting-code-review`, and `verification-before-completion`.
 - If a requested or relevant skill is unavailable, say so briefly and continue with the closest equivalent workflow.
@@ -87,8 +86,9 @@ Use this default decomposition pattern for complex requests:
 
 ## Task Management
 
-- **MUST** Always use the CLI ticket system `tk` for task management. Run `tk help` when you need to use it. If `tk` is not in the system, fallback to `docs/todo.md`
-- Mark progress as work completes. Do not keep stale tasks open after scope changes.
+- Use the CLI ticket system `tk` only for complex work or when the user explicitly asks for it. Run `tk help` when needed. If `tk` is unavailable and persistent task tracking is still required, fallback to `docs/todo.md`.
+- Do not create, update, or inspect tickets for trivial tasks by default.
+- Mark progress as work completes when task tracking is in use. Do not keep stale tasks open after scope changes.
 - Before finishing, confirm each planned step is complete, removed, or explicitly deferred.
 
 ## Autonomous Bug Fixing

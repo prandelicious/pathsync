@@ -1,6 +1,6 @@
 # pathsync
 
-`pathsync` is a Rust CLI for config-driven file sync jobs. It scans a source tree, renders each destination path from a layout, skips files that already match the selected compare policy, and copies the remaining files into a target directory.
+`pathsync` is a Rust CLI for config-driven file sync jobs. It scans a source tree, renders each destination path from a layout, skips files that already match the selected compare policy, and copies the remaining files into one or more target directories.
 
 The repository currently ships two binaries:
 
@@ -12,6 +12,7 @@ The repository currently ships two binaries:
 - Multiple named jobs in one TOML config
 - CLI overrides for job name, config path, parallelism, extensions, and disabled jobs
 - Dry-run planning without writing files
+- Backward-compatible `target` plus first-class multi-target `targets = [..]` job configuration
 - Flat, year/month, and fully templated destination layouts
 - Date extraction from EXIF for JPEG/TIFF, with filesystem mtime fallback
 - Timezone-aware filesystem date extraction
@@ -113,7 +114,8 @@ Each job supports:
 
 - `enabled`: optional boolean, defaults to `true`
 - `source`: source directory to scan
-- `target`: destination directory root
+- `target`: one destination directory root
+- `targets`: multiple destination directory roots
 - `extensions`: allowed file extensions
 - `compare`: optional compare policy
 - `transfer`: optional transfer policy
@@ -123,7 +125,10 @@ Each job supports:
 
 Notes:
 
-- `source` and `target` must already exist as directories
+- configure either `target` or `targets`, never both
+- `target = "/path"` is normalized internally to `targets = ["/path"]`
+- `targets = []` is invalid
+- `source` and every configured target must already exist as directories
 - extensions are normalized by trimming whitespace, removing any leading `.`, and lowercasing
 - `parallel` defaults to `4` when neither the CLI nor config sets it
 - `parallel = 0` is rejected
@@ -174,8 +179,8 @@ Rules:
 
 `layout` may be:
 
-- `"flat"`: place files directly under the target root
-- `"year_month"`: place files under `{year}/{month}/`
+- `"flat"`: place files directly under each target root
+- `"year_month"`: place files under `{year}/{month}/` beneath each target root
 - `{ kind = "flat" }`
 - `{ kind = "year_month" }`
 - `{ kind = "template", value = "..." }`
@@ -192,7 +197,7 @@ Available template tokens:
 
 Template safety rules:
 
-- rendered paths must stay relative to the job target
+- rendered paths must stay relative to the configured target root
 - absolute paths are rejected
 - escaping paths such as `..` are rejected
 - unresolved template tokens are rejected
@@ -218,9 +223,12 @@ Filename-based date parsing is not used.
 Before copying, `pathsync` builds a plan from the source tree.
 
 - files outside the extension allow-list are ignored
-- if no files need copying, the CLI prints `no new files to copy for job ...`
-- a dry run prints the planned source → destination mappings
-- if two different source files render to the same destination:
+- the source tree is scanned once per job, even when the job has multiple targets
+- each rendered relative destination expands to one planned transfer per target root
+- if no target-specific transfers need copying, the CLI prints `no new files to copy for job ...`
+- a dry run prints one source → destination mapping per planned transfer
+- compare-policy skip checks run per fully resolved destination path
+- if two different source files render to the same final destination:
   - identical content collapses to one planned copy
   - distinct content aborts planning with a collision error
 
@@ -228,8 +236,11 @@ During copying:
 
 - `pathsync` preserves file modification times on copied files
 - runtime copy failures are best-effort; later files still run when possible
+- for multi-target jobs, target-local copy failures do not abort the overall run when at least one target copy can still complete
+- single-target runtime failures still return a failed run result
 - planning and config failures still stop the run before copying starts
 - final summaries classify failures as `[local]` or `[systemic]`
+- post-run error rows include destination-path detail so you can see which target failed
 - repeated permission failures can be promoted from local to systemic
 
 For terminal output:
@@ -268,6 +279,19 @@ timezone = "UTC"
 enabled = true
 source = "/Volumes/Go-Ultra/DCIM/Camera01"
 target = "/Volumes/T7/Videos/Vlog"
+extensions = ["mp4", "jpg"]
+compare = { mode = "size_mtime" }
+transfer = { mode = "adaptive", large_file_threshold_mb = 100, large_file_slots = 3 }
+timezone = "America/Los_Angeles"
+layout = "year_month"
+
+[jobs.backup_vlog]
+enabled = true
+source = "/Volumes/Go-Ultra/DCIM/Camera01"
+targets = [
+  "/Volumes/T7/Videos/Vlog",
+  "/Volumes/Archive/Videos/Vlog",
+]
 extensions = ["mp4", "jpg"]
 compare = { mode = "size_mtime" }
 transfer = { mode = "adaptive", large_file_threshold_mb = 100, large_file_slots = 3 }
