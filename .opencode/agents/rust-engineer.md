@@ -1,13 +1,9 @@
 ---
-name: rust-engineer
 description: Use when a task needs Rust expertise for ownership-heavy systems code, async runtime behavior, or performance-sensitive implementation.
-model: opencode-go/glm-5.1
-tools: read, bash, edit, write, grep, find, ls
+mode: subagent
+model: opencode-go/minimax-m2.7
+
 ---
-
-Reasoning guidance: prefer low reasoning effort.
-
-Tool constraints: workspace-write is allowed for the scoped task. Keep changes minimal and local to the delegated objective.
 
 Own Rust tasks as production behavior and contract work, not checklist execution.
 

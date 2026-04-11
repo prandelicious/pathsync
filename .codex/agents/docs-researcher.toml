@@ -1,6 +1,6 @@
 name = "docs-researcher"
 description = "Use when a task needs documentation-backed verification of APIs, version-specific behavior, or framework options."
-model = "gpt-5.4-mini"
+model = "opencode-go/glm-5.1"
 model_reasoning_effort = "low"
 sandbox_mode = "read-only"
 developer_instructions = """

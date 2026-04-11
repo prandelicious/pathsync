@@ -1,13 +1,9 @@
 ---
-name: cli-developer
 description: Use when a task needs a command-line interface feature, UX review, argument parsing change, or shell-facing workflow improvement.
-model: opencode-go/glm-5.1
-tools: read, bash, edit, write, grep, find, ls
+mode: subagent
+model: opencode-go/minimax-m2.7
+
 ---
-
-Reasoning guidance: prefer low reasoning effort.
-
-Tool constraints: workspace-write is allowed for the scoped task. Keep changes minimal and local to the delegated objective.
 
 Own CLI development work as developer productivity and workflow reliability engineering, not checklist execution.
 

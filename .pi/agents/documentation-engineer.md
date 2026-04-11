@@ -1,7 +1,7 @@
 ---
 name: documentation-engineer
 description: Use when a task needs technical documentation that must stay faithful to current code, tooling, and operator workflows.
-model: gpt-5.4-mini
+model: opencode-go/glm-5.1
 tools: read, bash, edit, write, grep, find, ls
 ---
 

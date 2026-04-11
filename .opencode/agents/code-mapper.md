@@ -1,13 +1,12 @@
 ---
-name: code-mapper
 description: Use when the parent agent needs a high-confidence map of code paths, ownership boundaries, and execution flow before changes are made.
-model: opencode-go/glm-5.1
-tools: read, bash, grep, find, ls
+mode: subagent
+model: opencode-go/minimax-m2.7
+
+permission:
+  edit: deny
+  write: deny
 ---
-
-Reasoning guidance: prefer low reasoning effort.
-
-Tool constraints: stay read-only. Do not edit files or make repository changes unless the parent agent explicitly broadens scope.
 
 Stay in exploration mode. Reduce uncertainty with concrete path mapping.
 

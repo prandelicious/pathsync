@@ -5,7 +5,7 @@
       "plan": "pending",
       "execute": "complete",
       "verify": "active",
-      "review": "pending",
+      "review": "skipped",
       "finish": "pending"
     },
     "currentPhase": "verify",
@@ -27,24 +27,12 @@
     }
   },
   "tdd": {
-    "phase": "red-pending",
-    "testFiles": [
-      "/Users/francis/Developer/projects/pathsync/tests/config_date.rs",
-      "/Users/francis/Developer/projects/pathsync/tests/public_api.rs",
-      "/Users/francis/Developer/projects/pathsync/tests/plan_layout.rs",
-      "/Users/francis/Developer/projects/pathsync/tests/copy_integration.rs",
-      "/Users/francis/Developer/projects/pathsync/tests/progress_format.rs",
-      "/Users/francis/Developer/projects/pathsync/tests/progress_model.rs"
-    ],
+    "phase": "idle",
+    "testFiles": [],
     "sourceFiles": [
-      "/Users/francis/Developer/projects/pathsync/src/config.rs",
-      "/Users/francis/Developer/projects/pathsync/src/error.rs",
-      "/Users/francis/Developer/projects/pathsync/src/lib.rs",
-      "/Users/francis/Developer/projects/pathsync/src/copy.rs",
-      "/Users/francis/Developer/projects/pathsync/src/plan.rs",
-      "/Users/francis/Developer/projects/pathsync/src/progress_format.rs"
+      "/Users/francis/Developer/projects/pathsync/hello.py"
     ],
-    "redVerificationPending": true
+    "redVerificationPending": false
   },
   "debug": {
     "active": false,

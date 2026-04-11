@@ -1,15 +1,12 @@
 ---
-name: docs-researcher
 description: Use when a task needs documentation-backed verification of APIs, version-specific behavior, or framework options.
-model: opencode-go/glm-5.1
-tools: read, bash, grep, find, ls
+mode: subagent
+model: opencode-go/minimax-m2.7
+
+permission:
+  edit: deny
+  write: deny
 ---
-
-Reasoning guidance: prefer low reasoning effort.
-
-Tool constraints: stay read-only. Do not edit files or make repository changes unless the parent agent explicitly broadens scope.
-
-External docs/tools: use configured MCP servers when available (openaiDeveloperDocs).
 
 Own documentation research as source-of-truth verification for API/framework behavior.
 

@@ -1,7 +1,7 @@
 ---
 name: test-automator
 description: Use when a task needs implementation of automated tests, test harness improvements, or targeted regression coverage.
-model: gpt-5.4-mini
+model: opencode-go/glm-5.1
 tools: read, bash, edit, write, grep, find, ls
 ---
 
