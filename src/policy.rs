@@ -13,6 +13,7 @@ pub enum TransferPolicy {
     Adaptive {
         large_file_threshold_bytes: u64,
         large_file_slots: usize,
+        max_large_per_target: usize,
     },
 }
 

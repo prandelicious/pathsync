@@ -1,0 +1,83 @@
+<h2>Question 1: Should live run and final summary share one visual language?</h2>
+<p class="subtitle">The current live view already moved toward a two-column cockpit; the final summary still reads like a plain report. Pick the direction before we tune details.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Pathsync (vlog)                                           LIVE / COPY
+──────────────────────────────────────────────────────────────────────────────
+Copying  [██████████                    ]  58.2 GB of 133.0 GB   ETA 8m46s       ┌ Run ─────────────────────┐
+overall  copying large files                                                       │ Scanned    2,941         │
+                                                                                   │ Planned    318           │
+⠋ T01  hashing    [██████████        ]  A001_C014_0101AB.MP4   8.2 GB   78.4 MB/s │ Copied     141           │
+⠙ T02  copying    [████████          ]  A001_C015_0101AB.MP4   7.9 GB   64.0 MB/s │ Verified   141           │
+⠹ T03  verifying  [██                ]  GX010193.MP4           2.1 GB   41.8 MB/s │ Failed     1             │
+  T04             [                  ]  idle                       --          -- │ Rate       142.4 MB/s    │
+                                                                                   └──────────────────────────┘
+
+Pathsync (vlog)                                                 COMPLETE
+──────────────────────────────────────────────────────────────────────────────
+Result    success                  Bytes      131.6 GB                         ┌ Run ─────────────────────┐
+Copying   [██████████████████████████████]  100%                               │ Scanned    2,941         │
+                                                                               │ Planned    318           │
+Targets                                                                        │ Copied     316           │
+T7          planned 159   copied 159   verified 159   copy fail 0   verify fail 0│ Verified   316           │
+Archive    planned 159   copied 159   verified 159   copy fail 0   verify fail 0│ Failed     0             │
+                                                                               │ Elapsed    18m01s        │
+                                                                               └──────────────────────────┘</pre>
+    </div>
+    <div class="card-body">
+      <h3>A. Shared Command-Center Layout</h3>
+      <p>Live and summary use the same two-column structure. The run box remains the stable anchor, while the left pane changes from workers to results.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Pathsync (vlog)                                           LIVE / COPY
+──────────────────────────────────────────────────────────────────────────────
+Copying  [██████████                    ]  58.2 GB of 133.0 GB   ETA 8m46s       ┌ Run ─────────────────────┐
+overall  copying large files                                                       │ Scanned    2,941         │
+⠋ T01  hashing    [██████████        ]  A001_C014_0101AB.MP4   8.2 GB   78.4 MB/s │ Planned    318           │
+⠙ T02  copying    [████████          ]  A001_C015_0101AB.MP4   7.9 GB   64.0 MB/s │ Copied     141           │
+                                                                                   └──────────────────────────┘
+
+============================== SYNC COMPLETE ==============================
+
+Summary
+------------------------------------------------------------------------
+Job          vlog
+Result       success
+Duration     18m01s
+Avg Rate     121.7 MB/s
+
+Counts
+------------------------------------------------------------------------
+Copied       316 files   131.6 GB
+Planned      318 files   133.0 GB
+Failed       0 files     0 B</pre>
+    </div>
+    <div class="card-body">
+      <h3>B. Live Cockpit, Summary Report</h3>
+      <p>Keep live as a dashboard, but keep final output as a traditional text report optimized for logs and scrollback.</p>
+    </div>
+  </div>
+</div>
+
+<div class="pros-cons">
+  <div class="pros">
+    <h4>My recommendation: A</h4>
+    <ul>
+      <li>The user sees the same information hierarchy while copying and after completion.</li>
+      <li>Target verification can become a first-class block instead of being buried below counts.</li>
+      <li>It matches your earlier instinct: wide left work area, narrow right metrics box.</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>Tradeoff</h4>
+    <ul>
+      <li>The summary becomes more designed and less like a plain Unix report.</li>
+      <li>We need a graceful narrow-terminal fallback so logs remain readable.</li>
+    </ul>
+  </div>
+</div>

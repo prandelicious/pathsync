@@ -42,6 +42,7 @@ pub struct TransferConfig {
     pub mode: Option<String>,
     pub large_file_threshold_mb: Option<u64>,
     pub large_file_slots: Option<usize>,
+    pub max_large_per_target: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -266,12 +267,20 @@ pub fn resolve_transfer_policy(
         "adaptive" => {
             let threshold_mb = transfer.large_file_threshold_mb.unwrap_or(100);
             let large_file_slots = transfer.large_file_slots.unwrap_or(parallel);
-            if large_file_slots == 0 || large_file_slots > parallel {
+            let max_large_per_target = transfer
+                .max_large_per_target
+                .unwrap_or_else(|| 2.min(parallel));
+            if large_file_slots == 0
+                || large_file_slots > parallel
+                || max_large_per_target == 0
+                || max_large_per_target > parallel
+            {
                 return Err(ConfigError::InvalidAdaptiveLargeFileSlots);
             }
             Ok(TransferPolicy::Adaptive {
                 large_file_threshold_bytes: threshold_mb.saturating_mul(1024 * 1024),
                 large_file_slots,
+                max_large_per_target,
             })
         }
         other => Err(ConfigError::UnsupportedTransferMode {

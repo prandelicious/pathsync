@@ -98,6 +98,7 @@ fn adaptive_transfer_defaults_large_file_slots_to_parallel_budget() {
         TransferPolicy::Adaptive {
             large_file_threshold_bytes: 100 * 1024 * 1024,
             large_file_slots: 4,
+            max_large_per_target: 2,
         }
     );
 }
@@ -125,8 +126,54 @@ fn adaptive_transfer_preserves_explicit_large_file_slots() {
         TransferPolicy::Adaptive {
             large_file_threshold_bytes: 100 * 1024 * 1024,
             large_file_slots: 2,
+            max_large_per_target: 2,
         }
     );
+}
+
+#[test]
+fn adaptive_transfer_preserves_explicit_max_large_per_target() {
+    let adaptive: config::TransferConfig = toml::Value::Table({
+        let mut table = toml::map::Map::new();
+        table.insert(
+            "mode".to_string(),
+            toml::Value::String("adaptive".to_string()),
+        );
+        table.insert("large_file_slots".to_string(), toml::Value::Integer(3));
+        table.insert("max_large_per_target".to_string(), toml::Value::Integer(3));
+        table
+    })
+    .try_into()
+    .unwrap();
+
+    assert_eq!(
+        config::resolve_transfer_policy(Some(&adaptive), 4).unwrap(),
+        TransferPolicy::Adaptive {
+            large_file_threshold_bytes: 100 * 1024 * 1024,
+            large_file_slots: 3,
+            max_large_per_target: 3,
+        }
+    );
+}
+
+#[test]
+fn adaptive_transfer_rejects_zero_max_large_per_target() {
+    let adaptive: config::TransferConfig = toml::Value::Table({
+        let mut table = toml::map::Map::new();
+        table.insert(
+            "mode".to_string(),
+            toml::Value::String("adaptive".to_string()),
+        );
+        table.insert("max_large_per_target".to_string(), toml::Value::Integer(0));
+        table
+    })
+    .try_into()
+    .unwrap();
+
+    assert!(matches!(
+        config::resolve_transfer_policy(Some(&adaptive), 4),
+        Err(ConfigError::InvalidAdaptiveLargeFileSlots)
+    ));
 }
 
 #[test]

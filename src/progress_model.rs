@@ -54,14 +54,34 @@ impl ProgressBarModel {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TransferRowPhase {
+    Hashing,
+    #[default]
+    Copying,
+    Verifying,
+}
+
+impl TransferRowPhase {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Hashing => "hashing",
+            Self::Copying => "copying",
+            Self::Verifying => "verifying",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerRowModel {
     pub spinner_frame: Option<char>,
     pub worker_tag: String,
+    pub phase: Option<TransferRowPhase>,
     pub percent: usize,
     pub item: String,
     pub size: String,
     pub time: String,
+    pub target: String,
     pub idle: bool,
 }
 
@@ -73,14 +93,40 @@ impl WorkerRowModel {
         item: impl Into<String>,
         size: impl Into<String>,
         time: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Self {
+        Self::active_with_phase(
+            spinner_frame,
+            worker_tag,
+            TransferRowPhase::Copying,
+            percent,
+            item,
+            size,
+            time,
+            target,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn active_with_phase(
+        spinner_frame: char,
+        worker_tag: impl Into<String>,
+        phase: TransferRowPhase,
+        percent: usize,
+        item: impl Into<String>,
+        size: impl Into<String>,
+        time: impl Into<String>,
+        target: impl Into<String>,
     ) -> Self {
         Self {
             spinner_frame: Some(spinner_frame),
             worker_tag: worker_tag.into(),
+            phase: Some(phase),
             percent,
             item: item.into(),
             size: size.into(),
             time: time.into(),
+            target: target.into(),
             idle: false,
         }
     }
@@ -89,10 +135,12 @@ impl WorkerRowModel {
         Self {
             spinner_frame: None,
             worker_tag: worker_tag.into(),
+            phase: None,
             percent: 0,
             item: "idle".to_string(),
             size: "--".to_string(),
             time: "--".to_string(),
+            target: String::new(),
             idle: true,
         }
     }
@@ -148,15 +196,81 @@ impl CategoryRowModel {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorRowModel {
-    pub label: String,
-    pub detail: String,
+    pub target: String,
+    pub phase: String,
+    pub file: String,
+    pub error: String,
 }
 
 impl ErrorRowModel {
-    pub fn new(label: impl Into<String>, detail: impl Into<String>) -> Self {
+    pub fn new(
+        target: impl Into<String>,
+        phase: impl Into<String>,
+        file: impl Into<String>,
+        error: impl Into<String>,
+    ) -> Self {
         Self {
-            label: label.into(),
-            detail: detail.into(),
+            target: target.into(),
+            phase: phase.into(),
+            file: file.into(),
+            error: error.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetProgressRowModel {
+    pub target: String,
+    pub percent: usize,
+    pub bytes: String,
+    pub rate: String,
+    pub active_workers: usize,
+}
+
+impl TargetProgressRowModel {
+    pub fn new(
+        target: impl Into<String>,
+        percent: usize,
+        bytes: impl Into<String>,
+        rate: impl Into<String>,
+        active_workers: usize,
+    ) -> Self {
+        Self {
+            target: target.into(),
+            percent,
+            bytes: bytes.into(),
+            rate: rate.into(),
+            active_workers,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetResultRowModel {
+    pub target: String,
+    pub planned: usize,
+    pub copied: usize,
+    pub verified: usize,
+    pub copy_failed: usize,
+    pub verify_failed: usize,
+}
+
+impl TargetResultRowModel {
+    pub fn new(
+        target: impl Into<String>,
+        planned: usize,
+        copied: usize,
+        verified: usize,
+        copy_failed: usize,
+        verify_failed: usize,
+    ) -> Self {
+        Self {
+            target: target.into(),
+            planned,
+            copied,
+            verified,
+            copy_failed,
+            verify_failed,
         }
     }
 }
@@ -171,6 +285,7 @@ pub struct LiveScreenModel {
     pub overall_progress_text: String,
     pub phase_label: String,
     pub workers: Vec<WorkerRowModel>,
+    pub target_progress: Vec<TargetProgressRowModel>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,7 +296,10 @@ pub struct PostRunScreenModel {
     pub completion_label: String,
     pub completion_progress: ProgressBarModel,
     pub categories: Vec<CategoryRowModel>,
+    pub target_results: Vec<TargetResultRowModel>,
     pub errors: Vec<ErrorRowModel>,
+    pub copied_preview_count: usize,
+    pub copied_preview_total: usize,
 }
 
 impl ProgressSnapshot {

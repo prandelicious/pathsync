@@ -1,6 +1,7 @@
 use pathsync::progress_model::{
     CategoryRowModel, ErrorRowModel, PhaseKind, ProgressBarModel, ProgressSnapshot, SummaryMetric,
-    TransferCategory, WorkerRowModel, active_worker_slots, eta, overall_message, phase_label,
+    TargetResultRowModel, TransferCategory, WorkerRowModel, active_worker_slots, eta,
+    overall_message, phase_label,
 };
 use std::time::Duration;
 
@@ -67,37 +68,52 @@ fn overall_message_reports_success_and_failure_outcomes() {
 fn canonical_screen_model_constructors_preserve_display_values() {
     let metric = SummaryMetric::new("Scanned", "2,941");
     let progress = ProgressBarModel::new(43, 24);
-    let active = WorkerRowModel::active('⠋', "W01", 64, "clip.mp4", "8.2 GB", "4s");
-    let idle = WorkerRowModel::idle("W04");
+    let active = WorkerRowModel::active('⠋', "T01", 64, "clip.mp4", "8.2 GB", "4s", "T7");
+    let idle = WorkerRowModel::idle("T04");
     let category = CategoryRowModel::new("copied mp4", 204, "128.4 GB", "67.1%", "16m09s");
-    let error = ErrorRowModel::new("[local] GX010193.MP4", "permission denied");
+    let error = ErrorRowModel::new("Archive", "copy", "GX010193.MP4", "permission denied");
+    let target_result = TargetResultRowModel::new("T7", 10, 9, 8, 1, 1);
 
     assert_eq!(metric.label, "Scanned");
     assert_eq!(metric.value, "2,941");
     assert_eq!(progress.percent, 43);
     assert_eq!(progress.width, 24);
     assert_eq!(active.spinner_frame, Some('⠋'));
-    assert_eq!(active.worker_tag, "W01");
+    assert_eq!(active.worker_tag, "T01");
     assert_eq!(active.percent, 64);
+    assert_eq!(active.target, "T7");
     assert!(!active.idle);
     assert_eq!(idle.item, "idle");
     assert_eq!(idle.spinner_frame, None);
     assert!(idle.idle);
     assert_eq!(category.label, "copied mp4");
     assert_eq!(category.files, 204);
-    assert_eq!(error.detail, "permission denied");
+    assert_eq!(error.target, "Archive");
+    assert_eq!(error.phase, "copy");
+    assert_eq!(error.file, "GX010193.MP4");
+    assert_eq!(error.error, "permission denied");
+    assert_eq!(target_result.target, "T7");
+    assert_eq!(target_result.planned, 10);
+    assert_eq!(target_result.copied, 9);
+    assert_eq!(target_result.verified, 8);
+    assert_eq!(target_result.copy_failed, 1);
+    assert_eq!(target_result.verify_failed, 1);
 }
 
 #[test]
 fn error_row_models_preserve_target_specific_details() {
     let error = ErrorRowModel::new(
-        "[local] GX010193.MP4",
+        "Archive",
+        "verify",
+        "GX010193.MP4",
         "/Volumes/Archive/Vlog/2026/03/GX010193.MP4: permission denied",
     );
 
-    assert_eq!(error.label, "[local] GX010193.MP4");
+    assert_eq!(error.target, "Archive");
+    assert_eq!(error.phase, "verify");
+    assert_eq!(error.file, "GX010193.MP4");
     assert_eq!(
-        error.detail,
+        error.error,
         "/Volumes/Archive/Vlog/2026/03/GX010193.MP4: permission denied"
     );
 }

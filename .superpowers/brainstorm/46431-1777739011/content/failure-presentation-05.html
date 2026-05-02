@@ -1,0 +1,72 @@
+<h2>Question 5: How should failures appear in the final summary?</h2>
+<p class="subtitle">Failures need to be obvious, but not so loud that they obscure what succeeded.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Target Results
+Target      Planned   Copied   Verified   Copy Fail   Verify Fail   Result
+T7              159      159        159           0             0    ok
+Archive         159      157        157           1             1    attention
+
+Failures
+Target    Phase    File                  Error
+Archive   verify   GX010193.MP4          signature mismatch
+Archive   copy     GX010194.MP4          permission denied</pre>
+    </div>
+    <div class="card-body">
+      <h3>A. Inline Status + Failure Table</h3>
+      <p>Target rows show attention status, then a nearby failure table gives exact file, phase, and error.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Attention
+Archive had 2 failed items:
+copy failed: GX010194.MP4 - permission denied
+verify failed: GX010193.MP4 - signature mismatch
+
+Target Results
+T7       159/159 verified
+Archive 157/159 verified</pre>
+    </div>
+    <div class="card-body">
+      <h3>B. Failure Narrative First</h3>
+      <p>Lead with a human-readable problem statement, then show target results below.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Target Results
+Target      Planned   Copied   Verified   Copy Fail   Verify Fail
+T7              159      159        159           0             0
+Archive         159      157        157           1             1
+
+Failures are written to:
+/tmp/pathsync-run-20260503-001/errors.log</pre>
+    </div>
+    <div class="card-body">
+      <h3>C. Summary Only + External Log</h3>
+      <p>Keep terminal clean and point to a detailed failure artifact.</p>
+    </div>
+  </div>
+</div>
+
+<div class="pros-cons">
+  <div class="pros">
+    <h4>My recommendation: A</h4>
+    <ul>
+      <li>It preserves the target verification table as the main truth source.</li>
+      <li>The failure table is machine-scannable and actionable: target, phase, file, error.</li>
+      <li>It works in terminal scrollback without requiring a separate artifact.</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>Tradeoff</h4>
+    <ul>
+      <li>Long failure lists need a preview limit plus a clear “showing N of M” line.</li>
+    </ul>
+  </div>
+</div>

@@ -6,6 +6,8 @@ use pathsync::plan::{
 use pathsync::policy::ComparePolicy;
 use std::fs::{self, File};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -103,15 +105,61 @@ fn render_layout_accepts_relative_templates() {
 }
 
 #[test]
-fn build_plan_dedupes_identical_collision_sources() {
+fn build_plan_defers_source_signature_until_runtime() {
     let temp = TempDir::new();
     let source = temp.path().join("source");
     let target = temp.path().join("target");
     fs::create_dir_all(&source).unwrap();
     fs::create_dir_all(&target).unwrap();
 
-    write_file(&source.join("one/photo.jpg"), b"1111");
-    write_file(&source.join("two/photo.jpg"), b"1111");
+    write_file(&source.join("photo.jpg"), b"source bytes");
+
+    let job = PlanJob {
+        source: source.clone(),
+        targets: vec![target],
+        extensions: vec!["jpg".to_string()],
+        compare_policy: ComparePolicy::PathSize,
+        template: "{filename}".to_string(),
+    };
+
+    let build = build_plan(&job, false, |path, _metadata| {
+        Ok(sample_context(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .expect("utf-8 filename"),
+        ))
+    })
+    .unwrap();
+
+    assert_eq!(
+        build.plans,
+        vec![pathsync::plan::TransferPlan {
+            source: source.join("photo.jpg"),
+            dest: job.targets[0].join("photo.jpg"),
+            size: 12,
+            display_name: "photo.jpg".to_string(),
+        }]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn build_plan_reports_collision_without_opening_same_size_sources() {
+    let temp = TempDir::new();
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+
+    let first_source = source.join("one/photo.jpg");
+    let second_source = source.join("two/photo.jpg");
+    write_file(&first_source, b"1111");
+    write_file(&second_source, b"1111");
+
+    let first_permissions = fs::metadata(&first_source).unwrap().permissions();
+    let second_permissions = fs::metadata(&second_source).unwrap().permissions();
+    fs::set_permissions(&first_source, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::set_permissions(&second_source, fs::Permissions::from_mode(0o000)).unwrap();
 
     let job = PlanJob {
         source: source.clone(),
@@ -127,12 +175,24 @@ fn build_plan_dedupes_identical_collision_sources() {
                 .and_then(|name| name.to_str())
                 .expect("utf-8 filename"),
         ))
-    })
-    .unwrap();
+    });
 
-    assert_eq!(build.plans.len(), 1);
-    assert_eq!(build.plans[0].dest, target.join("photo.jpg"));
-    assert!(build.plans[0].source.ends_with("one/photo.jpg"));
+    fs::set_permissions(&first_source, first_permissions).unwrap();
+    fs::set_permissions(&second_source, second_permissions).unwrap();
+
+    let err = build.unwrap_err();
+    match err {
+        PlanError::Collision {
+            destination,
+            sources,
+        } => {
+            assert_eq!(destination, target.join("photo.jpg"));
+            assert_eq!(sources.len(), 2);
+            assert!(sources.iter().any(|path| path.ends_with("one/photo.jpg")));
+            assert!(sources.iter().any(|path| path.ends_with("two/photo.jpg")));
+        }
+        other => panic!("expected collision error, got {other:?}"),
+    }
 }
 
 #[test]
@@ -268,6 +328,45 @@ fn build_plan_skips_existing_per_final_destination() {
             display_name: "photo.jpg".to_string(),
         }]
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn build_plan_does_not_open_source_contents_for_skipped_destinations() {
+    let temp = TempDir::new();
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+
+    let source_file = source.join("photo.jpg");
+    write_file(&source_file, b"1111");
+    write_file(&target.join("photo.jpg"), b"2222");
+
+    let original_permissions = fs::metadata(&source_file).unwrap().permissions();
+    fs::set_permissions(&source_file, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let job = PlanJob {
+        source: source.clone(),
+        targets: vec![target],
+        extensions: vec!["jpg".to_string()],
+        compare_policy: ComparePolicy::PathSize,
+        template: "{filename}".to_string(),
+    };
+
+    let build = build_plan(&job, false, |path, _metadata| {
+        Ok(sample_context(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .expect("utf-8 filename"),
+        ))
+    });
+
+    fs::set_permissions(&source_file, original_permissions).unwrap();
+
+    let build = build.unwrap();
+    assert!(build.plans.is_empty());
+    assert_eq!(build.stats.skipped_existing_files, 1);
 }
 
 #[test]

@@ -164,6 +164,10 @@ fn copy_file_handles_manual(
     writer
         .flush()
         .map_err(|err| CopyTransferError::io(CopyTransferOperation::FlushDestination, err))?;
+    writer
+        .get_ref()
+        .sync_all()
+        .map_err(|err| CopyTransferError::io(CopyTransferOperation::FlushDestination, err))?;
 
     Ok(copied)
 }
@@ -506,6 +510,9 @@ mod macos_native {
         unsafe {
             let _ = copyfile_state_free(state);
         }
+        dest_file
+            .sync_all()
+            .map_err(|err| CopyTransferError::io(CopyTransferOperation::FlushDestination, err))?;
         Ok(copied)
     }
 

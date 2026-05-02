@@ -1,0 +1,85 @@
+<h2>Question 13: How should the live UI handle overflow?</h2>
+<p class="subtitle">The layout is clean with 2 targets and 4 workers. It needs a rule for more targets/workers without turning into a scrolling dashboard.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Workers
+⠋ T01  hashing    [██████████        ]  A001_C014_0101AB.MP4      8.2 GB   78.4 MB/s   T7
+⠙ T02  copying    [████████          ]  A001_C015_0101AB.MP4      7.9 GB   64.0 MB/s   Archive
+⠹ T03  verifying  [██                ]  GX010193.MP4              2.1 GB   41.8 MB/s   T7
+  T04             [                  ]  idle                         --          --   --
+
+Targets
+T7        [█████████████                 ]  31.0 / 66.5 GB   78.4 MB/s
+Archive   [███████████                   ]  27.2 / 66.5 GB   64.0 MB/s
+... 3 more targets</pre>
+    </div>
+    <div class="card-body">
+      <h3>A. Fixed Visible Rows + Overflow Count</h3>
+      <p>Show the most important rows, then a concise “N more” line. Final summary shows all targets.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Workers
+⠋ T01 ...
+⠙ T02 ...
+⠹ T03 ...
+⠸ T04 ...
+⠼ T05 ...
+⠴ T06 ...
+⠦ T07 ...
+⠧ T08 ...
+
+Targets
+T7 ...
+Archive ...
+Backup ...
+NAS ...
+ColdStore ...</pre>
+    </div>
+    <div class="card-body">
+      <h3>B. Show Everything</h3>
+      <p>Most complete, but the frame height grows and redraws can become distracting.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Workers
+⠋ T01 ...
+⠙ T02 ...
+⠹ T03 ...
+  T04 ...
+
+Targets
+Archive   [███████████                   ]  27.2 / 66.5 GB   64.0 MB/s
+Backup    [████                          ]  10.1 / 66.5 GB   22.0 MB/s
+NAS       [██                            ]   4.0 / 66.5 GB    8.2 MB/s
+... fastest/healthy targets hidden</pre>
+    </div>
+    <div class="card-body">
+      <h3>C. Prioritize Problem Rows</h3>
+      <p>Show slow/failed/active rows first. More useful, but rows may reorder during the run.</p>
+    </div>
+  </div>
+</div>
+
+<div class="pros-cons">
+  <div class="pros">
+    <h4>My recommendation: A</h4>
+    <ul>
+      <li>The live UI should be stable; rows jumping around is visually expensive.</li>
+      <li>Workers are bounded by configured parallelism, so fixed visible rows work well there.</li>
+      <li>Target overflow is acceptable in live view because the final summary will show every target result.</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>Tradeoff</h4>
+    <ul>
+      <li>A hidden slow target might not be visible live unless we later add a specific attention override.</li>
+    </ul>
+  </div>
+</div>

@@ -1,0 +1,86 @@
+<h2>Question 4: What should the final summary make primary?</h2>
+<p class="subtitle">The live screen is about movement. The summary should be about confidence and diagnosis after the run.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Pathsync (vlog)                                                   COMPLETE
+──────────────────────────────────────────────────────────────────────────────
+Copying  [██████████████████████████████]  131.6 GB verified of 131.6 GB       ┌ Run ─────────────────────┐
+                                                                                 │ Scanned    2,941         │
+Target Results                                                                   │ Planned    318           │
+Target      Planned   Copied   Verified   Copy Fail   Verify Fail   Result      │ Copied     316           │
+T7              159      159        159           0             0    ok          │ Verified   316           │
+Archive         159      157        157           1             1    attention   │ Failed     2             │
+                                                                                 │ Elapsed    18m01s        │
+Failures                                                                         └──────────────────────────┘
+Archive   GX010193.MP4   verify   signature mismatch
+Archive   GX010194.MP4   copy     permission denied</pre>
+    </div>
+    <div class="card-body">
+      <h3>A. Target Verification First</h3>
+      <p>The first section after the progress line is the per-target copy/verify result, followed by failures.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Pathsync (vlog)                                                   COMPLETE
+──────────────────────────────────────────────────────────────────────────────
+Copying  [██████████████████████████████]  131.6 GB verified of 131.6 GB       ┌ Run ─────────────────────┐
+                                                                                 │ Scanned    2,941         │
+By Category                                                                       │ Planned    318           │
+skipped existing     2,623 files        0 B   100.0%                             │ Copied     316           │
+copied mp4             204 files   128.4 GB    97.6%                             │ Failed     2             │
+copied jpg             112 files     3.2 GB     2.4%                             │ Elapsed    18m01s        │
+failed permission        1 file     14.2 MB     0.0%                             └──────────────────────────┘
+
+Target Results
+T7 planned 159 copied 159 verified 159</pre>
+    </div>
+    <div class="card-body">
+      <h3>B. Category Breakdown First</h3>
+      <p>The summary begins with what kind of data moved or skipped, then target correctness comes later.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Pathsync (vlog)                                                   COMPLETE
+──────────────────────────────────────────────────────────────────────────────
+Copying  [██████████████████████████████]  131.6 GB verified of 131.6 GB       ┌ Run ─────────────────────┐
+                                                                                 │ Scanned    2,941         │
+Copied Files                                                                      │ Planned    318           │
+#   File                                               Size                       │ Copied     316           │
+1   A001_C014_0101AB.MP4                              8.2 GB                     │ Failed     2             │
+2   A001_C015_0101AB.MP4                              7.9 GB                     │ Elapsed    18m01s        │
+3   GX010193.MP4                                      2.1 GB                     └──────────────────────────┘
+...
+
+Target Results
+T7 planned 159 copied 159 verified 159</pre>
+    </div>
+    <div class="card-body">
+      <h3>C. Copied File Preview First</h3>
+      <p>The summary leads with a list of copied files. Useful for browsing, weaker for correctness confidence.</p>
+    </div>
+  </div>
+</div>
+
+<div class="pros-cons">
+  <div class="pros">
+    <h4>My recommendation: A</h4>
+    <ul>
+      <li>Your stated concern was not trusting that 100% of files copied correctly to each target.</li>
+      <li>Target verification should therefore be the first detailed section after the run progress.</li>
+      <li>Categories and copied-file previews are secondary; failures should be adjacent to target results.</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>Tradeoff</h4>
+    <ul>
+      <li>The summary becomes correctness-first, not file-browser-first.</li>
+      <li>If someone wants the copied file list, it moves lower or becomes a capped appendix.</li>
+    </ul>
+  </div>
+</div>

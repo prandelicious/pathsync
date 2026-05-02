@@ -1,0 +1,72 @@
+<h2>Question 11: What outcome language should the summary use?</h2>
+<p class="subtitle">The final header and target result labels should make the run outcome obvious without reading the whole table.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Pathsync (vlog)                                      VERIFIED
+──────────────────────────────────────────────────────────────────────────────
+Copying  [██████████████████████████████]  131.6 GB verified of 131.6 GB
+
+Target Results
+Target      Planned   Copied   Verified   Copy Fail   Verify Fail   Result
+T7              159      159        159           0             0    verified
+Archive         159      159        159           0             0    verified</pre>
+    </div>
+    <div class="card-body">
+      <h3>A. Verified / Attention / Failed</h3>
+      <p>Use correctness-focused language. Clean runs are `VERIFIED`; partial target issues are `ATTENTION`; systemic/copy failure is `FAILED`.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Pathsync (vlog)                                      COMPLETE
+──────────────────────────────────────────────────────────────────────────────
+Copying  [██████████████████████████████]  131.6 GB copied of 131.6 GB
+
+Target Results
+Target      Planned   Copied   Verified   Copy Fail   Verify Fail   Result
+T7              159      159        159           0             0    success
+Archive         159      159        159           0             0    success</pre>
+    </div>
+    <div class="card-body">
+      <h3>B. Complete / Success / Failed</h3>
+      <p>Conventional CLI wording. Familiar, but less explicit about verification being the trust boundary.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Pathsync (vlog)                                      COMPLETE WITH WARNINGS
+──────────────────────────────────────────────────────────────────────────────
+Copying  [███████████████████████████---]  129.5 GB verified of 131.6 GB
+
+Target Results
+Target      Planned   Copied   Verified   Copy Fail   Verify Fail   Result
+T7              159      159        159           0             0    ok
+Archive         159      157        157           1             1    warning</pre>
+    </div>
+    <div class="card-body">
+      <h3>C. Complete / Warning / Error</h3>
+      <p>Softens partial failures as warnings. Useful for batch tools, but can understate verification failures.</p>
+    </div>
+  </div>
+</div>
+
+<div class="pros-cons">
+  <div class="pros">
+    <h4>My recommendation: A</h4>
+    <ul>
+      <li>The whole feature exists to build trust that target files match the source signatures.</li>
+      <li>`VERIFIED` is a stronger and more accurate success state than `COMPLETE`.</li>
+      <li>`ATTENTION` avoids calling partial failure a success while still distinguishing it from systemic failure.</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>Tradeoff</h4>
+    <ul>
+      <li>It is slightly less conventional CLI language, but it better matches the product promise.</li>
+    </ul>
+  </div>
+</div>

@@ -1,0 +1,68 @@
+<h2>Question 7: What should happen on narrow terminals?</h2>
+<p class="subtitle">The wide two-column layout is the preferred view, but the app still needs a predictable fallback when the terminal is not wide enough.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">80 cols
+Pathsync (vlog)                                      LIVE / COPY
+────────────────────────────────────────────────────────────────────────────────
+Scanned: 2,941             Planned: 318, Copied: 141, Failed: 1
+Copying  [█████████████-----------------]   58.2 GB of 133.0 GB
+overall  copying large files
+⠋ T01 hashing   [█████   ] A001_C014…101AB.MP4  8.2 GB  T7
+⠙ T02 copying   [████    ] A001_C015…101AB.MP4  7.9 GB  Archive</pre>
+    </div>
+    <div class="card-body">
+      <h3>A. Stacked Fallback</h3>
+      <p>Drop the right box and target strip first. Keep workers readable in a simpler stacked layout.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">80 cols
+Copying [██████████] 58.2 / 133.0 GB ┌ Run ──────────────┐
+overall copying large files          │ Scanned 2,941     │
+⠋ T01 hashing [████] A001…AB.MP4     │ Planned 318       │
+⠙ T02 copying [███ ] A001…AB.MP4     │ Copied 141        │
+Targets                              │ Failed 1          │
+T7 [████] 31.0GB Archive [███] 27GB  └───────────────────┘</pre>
+    </div>
+    <div class="card-body">
+      <h3>B. Keep Everything, Compress Hard</h3>
+      <p>Retain all layout regions even when narrow, accepting aggressive truncation.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">80 cols
+Pathsync needs at least 110 columns for live dashboard mode.
+Current terminal: 80 columns.
+
+Run with --plain or enlarge the terminal.</pre>
+    </div>
+    <div class="card-body">
+      <h3>C. Require Wide Terminal</h3>
+      <p>Do not attempt a rich layout below the wide threshold.</p>
+    </div>
+  </div>
+</div>
+
+<div class="pros-cons">
+  <div class="pros">
+    <h4>My recommendation: A</h4>
+    <ul>
+      <li>It avoids the exact problem you reported earlier: filenames and target names becoming unrecognizable.</li>
+      <li>The fallback keeps the most useful live signal: worker phase, item, size, target.</li>
+      <li>The wide layout can remain polished without forcing it into 80 columns.</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>Tradeoff</h4>
+    <ul>
+      <li>The narrow layout will show less information than the wide layout, especially per-target progress.</li>
+    </ul>
+  </div>
+</div>

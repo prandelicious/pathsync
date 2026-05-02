@@ -1,0 +1,66 @@
+<h2>Question 14: What symbol set should the TTY layout use?</h2>
+<p class="subtitle">The current design uses box drawing, solid bars, and braille spinners. It looks better when supported, but terminals and logs vary.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Pathsync (vlog)                                      LIVE / COPY
+──────────────────────────────────────────────────────────────────────────────
+Copying  [██████████                    ]  58.2 GB of 133.0 GB   ETA 8m46s       ┌ Run ─────────────────────┐
+⠋ T01  hashing    [██████████        ]  A001_C014_0101AB.MP4      8.2 GB   T7    │ Scanned    2,941         │
+⠙ T02  copying    [████████          ]  A001_C015_0101AB.MP4      7.9 GB   Archive│ Planned    318           │
+                                                                                 └──────────────────────────┘</pre>
+    </div>
+    <div class="card-body">
+      <h3>A. Unicode Default + ASCII Fallback</h3>
+      <p>Use polished Unicode in normal TTY mode, but support plain ASCII when terminal capability or config requires it.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Pathsync (vlog)                                      LIVE / COPY
+------------------------------------------------------------------------------
+Copying  [##########                    ]  58.2 GB of 133.0 GB   ETA 8m46s       + Run ---------------------+
+| T01  hashing    [##########        ]  A001_C014_0101AB.MP4      8.2 GB   T7    | Scanned    2,941         |
+| T02  copying    [########          ]  A001_C015_0101AB.MP4      7.9 GB   Archive| Planned    318           |
+                                                                                 +--------------------------+</pre>
+    </div>
+    <div class="card-body">
+      <h3>B. ASCII Everywhere</h3>
+      <p>Maximum compatibility. Less polished, and loses the nice terminal-dashboard feel.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Pathsync (vlog)                                      LIVE / COPY
+──────────────────────────────────────────────────────────────────────────────
+Copying  [██████████░░░░░░░░░░░░░░░░░░░░]  58.2 GB of 133.0 GB   ETA 8m46s       ╭ Run ════════════════════╮
+◐ T01  hashing    ██████████░░░░░░░░  A001_C014_0101AB.MP4      8.2 GB   T7      │ Scanned    2,941        │
+◓ T02  copying    ████████░░░░░░░░░░  A001_C015_0101AB.MP4      7.9 GB   Archive │ Planned    318          │
+                                                                                 ╰═════════════════════════╯</pre>
+    </div>
+    <div class="card-body">
+      <h3>C. More Decorative Unicode</h3>
+      <p>Richer visual language, but more likely to look inconsistent across fonts and terminals.</p>
+    </div>
+  </div>
+</div>
+
+<div class="pros-cons">
+  <div class="pros">
+    <h4>My recommendation: A</h4>
+    <ul>
+      <li>It keeps the polished look you want in Ghostty/macOS while protecting logs and weaker terminals.</li>
+      <li>The current design already uses Unicode; we can make it intentional rather than accidental.</li>
+      <li>ASCII fallback can use the same layout model, just different glyphs.</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>Tradeoff</h4>
+    <ul>
+      <li>It adds a small formatting abstraction for glyph sets.</li>
+    </ul>
+  </div>
+</div>

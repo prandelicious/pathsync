@@ -1,0 +1,75 @@
+<h2>Question 2: What should the live left pane optimize for?</h2>
+<p class="subtitle">With the right Run box fixed, the left pane needs one primary job. This decides how much space workers, targets, and recent events get.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Copying  [██████████                    ]  58.2 GB of 133.0 GB   ETA 8m46s       ┌ Run ─────────────────────┐
+overall  copying large files                                                       │ Scanned    2,941         │
+                                                                                   │ Planned    318           │
+Workers                                                                            │ Copied     141           │
+⠋ T01  hashing    [██████████        ]  A001_C014_0101AB.MP4   8.2 GB   T7        │ Verified   141           │
+⠙ T02  copying    [████████          ]  A001_C015_0101AB.MP4   7.9 GB   Archive   │ Failed     1             │
+⠹ T03  verifying  [██                ]  GX010193.MP4           2.1 GB   T7        │ Rate       142.4 MB/s    │
+  T04             [                  ]  idle                       --   --        │ ETA        8m46s         │
+                                                                                   └──────────────────────────┘</pre>
+    </div>
+    <div class="card-body">
+      <h3>A. Worker-First</h3>
+      <p>The live view answers: “What is each worker doing right now?” Target names stay on worker rows.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Copying  [██████████                    ]  58.2 GB of 133.0 GB   ETA 8m46s       ┌ Run ─────────────────────┐
+overall  copying large files                                                       │ Scanned    2,941         │
+                                                                                   │ Planned    318           │
+Targets                                                                            │ Copied     141           │
+T7        [█████████████                 ]  31.0 / 66.5 GB   78.4 MB/s   2 active │ Verified   141           │
+Archive   [███████████                   ]  27.2 / 66.5 GB   64.0 MB/s   1 active │ Failed     1             │
+                                                                                   │ Rate       142.4 MB/s    │
+Workers                                                                            │ ETA        8m46s         │
+T01 hashing A001_C014_0101AB.MP4   T02 copying A001_C015_0101AB.MP4               └──────────────────────────┘</pre>
+    </div>
+    <div class="card-body">
+      <h3>B. Target-First</h3>
+      <p>The live view answers: “How is each destination progressing?” Workers become a compact secondary line.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Copying  [██████████                    ]  58.2 GB of 133.0 GB   ETA 8m46s       ┌ Run ─────────────────────┐
+overall  copying large files                                                       │ Scanned    2,941         │
+                                                                                   │ Planned    318           │
+Now                                                                                │ Copied     141           │
+⠋ T01  hashing    [██████████        ]  A001_C014_0101AB.MP4   T7                 │ Verified   141           │
+⠙ T02  copying    [████████          ]  A001_C015_0101AB.MP4   Archive            │ Failed     1             │
+                                                                                   │ Rate       142.4 MB/s    │
+Targets                                                                            │ ETA        8m46s         │
+T7  71/159 copied, 71 verified     Archive  70/159 copied, 70 verified             └──────────────────────────┘</pre>
+    </div>
+    <div class="card-body">
+      <h3>C. Hybrid</h3>
+      <p>Workers remain visible, but a small target status strip is always present below them.</p>
+    </div>
+  </div>
+</div>
+
+<div class="pros-cons">
+  <div class="pros">
+    <h4>My recommendation: C</h4>
+    <ul>
+      <li>Worker state is the most useful live debugging signal, especially with hashing/copying/verifying phases.</li>
+      <li>Target progress matters because the app copies to multiple destinations and users want confidence each target is advancing.</li>
+      <li>The target strip gives that confidence without stealing too much filename space.</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>Tradeoff</h4>
+    <ul>
+      <li>It consumes one or two extra rows, so narrow terminals need a fallback that hides the target strip first.</li>
+    </ul>
+  </div>
+</div>

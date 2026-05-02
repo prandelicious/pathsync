@@ -18,7 +18,7 @@ use plan::{FileContext, PlanBuild, PlanJob, TransferPlan};
 use progress_format::{render_live_screen, render_post_run_screen};
 use progress_model::{
     CategoryRowModel, ErrorRowModel, LiveScreenModel, PostRunScreenModel, ProgressBarModel,
-    SummaryMetric, WorkerRowModel,
+    SummaryMetric, TargetProgressRowModel, TargetResultRowModel, WorkerRowModel,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,35 +259,43 @@ fn preview_live_screen_model() -> LiveScreenModel {
             SummaryMetric::new("Scanned", "2,941"),
             SummaryMetric::new("Planned", "318"),
             SummaryMetric::new("Copied", "141"),
+            SummaryMetric::new("Verified", "141"),
             SummaryMetric::new("Failed", "1"),
             SummaryMetric::new("Bytes", "58.2 GB / 133.0 GB"),
             SummaryMetric::new("Rate", "142.4 MB/s"),
             SummaryMetric::new("Elapsed", "7m08s"),
             SummaryMetric::new("ETA", "8m46s"),
+            SummaryMetric::new("Targets", "2"),
         ],
-        overall_label: "Total copy progress".to_string(),
+        overall_label: "Copying".to_string(),
         overall_progress: ProgressBarModel::new(43, 30),
-        overall_progress_text: "58.2 GB / 133.0 GB".to_string(),
+        overall_progress_text: "58.2 GB verified of 133.0 GB   ETA 8m46s".to_string(),
         phase_label: "overall  copying large files".to_string(),
         workers: vec![
             WorkerRowModel::active(
                 '⠋',
-                "W01",
+                "T01",
                 64,
                 "A001_C014_0101AB.MP4",
                 "8.2 GB",
                 "78.4 MB/s",
+                "T7",
             ),
             WorkerRowModel::active(
                 '⠙',
-                "W02",
+                "T02",
                 51,
                 "A001_C015_0101AB.MP4",
                 "7.9 GB",
                 "64.0 MB/s",
+                "Archive",
             ),
-            WorkerRowModel::active('⠹', "W03", 12, "GX010193.MP4", "2.1 GB", "41.8 MB/s"),
-            WorkerRowModel::idle("W04"),
+            WorkerRowModel::active('⠹', "T03", 12, "GX010193.MP4", "2.1 GB", "41.8 MB/s", "T7"),
+            WorkerRowModel::idle("T04"),
+        ],
+        target_progress: vec![
+            TargetProgressRowModel::new("T7", 47, "31.0 GB / 66.5 GB", "78.4 MB/s", 2),
+            TargetProgressRowModel::new("Archive", 41, "27.2 GB / 66.5 GB", "64.0 MB/s", 1),
         ],
     }
 }
@@ -295,18 +303,20 @@ fn preview_live_screen_model() -> LiveScreenModel {
 fn preview_post_run_screen_model() -> PostRunScreenModel {
     PostRunScreenModel {
         job_name: "vlog-sync".to_string(),
-        status: "COMPLETE WITH ERRORS".to_string(),
+        status: "ATTENTION".to_string(),
         summary: vec![
             SummaryMetric::new("Scanned", "2,941"),
             SummaryMetric::new("Planned", "318"),
             SummaryMetric::new("Copied", "316"),
-            SummaryMetric::new("Failed", "2"),
-            SummaryMetric::new("Bytes transferred", "131.6 GB"),
-            SummaryMetric::new("Avg rate", "121.7 MB/s"),
+            SummaryMetric::new("Verified", "314"),
+            SummaryMetric::new("Failed", "3"),
+            SummaryMetric::new("Bytes", "129.5 GB / 131.6 GB"),
+            SummaryMetric::new("Rate", "121.7 MB/s"),
             SummaryMetric::new("Elapsed", "18m01s"),
-            SummaryMetric::new("Skip rate", "89.2%"),
+            SummaryMetric::new("ETA", "--"),
+            SummaryMetric::new("Targets", "2"),
         ],
-        completion_label: "Copy completion".to_string(),
+        completion_label: "Verified".to_string(),
         completion_progress: ProgressBarModel::new(99, 30),
         categories: vec![
             CategoryRowModel::new("skipped existing", 2623, "0 B", "100.0%", "0.0s"),
@@ -315,12 +325,15 @@ fn preview_post_run_screen_model() -> PostRunScreenModel {
             CategoryRowModel::new("failed permission", 1, "14.2 MB", "0.0%", "--"),
             CategoryRowModel::new("failed collision", 1, "8.7 MB", "0.0%", "--"),
         ],
-        errors: vec![
-            ErrorRowModel::new("[local] GX010193.MP4", "permission denied"),
-            ErrorRowModel::new(
-                "[local] GX010194.MP4",
-                "destination collision after layout render",
-            ),
+        target_results: vec![
+            TargetResultRowModel::new("T7", 159, 159, 159, 0, 0),
+            TargetResultRowModel::new("Archive", 159, 157, 155, 1, 2),
         ],
+        errors: vec![
+            ErrorRowModel::new("Archive", "copy", "GX010194.MP4", "permission denied"),
+            ErrorRowModel::new("Archive", "verify", "GX010193.MP4", "signature mismatch"),
+        ],
+        copied_preview_count: 20,
+        copied_preview_total: 316,
     }
 }

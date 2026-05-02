@@ -90,6 +90,12 @@ pub enum CopyOperation {
     SetMtime,
     #[error("rename")]
     Rename,
+    #[error("hash_source")]
+    HashSource,
+    #[error("source_changed")]
+    SourceChanged,
+    #[error("verify")]
+    Verify,
     #[error("cleanup_temp")]
     CleanupTemp,
     #[error("worker_panic")]

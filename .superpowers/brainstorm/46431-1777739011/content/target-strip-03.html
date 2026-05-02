@@ -1,0 +1,57 @@
+<h2>Question 3: How much detail should the live target strip show?</h2>
+<p class="subtitle">The strip should reassure you that each target is moving, without turning the live view into a spreadsheet.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Targets
+T7        71/159 copied   71 verified   0 failed
+Archive   70/159 copied   70 verified   1 failed</pre>
+    </div>
+    <div class="card-body">
+      <h3>A. Counts Only</h3>
+      <p>Compact and stable. Good for confidence, weak for diagnosing slow or stuck targets.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Targets
+T7        [█████████████                 ]  31.0 / 66.5 GB   78.4 MB/s   2 active
+Archive   [███████████                   ]  27.2 / 66.5 GB   64.0 MB/s   1 active</pre>
+    </div>
+    <div class="card-body">
+      <h3>B. Byte Progress + Rate</h3>
+      <p>Best for seeing whether destinations are actually advancing and which target is lagging.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Targets
+T7        [█████████████                 ]  71/159 copied   31.0 / 66.5 GB   78.4 MB/s
+Archive   [███████████                   ]  70/159 copied   27.2 / 66.5 GB   64.0 MB/s</pre>
+    </div>
+    <div class="card-body">
+      <h3>C. Full Mini Dashboard</h3>
+      <p>Most complete, but it takes horizontal space and starts competing with the worker rows.</p>
+    </div>
+  </div>
+</div>
+
+<div class="pros-cons">
+  <div class="pros">
+    <h4>My recommendation: B</h4>
+    <ul>
+      <li>Per-target bytes and rate are the fastest way to spot a target that is falling behind.</li>
+      <li>Counts can stay in the final summary, where exact per-target correctness matters more.</li>
+      <li>The row stays readable if we cap target labels and hide the strip first on narrow terminals.</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>Tradeoff</h4>
+    <ul>
+      <li>It does not show exact verified counts during the run; that precision moves to the summary.</li>
+    </ul>
+  </div>
+</div>

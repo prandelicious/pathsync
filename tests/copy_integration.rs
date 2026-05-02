@@ -188,7 +188,7 @@ fn preview_ui_flag_renders_canned_live_and_post_copy_screens_without_config() {
         live.stderr
     );
     assert!(live.stdout.contains("LIVE / COPY-LARGE"));
-    assert!(!live.stdout.contains("COMPLETE WITH ERRORS"));
+    assert!(!live.stdout.contains("ATTENTION"));
 
     assert!(
         post.status.success(),
@@ -196,7 +196,7 @@ fn preview_ui_flag_renders_canned_live_and_post_copy_screens_without_config() {
         post.stdout,
         post.stderr
     );
-    assert!(post.stdout.contains("COMPLETE WITH ERRORS"));
+    assert!(post.stdout.contains("ATTENTION"));
     assert!(!post.stdout.contains("LIVE / COPY-LARGE"));
 
     assert!(
@@ -206,7 +206,7 @@ fn preview_ui_flag_renders_canned_live_and_post_copy_screens_without_config() {
         all.stderr
     );
     assert!(all.stdout.contains("LIVE / COPY-LARGE"));
-    assert!(all.stdout.contains("COMPLETE WITH ERRORS"));
+    assert!(all.stdout.contains("ATTENTION"));
 }
 
 #[test]
@@ -338,11 +338,13 @@ fn real_copy_preserves_contents_and_mtime() {
     assert_eq!(fs::read(&copied).unwrap(), b"real-copy-bytes");
     let copied_mtime = FileTime::from_last_modification_time(&fs::metadata(&copied).unwrap());
     assert_eq!(copied_mtime.unix_seconds(), mtime.unix_seconds());
-    assert!(output.stdout.contains("SYNC COMPLETE"));
-    assert!(output.stdout.contains("Result       success"));
-    assert!(output.stdout.contains("\nSummary\n"));
-    assert!(output.stdout.contains("\nCounts\n"));
-    assert!(output.stdout.contains("\nCopied Files\n"));
+    assert!(output.stdout.contains("VERIFIED"));
+    assert!(output.stdout.contains("Result       VERIFIED"));
+    assert!(output.stdout.contains("\nRun\n"));
+    assert!(output.stdout.contains("\nBreakdown\n"));
+    assert!(output.stdout.contains("\nTarget Results\n"));
+    assert!(output.stdout.contains("Verified"));
+    assert!(output.stdout.contains("\nCopied file preview\n"));
     assert!(output.stdout.contains("photo.jpg"));
 }
 
@@ -426,15 +428,16 @@ parallel = 2
     assert!(output.stdout.contains("phase    : adaptive"));
     assert!(output.stdout.contains("copying files |"));
     assert!(output.stdout.contains("copy complete |"));
-    assert!(output.stdout.contains("W01"));
-    assert!(output.stdout.contains("W02"));
+    assert!(output.stdout.contains("T01"));
+    assert!(output.stdout.contains("T02"));
     assert!(!output.stdout.contains("[W00]"));
     assert!(!output.stdout.contains("[W01]"));
     assert!(!output.stdout.contains("phase    : large files"));
     assert!(!output.stdout.contains("phase    : small files"));
     assert!(output.stdout.contains("one/photo.jpg"));
     assert!(output.stdout.contains("two/photo.jpg"));
-    assert!(output.stdout.contains("SYNC COMPLETE"));
+    assert!(output.stdout.contains("VERIFIED"));
+    assert!(output.stdout.contains("target "));
     assert!(
         output
             .stdout
@@ -486,10 +489,10 @@ parallel = 2
         output.stdout,
         output.stderr
     );
-    assert!(output.stdout.contains("Showing 8 of 12 copied files."));
+    assert!(output.stdout.contains("showing 8 of 12 copied files"));
     let copied_files_section = output
         .stdout
-        .split("Copied Files")
+        .split("Copied file preview")
         .last()
         .expect("copied files section missing");
     assert!(!copied_files_section.contains("photo-11.jpg"));
@@ -585,14 +588,14 @@ fn failure_path_reports_complete_with_errors_and_never_success_text() {
         output.stderr
     );
     assert!(!output.stdout.contains("all copies complete"));
-    assert!(output.stdout.contains("ATTENTION ITEMS") || output.stderr.contains("ATTENTION ITEMS"));
+    assert!(output.stdout.contains("ATTENTION") || output.stderr.contains("ATTENTION"));
     assert!(output.stdout.contains("copy failed") || output.stderr.contains("copy failed"));
     assert!(output.stdout.contains("\nFailures\n"));
 }
 
 #[cfg(unix)]
 #[test]
-fn multi_target_local_failure_completes_with_errors_but_returns_success() {
+fn multi_target_local_failure_reports_failed_target_without_end_verification() {
     let root = TempDir::new("pathsync-multi-target-local-failure");
     let source = root.path().join("source");
     let blocked = root.path().join("blocked-target");
@@ -612,14 +615,16 @@ fn multi_target_local_failure_completes_with_errors_but_returns_success() {
     fs::set_permissions(&blocked, blocked_permissions).unwrap();
 
     assert!(
-        output.status.success(),
+        !output.status.success(),
         "stdout={}\nstderr={}",
         output.stdout,
         output.stderr
     );
     assert!(!blocked.join("photo.jpg").exists());
     assert!(open.join("photo.jpg").exists());
-    assert!(output.stdout.contains("ATTENTION ITEMS"));
+    assert!(output.stdout.contains("ATTENTION"));
+    assert!(output.stdout.contains("CopyFail"));
+    assert!(!output.stdout.contains("\nVerification\n"));
     assert!(output.stdout.contains("photo.jpg"));
     assert!(
         output
@@ -680,12 +685,12 @@ parallel = 2
     assert!(!target.join("blocked/large.jpg").exists());
     assert!(output.stdout.contains("phase    : adaptive"));
     assert!(output.stdout.contains("copying files |"));
-    assert!(output.stdout.contains("W01"));
+    assert!(output.stdout.contains("T01"));
     assert!(!output.stdout.contains("[W00]"));
     assert!(!output.stdout.contains("phase    : large files"));
     assert!(!output.stdout.contains("phase    : small files"));
-    assert!(output.stdout.contains("[local]"));
-    assert!(output.stdout.contains("ATTENTION ITEMS"));
+    assert!(output.stdout.contains("\nFailures\n"));
+    assert!(output.stdout.contains("ATTENTION"));
     assert!(output.stdout.contains("Systemic"));
     assert!(output.stdout.contains("no"));
 }
@@ -740,8 +745,8 @@ parallel = 2
         output.stdout,
         output.stderr
     );
-    assert!(output.stdout.contains("[local]"));
-    assert!(output.stdout.contains("[systemic]"));
+    assert!(output.stdout.contains("\nFailures\n"));
+    assert!(output.stdout.contains("FAILED"));
     assert!(output.stdout.contains("Systemic"));
     assert!(output.stdout.contains("yes"));
 }
@@ -779,7 +784,7 @@ fn failed_rename_cleans_up_temp_file() {
 }
 
 #[test]
-fn planning_dedupes_identical_collisions_before_copy() {
+fn planning_rejects_same_destination_collisions_without_content_dedupe() {
     let root = TempDir::new("pathsync-collision");
     let source = root.path().join("source");
     let target = root.path().join("target");
@@ -798,9 +803,17 @@ fn planning_dedupes_identical_collisions_before_copy() {
     let config = config::load_config(&config_path).unwrap();
     let job = config::resolve_job(&config, None, None, false, None).unwrap();
 
-    let plans = build_transfer_plan(&job, false).unwrap();
-    assert_eq!(plans.len(), 1);
-    assert_eq!(plans[0].dest, target.join("photo.jpg"));
+    let error = build_transfer_plan(&job, false).unwrap_err();
+    match error {
+        pathsync::error::PathsyncError::Plan(pathsync::plan::PlanError::Collision {
+            destination,
+            sources,
+        }) => {
+            assert_eq!(destination, target.join("photo.jpg"));
+            assert_eq!(sources.len(), 2);
+        }
+        other => panic!("expected collision error, got {other:?}"),
+    }
 }
 
 fn load_job(source: &Path, target: &Path, compare_mode: &str) -> config::ResolvedJob {
@@ -823,6 +836,7 @@ fn load_job(source: &Path, target: &Path, compare_mode: &str) -> config::Resolve
                     mode: Some("standard".to_string()),
                     large_file_threshold_mb: None,
                     large_file_slots: None,
+                    max_large_per_target: None,
                 }),
                 parallel: None,
                 timezone: None,

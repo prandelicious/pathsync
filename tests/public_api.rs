@@ -35,6 +35,7 @@ fn public_policy_types_are_exposed_through_resolved_jobs() {
                     mode: Some("adaptive".to_string()),
                     large_file_threshold_mb: Some(100),
                     large_file_slots: Some(2),
+                    max_large_per_target: Some(2),
                 }),
                 parallel: Some(2),
                 timezone: None,
@@ -54,6 +55,7 @@ fn public_policy_types_are_exposed_through_resolved_jobs() {
         TransferPolicy::Adaptive {
             large_file_threshold_bytes: 100 * 1024 * 1024,
             large_file_slots: 2,
+            max_large_per_target: 2,
         }
     );
     assert_eq!(job.timezone_policy, TimezonePolicy::Utc);
@@ -114,7 +116,7 @@ fn public_build_transfer_plan_expands_multi_target_jobs() {
 }
 
 #[test]
-fn public_build_transfer_plan_dedupes_identical_collision_sources() {
+fn public_build_transfer_plan_reports_identical_collision_sources_without_content_dedupe() {
     let root = std::env::temp_dir().join(format!(
         "pathsync-public-api-collision-{}",
         std::process::id()
@@ -154,10 +156,12 @@ fn public_build_transfer_plan_dedupes_identical_collision_sources() {
     };
 
     let job = config::resolve_job(&config, None, None, false, None).unwrap();
-    let plans = build_transfer_plan(&job, false).unwrap();
+    let error = build_transfer_plan(&job, false).unwrap_err();
 
-    assert_eq!(plans.len(), 1);
-    assert_eq!(plans[0].dest, target.join("photo.jpg"));
+    assert!(matches!(
+        error,
+        PathsyncError::Plan(pathsync::plan::PlanError::Collision { .. })
+    ));
 }
 
 #[test]
@@ -279,9 +283,9 @@ fn public_preview_ui_output_can_render_live_and_post_copy_screens() {
     let all = preview_ui_output(PreviewUiMode::All);
 
     assert!(live.contains("LIVE / COPY-LARGE"));
-    assert!(!live.contains("COMPLETE WITH ERRORS"));
-    assert!(post.contains("COMPLETE WITH ERRORS"));
+    assert!(!live.contains("ATTENTION"));
+    assert!(post.contains("ATTENTION"));
     assert!(!post.contains("LIVE / COPY-LARGE"));
     assert!(all.contains("LIVE / COPY-LARGE"));
-    assert!(all.contains("COMPLETE WITH ERRORS"));
+    assert!(all.contains("ATTENTION"));
 }

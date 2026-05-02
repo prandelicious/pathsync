@@ -4,7 +4,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::hash::Hash;
-use std::io::{self, BufReader, Read};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -36,6 +36,14 @@ pub struct TransferPlan {
     pub dest: PathBuf,
     pub size: u64,
     pub display_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TransferCandidate {
+    source: PathBuf,
+    dest: PathBuf,
+    size: u64,
+    display_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -148,7 +156,7 @@ where
     F: FnMut(&Path, &fs::Metadata) -> Result<FileContext>,
 {
     let extensions = normalize_extensions(&job.extensions);
-    let mut candidates = BTreeMap::<PathBuf, Vec<TransferPlan>>::new();
+    let mut candidates = BTreeMap::<PathBuf, Vec<TransferCandidate>>::new();
     let mut seen_files: HashSet<FileId> = HashSet::new();
     let mut stats = PlanningStats::default();
 
@@ -195,7 +203,7 @@ where
         let rel_dest = render_layout(&job.template, &ctx)?;
         for target in &job.targets {
             let dest = target.join(&rel_dest);
-            let plan = TransferPlan {
+            let plan = TransferCandidate {
                 source: source.clone(),
                 dest: dest.clone(),
                 size: metadata.len(),
@@ -209,35 +217,40 @@ where
     resolve_collisions(&mut candidates)?;
 
     let mut plans = Vec::new();
-    for plan in candidates.into_values().flatten() {
-        let source_metadata = fs::metadata(&plan.source).map_err(|err| PlanError::Io {
+    for candidate in candidates.into_values().flatten() {
+        let source_metadata = fs::metadata(&candidate.source).map_err(|err| PlanError::Io {
             context: "failed to stat source file".to_string(),
-            path: Some(plan.source.clone()),
+            path: Some(candidate.source.clone()),
             message: err.to_string(),
         })?;
-        if !force && should_skip_existing(job.compare_policy, &source_metadata, &plan.dest)? {
+        if !force && should_skip_existing(job.compare_policy, &source_metadata, &candidate.dest)? {
             stats.skipped_existing_files += 1;
-            stats.skipped_existing_bytes += plan.size;
+            stats.skipped_existing_bytes += candidate.size;
             continue;
         }
         stats.planned_files += 1;
-        stats.planned_bytes += plan.size;
-        plans.push(plan);
+        stats.planned_bytes += candidate.size;
+        plans.push(TransferPlan {
+            source: candidate.source,
+            dest: candidate.dest,
+            size: candidate.size,
+            display_name: candidate.display_name,
+        });
     }
 
     plans.sort_by(|a, b| a.dest.cmp(&b.dest));
     Ok(PlanBuild { plans, stats })
 }
 
-fn resolve_collisions(candidates: &mut BTreeMap<PathBuf, Vec<TransferPlan>>) -> Result<()> {
-    let collisions: Vec<(PathBuf, Vec<TransferPlan>)> = candidates
+fn resolve_collisions(candidates: &mut BTreeMap<PathBuf, Vec<TransferCandidate>>) -> Result<()> {
+    let collisions: Vec<(PathBuf, Vec<TransferCandidate>)> = candidates
         .iter()
         .filter(|(_, plans)| plans.len() > 1)
         .map(|(dest, plans)| (dest.clone(), plans.clone()))
         .collect();
 
     for (destination, plans) in collisions {
-        let Some(plan) = dedupe_identical_collision_sources(&plans)? else {
+        let Some(plan) = dedupe_same_source_collision_candidates(&plans) else {
             let mut sources: Vec<PathBuf> = plans.into_iter().map(|plan| plan.source).collect();
             sources.sort();
             sources.dedup();
@@ -253,73 +266,22 @@ fn resolve_collisions(candidates: &mut BTreeMap<PathBuf, Vec<TransferPlan>>) -> 
     Ok(())
 }
 
-fn dedupe_identical_collision_sources(plans: &[TransferPlan]) -> Result<Option<TransferPlan>> {
+fn dedupe_same_source_collision_candidates(
+    plans: &[TransferCandidate],
+) -> Option<TransferCandidate> {
     if plans.len() < 2 {
-        return Ok(plans.first().cloned());
+        return plans.first().cloned();
     }
 
     let mut sorted = plans.to_vec();
     sorted.sort_by(|a, b| a.source.cmp(&b.source));
 
     let first = &sorted[0];
-    if sorted.iter().any(|plan| plan.size != first.size) {
-        return Ok(None);
+    if sorted.iter().all(|plan| plan.source == first.source) {
+        return Some(first.clone());
     }
 
-    for plan in sorted.iter().skip(1) {
-        if !files_match(&first.source, &plan.source)? {
-            return Ok(None);
-        }
-    }
-
-    Ok(Some(first.clone()))
-}
-
-fn files_match(left: &Path, right: &Path) -> Result<bool> {
-    const BUFFER_SIZE: usize = 64 * 1024;
-
-    let left_file = fs::File::open(left).map_err(|err| PlanError::Io {
-        context: "failed to open source file for collision comparison".to_string(),
-        path: Some(left.to_path_buf()),
-        message: err.to_string(),
-    })?;
-    let right_file = fs::File::open(right).map_err(|err| PlanError::Io {
-        context: "failed to open source file for collision comparison".to_string(),
-        path: Some(right.to_path_buf()),
-        message: err.to_string(),
-    })?;
-
-    let mut left_reader = BufReader::new(left_file);
-    let mut right_reader = BufReader::new(right_file);
-    let mut left_buf = [0u8; BUFFER_SIZE];
-    let mut right_buf = [0u8; BUFFER_SIZE];
-
-    loop {
-        let left_read = left_reader
-            .read(&mut left_buf)
-            .map_err(|err| PlanError::Io {
-                context: "failed to read source file for collision comparison".to_string(),
-                path: Some(left.to_path_buf()),
-                message: err.to_string(),
-            })?;
-        let right_read = right_reader
-            .read(&mut right_buf)
-            .map_err(|err| PlanError::Io {
-                context: "failed to read source file for collision comparison".to_string(),
-                path: Some(right.to_path_buf()),
-                message: err.to_string(),
-            })?;
-
-        if left_read != right_read {
-            return Ok(false);
-        }
-        if left_read == 0 {
-            return Ok(true);
-        }
-        if left_buf[..left_read] != right_buf[..right_read] {
-            return Ok(false);
-        }
-    }
+    None
 }
 
 pub fn should_skip_existing(

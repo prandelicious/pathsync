@@ -1,0 +1,70 @@
+<h2>Question 12: Should non-TTY/plain output use the designed layout?</h2>
+<p class="subtitle">Interactive terminals benefit from a dashboard. Redirected logs, CI, and scripts usually need simpler line-oriented output.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">TTY
+Pathsync (vlog)                                      LIVE / COPY
+──────────────────────────────────────────────────────────────────────────────
+Copying  [██████████                    ]  58.2 GB of 133.0 GB   ETA 8m46s       ┌ Run ─────────────────────┐
+...
+
+Plain / redirected
+copying files | 141/318 files | 4 active | 58.2 GB / 133.0 GB | rate 142.4 MB/s | eta 8m46s
+target T7 | 31.0 GB / 66.5 GB | rate 78.4 MB/s | active 2
+target Archive | 27.2 GB / 66.5 GB | rate 64.0 MB/s | active 1
+verified | target T7 | planned 159 | copied 159 | verified 159 | copy_fail 0 | verify_fail 0</pre>
+    </div>
+    <div class="card-body">
+      <h3>A. Rich TTY, Structured Plain Lines</h3>
+      <p>TTY gets the dashboard. Plain output stays grep-friendly and line-oriented.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Plain / redirected
+Pathsync (vlog)                                      LIVE / COPY
+──────────────────────────────────────────────────────────────────────────────
+Copying  [██████████                    ]  58.2 GB of 133.0 GB   ETA 8m46s       ┌ Run ─────────────────────┐
+overall  copying large files                                                       │ Scanned    2,941         │
+...</pre>
+    </div>
+    <div class="card-body">
+      <h3>B. Same Layout Everywhere</h3>
+      <p>Consistent visuals, but noisy and awkward in logs because every redraw becomes a frame.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Plain / redirected
+copying files | 141/318 files | 58.2 GB / 133.0 GB
+
+No target progress lines.
+No per-target verification table.</pre>
+    </div>
+    <div class="card-body">
+      <h3>C. Minimal Plain Output</h3>
+      <p>Very quiet logs, but loses the multi-target confidence signal outside TTY mode.</p>
+    </div>
+  </div>
+</div>
+
+<div class="pros-cons">
+  <div class="pros">
+    <h4>My recommendation: A</h4>
+    <ul>
+      <li>It preserves a polished interactive UI without making logs unreadable.</li>
+      <li>Plain output should still include target progress and final target verification, but as parseable lines/tables.</li>
+      <li>This keeps tests simpler because non-TTY contracts can assert stable text tokens instead of exact frames.</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>Tradeoff</h4>
+    <ul>
+      <li>TTY and plain output have separate formatters, so tests need to cover both contracts.</li>
+    </ul>
+  </div>
+</div>

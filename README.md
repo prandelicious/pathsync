@@ -19,9 +19,9 @@ The repository currently ships two binaries:
 - `path`, `path_size`, and `size_mtime` compare policies
 - `standard` and adaptive transfer scheduling
 - Best-effort runtime copy handling with end-of-run failure summaries
+- Streaming destination verification by target using runtime `xxh3_128` file signatures
 - Collision protection for rendered destination paths
-  - identical files that collide collapse to one planned copy
-  - distinct files that collide fail planning
+  - different source files that render to the same final destination fail planning
 - Preview screens for the live and post-copy terminal UI
 - Native-copy benchmarking through `bench-copy`
 
@@ -166,14 +166,18 @@ Options:
 
 - `large_file_threshold_mb`: files at or above this size are large, default `100`
 - `large_file_slots`: slot cost for each large file, default `parallel`
+- `max_large_per_target`: maximum concurrent large-file copies per target, default `min(2, parallel)`
 
 Rules:
 
 - small files consume `1` slot
 - large files consume `large_file_slots`
 - larger files are scheduled first, then smaller files backfill remaining slots
+- in multi-target jobs, large transfers for the same source share one slot cost so target fan-out can run in parallel
+- faster target lanes can continue with later large files while slower target lanes finish earlier work
 - `large_file_slots` must be between `1` and `parallel`
-- `large_file_slots = parallel` preserves the old one-large-file-at-a-time behavior
+- `max_large_per_target` must be between `1` and `parallel`
+- `large_file_slots = parallel` allows one distinct large source at a time
 
 ## Layouts and template tokens
 
@@ -229,14 +233,21 @@ Before copying, `pathsync` builds a plan from the source tree.
 - a dry run prints one source → destination mapping per planned transfer
 - compare-policy skip checks run per fully resolved destination path
 - if two different source files render to the same final destination:
-  - identical content collapses to one planned copy
-  - distinct content aborts planning with a collision error
+  - planning aborts with a collision error
+  - planning does not read full file contents to dedupe collisions
 
 During copying:
 
 - `pathsync` preserves file modification times on copied files
 - runtime copy failures are best-effort; later files still run when possible
-- for multi-target jobs, target-local copy failures do not abort the overall run when at least one target copy can still complete
+- for multi-target jobs, target-local copy failures do not stop other target copies from running
+- copy workers compute a `(size, xxh3_128)` source signature immediately before copying and check that the source metadata is unchanged after copying
+- same-source multi-target transfers reuse the runtime source-signature cache
+- successful copies are streamed to bounded verifier workers, which read destinations only and compare them with the source signature
+- live progress and final completion are based on verified bytes/transfers
+- the post-run summary includes `Target Results` with planned, copied, verified, copy-failed, and verify-failed counts per target
+- any verification miss or signature mismatch returns a failed run result
+- skipped-existing files are not verified unless copied in the current run
 - single-target runtime failures still return a failed run result
 - planning and config failures still stop the run before copying starts
 - final summaries classify failures as `[local]` or `[systemic]`

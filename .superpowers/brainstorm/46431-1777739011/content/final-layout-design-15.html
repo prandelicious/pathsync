@@ -1,0 +1,69 @@
+<h2>Resolved Layout Direction</h2>
+<p class="subtitle">This consolidates the choices so far. The live view is movement-first; the summary is verification-first.</p>
+
+<div class="mockup">
+  <div class="mockup-header">Live TTY, wide terminal</div>
+  <div class="mockup-body">
+    <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Pathsync (vlog)                                                   LIVE / COPY
+────────────────────────────────────────────────────────────────────────────────────────────────────────
+Copying  [██████████                    ]  58.2 GB of 133.0 GB   ETA 8m46s       ┌ Run ─────────────────────┐
+overall  copying large files                                                       │ Scanned    2,941         │
+                                                                                   │ Planned    318           │
+Workers                                                                            │ Copied     141           │
+⠋ T01  hashing    [██████████        ]  A001_C014_0101AB.MP4      8.2 GB   78.4 MB/s   T7      │ Verified   141           │
+⠙ T02  copying    [████████          ]  A001_C015_0101AB.MP4      7.9 GB   64.0 MB/s   Archive │ Failed     1             │
+⠹ T03  verifying  [██                ]  GX010193.MP4              2.1 GB   41.8 MB/s   T7      │ Bytes      58.2 / 133 GB │
+  T04             [                  ]  idle                         --          --   --       │ Rate       142.4 MB/s    │
+                                                                                   │ Elapsed    7m08s         │
+Targets                                                                            │ ETA        8m46s         │
+T7        [█████████████                 ]  31.0 / 66.5 GB   78.4 MB/s             │ Targets    2             │
+Archive   [███████████                   ]  27.2 / 66.5 GB   64.0 MB/s             └──────────────────────────┘
+────────────────────────────────────────────────────────────────────────────────────────────────────────</pre>
+  </div>
+</div>
+
+<div class="mockup">
+  <div class="mockup-header">Final summary, wide terminal</div>
+  <div class="mockup-body">
+    <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Pathsync (vlog)                                                   ATTENTION
+────────────────────────────────────────────────────────────────────────────────────────────────────────
+Copying  [███████████████████████████---]  129.5 GB verified of 131.6 GB          ┌ Run ─────────────────────┐
+                                                                                   │ Scanned    2,941         │
+Target Results                                                                     │ Planned    318           │
+Target      Planned   Copied   Verified   Copy Fail   Verify Fail   Result        │ Copied     316           │
+T7              159      159        159           0             0    verified      │ Verified   314           │
+Archive         159      157        155           1             2    attention     │ Failed     3             │
+                                                                                   │ Bytes      129.5 / 131 GB│
+Failures                                                                           │ Rate       121.7 MB/s    │
+Target    Phase    File                    Error                                   │ Elapsed    18m01s        │
+Archive   copy     GX010194.MP4            permission denied                       │ ETA        --            │
+Archive   verify   GX010193.MP4            signature mismatch                      │ Targets    2             │
+                                                                                   └──────────────────────────┘
+Breakdown
+Bucket             Files        Bytes        Share
+copied large         204      128.4 GB       97.6%
+copied small         112        3.2 GB        2.4%
+skipped existing   2,623          0 B          --
+
+Copied file preview
+showing 20 of 316 copied files
+────────────────────────────────────────────────────────────────────────────────────────────────────────</pre>
+  </div>
+</div>
+
+<div class="options">
+  <div class="option" data-choice="approve" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Approve This Direction</h3>
+      <p>Use this as the design target for the implementation plan.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="revise" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Revise Before Planning</h3>
+      <p>Keep grilling one specific area before moving to implementation planning.</p>
+    </div>
+  </div>
+</div>

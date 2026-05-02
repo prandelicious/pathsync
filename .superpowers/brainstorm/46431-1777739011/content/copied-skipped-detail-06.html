@@ -1,0 +1,70 @@
+<h2>Question 6: How much copied/skipped file detail belongs in the final summary?</h2>
+<p class="subtitle">After target verification and failures, we need to decide whether the summary should include file-level browsing details.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Breakdown
+Bucket             Files        Bytes        Share
+copied large           204      128.4 GB      97.6%
+copied small           112        3.2 GB       2.4%
+skipped existing     2,623          0 B         --
+
+Copied file preview
+showing 20 of 316 copied files</pre>
+    </div>
+    <div class="card-body">
+      <h3>A. Compact Breakdown + Capped Preview</h3>
+      <p>Show aggregate skipped/copied counts and keep the copied file list as a short preview only.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Copied Files
+#   File                                               Size       Target
+1   A001_C014_0101AB.MP4                              8.2 GB     T7
+2   A001_C014_0101AB.MP4                              8.2 GB     Archive
+3   A001_C015_0101AB.MP4                              7.9 GB     T7
+...
+showing 50 of 316 copied files</pre>
+    </div>
+    <div class="card-body">
+      <h3>B. File Preview Prominent</h3>
+      <p>Keep a larger copied-files table as a major part of the summary.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Breakdown
+Bucket             Files        Bytes        Share
+copied large           204      128.4 GB      97.6%
+copied small           112        3.2 GB       2.4%
+skipped existing     2,623          0 B         --
+
+Detailed copied-file list omitted from terminal summary.</pre>
+    </div>
+    <div class="card-body">
+      <h3>C. No File Preview</h3>
+      <p>Summary stays focused on correctness and totals. File browsing is omitted from terminal output.</p>
+    </div>
+  </div>
+</div>
+
+<div class="pros-cons">
+  <div class="pros">
+    <h4>My recommendation: A</h4>
+    <ul>
+      <li>Aggregates tell you what happened without turning the summary into a long scrollback dump.</li>
+      <li>A capped preview is still useful for sanity-checking filenames and layout output.</li>
+      <li>It preserves the correctness-first shape: target results, failures, then breakdown/preview.</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>Tradeoff</h4>
+    <ul>
+      <li>The terminal will not show every copied file unless a future verbose/report option is added.</li>
+    </ul>
+  </div>
+</div>

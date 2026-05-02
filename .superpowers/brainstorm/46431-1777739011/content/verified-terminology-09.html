@@ -1,0 +1,67 @@
+<h2>Question 9: How should the UI name progress while verification is folded into workers?</h2>
+<p class="subtitle">During the run, a worker may hash, copy, then verify. The overall progress text should not overclaim before verification finishes.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Copying  [██████████                    ]  58.2 GB of 133.0 GB   ETA 8m46s
+
+┌ Run ─────────────────────┐
+│ Copied     141           │
+│ Verified   141           │
+│ Failed     1             │
+└──────────────────────────┘</pre>
+    </div>
+    <div class="card-body">
+      <h3>A. Keep Copied and Verified Separate</h3>
+      <p>Overall says copying; the Run box shows both copied and verified counts as separate facts.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Verifying copy  [██████████                    ]  58.2 GB verified of 133.0 GB   ETA 8m46s
+
+┌ Run ─────────────────────┐
+│ Verified   141           │
+│ Failed     1             │
+└──────────────────────────┘</pre>
+    </div>
+    <div class="card-body">
+      <h3>B. Treat Verified as the Main Progress</h3>
+      <p>Emphasizes correctness, but can feel odd while workers are still actively copying.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Transferring  [██████████                    ]  58.2 GB processed of 133.0 GB   ETA 8m46s
+
+┌ Run ─────────────────────┐
+│ Done       141           │
+│ Failed     1             │
+└──────────────────────────┘</pre>
+    </div>
+    <div class="card-body">
+      <h3>C. Use Generic “Processed/Done”</h3>
+      <p>Avoids overclaiming, but hides the important distinction between copied and verified.</p>
+    </div>
+  </div>
+</div>
+
+<div class="pros-cons">
+  <div class="pros">
+    <h4>My recommendation: A</h4>
+    <ul>
+      <li>It is honest during the run: the app is copying, with verification folded into each worker.</li>
+      <li>Copied and verified counts remain explicit, so users can see correctness progress.</li>
+      <li>The final summary can switch emphasis to verified results once the run is complete.</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>Tradeoff</h4>
+    <ul>
+      <li>The Run box has one more metric, but that metric is important enough to keep.</li>
+    </ul>
+  </div>
+</div>

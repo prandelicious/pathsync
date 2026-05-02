@@ -3,15 +3,27 @@ use std::time::Duration;
 
 use crate::format::{human_bytes, human_rate};
 use crate::progress_model::{
-    LiveScreenModel, PostRunScreenModel, ProgressBarModel, WorkerRowModel, overall_message,
+    LiveScreenModel, PostRunScreenModel, ProgressBarModel, TargetProgressRowModel, WorkerRowModel,
+    overall_message,
 };
 pub use crate::progress_model::{PhaseKind, ProgressSnapshot, phase_label};
 
 pub const CANONICAL_WIDTH: usize = 80;
 const LIVE_BAR_WIDTH: usize = 30;
 const WORKER_BAR_WIDTH: usize = 18;
+const TARGET_BAR_WIDTH: usize = 30;
 const VISIBLE_WORKER_ROWS: usize = 4;
+const VISIBLE_TARGET_ROWS: usize = 3;
 const SUMMARY_RIGHT_COLUMN: usize = 27;
+const WIDE_LAYOUT_MIN_WIDTH: usize = 110;
+const WIDE_STATS_BOX_WIDTH: usize = 28;
+const WIDE_LAYOUT_GUTTER: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlyphSet {
+    Unicode,
+    Ascii,
+}
 
 pub fn worker_label(display_name: &str, source: &Path, root: &Path, max_chars: usize) -> String {
     let relative = source
@@ -35,7 +47,7 @@ pub fn worker_prefix(worker: usize) -> String {
 }
 
 pub fn worker_tag(worker: usize) -> String {
-    format!("W{:02}", worker + 1)
+    format!("T{:02}", worker + 1)
 }
 
 pub fn overall_line(snapshot: &ProgressSnapshot) -> String {
@@ -84,142 +96,431 @@ pub fn worker_row(
 }
 
 pub fn render_live_screen(model: &LiveScreenModel) -> Vec<String> {
+    render_live_screen_with_width(model, CANONICAL_WIDTH)
+}
+
+pub fn render_live_screen_with_width(model: &LiveScreenModel, width: usize) -> Vec<String> {
+    render_live_screen_with_width_and_glyphs(model, width, GlyphSet::Unicode)
+}
+
+pub fn render_live_screen_with_width_and_glyphs(
+    model: &LiveScreenModel,
+    width: usize,
+    glyphs: GlyphSet,
+) -> Vec<String> {
+    let width = width.max(CANONICAL_WIDTH);
+    let lines = if width >= WIDE_LAYOUT_MIN_WIDTH {
+        render_live_screen_wide(model, width)
+    } else {
+        render_live_screen_narrow(model, width)
+    };
+
+    apply_glyphs(lines, glyphs)
+}
+
+fn render_live_screen_narrow(model: &LiveScreenModel, width: usize) -> Vec<String> {
     let mut lines = vec![
-        header_line(&model.job_name, &model.status),
-        divider(),
-        live_counts_row(&model.summary),
-        live_bytes_rate_row(&model.summary),
-        live_elapsed_eta_row(&model.summary),
-        blank_line(),
+        header_line(&model.job_name, &model.status, width),
+        divider(width),
+        pad_to_width(&live_counts_row(&model.summary), width),
+        pad_to_width(&live_bytes_rate_row(&model.summary), width),
+        pad_to_width(&live_elapsed_eta_row(&model.summary), width),
+        blank_line(width),
         progress_line(
             &model.overall_label,
             &model.overall_progress,
             Some(&model.overall_progress_text),
+            width,
         ),
-        blank_line(),
-        phase_line(&model.phase_label),
+        blank_line(width),
+        phase_line(&model.phase_label, width),
     ];
 
     for worker in model.workers.iter().take(VISIBLE_WORKER_ROWS) {
-        lines.push(render_worker_row(worker));
+        lines.push(render_worker_row(worker, width));
     }
     for worker in model.workers.len()..VISIBLE_WORKER_ROWS {
-        lines.push(render_worker_row(&WorkerRowModel::idle(worker_tag(worker))));
+        lines.push(render_worker_row(
+            &WorkerRowModel::idle(worker_tag(worker)),
+            width,
+        ));
     }
-    lines.push(divider());
+    lines.push(divider(width));
 
     lines
 }
 
-pub fn render_post_run_screen(model: &PostRunScreenModel) -> Vec<String> {
+fn render_live_screen_wide(model: &LiveScreenModel, width: usize) -> Vec<String> {
+    let left_width = width.saturating_sub(WIDE_STATS_BOX_WIDTH + WIDE_LAYOUT_GUTTER);
     let mut lines = vec![
-        header_line(&model.job_name, &model.status),
-        divider(),
-        post_run_counts_row(&model.summary),
-        post_run_bytes_rate_row(&model.summary),
-        post_run_elapsed_skip_row(&model.summary),
-        blank_line(),
-        progress_line(&model.completion_label, &model.completion_progress, None),
-        blank_line(),
-        pad_to_width("By Category"),
-        divider(),
+        header_line(&model.job_name, &model.status, width),
+        divider(width),
+        blank_line(width),
     ];
+
+    let mut left = vec![
+        progress_line(
+            &model.overall_label,
+            &model.overall_progress,
+            Some(&model.overall_progress_text),
+            left_width,
+        ),
+        phase_line(&model.phase_label, left_width),
+        blank_line(left_width),
+        pad_to_width("Workers", left_width),
+    ];
+    for worker in model.workers.iter().take(VISIBLE_WORKER_ROWS) {
+        left.push(render_worker_row(worker, left_width));
+    }
+    for worker in model.workers.len()..VISIBLE_WORKER_ROWS {
+        left.push(render_worker_row(
+            &WorkerRowModel::idle(worker_tag(worker)),
+            left_width,
+        ));
+    }
+    if !model.target_progress.is_empty() {
+        left.push(blank_line(left_width));
+        left.push(pad_to_width("Targets", left_width));
+        for target in model.target_progress.iter().take(VISIBLE_TARGET_ROWS) {
+            left.push(render_target_progress_row(target, left_width));
+        }
+        if model.target_progress.len() > VISIBLE_TARGET_ROWS {
+            left.push(pad_to_width(
+                &format!(
+                    "... {} more targets",
+                    model.target_progress.len() - VISIBLE_TARGET_ROWS
+                ),
+                left_width,
+            ));
+        }
+    }
+
+    let right = live_stats_box(&model.summary);
+    let row_count = left.len().max(right.len());
+    for row in 0..row_count {
+        let left_line = left.get(row).map(String::as_str).unwrap_or("");
+        let right_line = right.get(row).map(String::as_str).unwrap_or("");
+        lines.push(format!(
+            "{}{}{}",
+            pad_to_width(left_line, left_width),
+            " ".repeat(WIDE_LAYOUT_GUTTER),
+            pad_to_width(right_line, WIDE_STATS_BOX_WIDTH)
+        ));
+    }
+
+    lines.push(divider(width));
+    lines
+}
+
+fn live_stats_box(metrics: &[crate::progress_model::SummaryMetric]) -> Vec<String> {
+    let inner_width = WIDE_STATS_BOX_WIDTH - 2;
+    let title = " Run ";
+    let rule_len = inner_width.saturating_sub(title.chars().count());
+    let mut lines = vec![format!("┌{title}{}┐", "─".repeat(rule_len))];
+    for label in [
+        "Scanned", "Planned", "Copied", "Verified", "Failed", "Bytes", "Rate", "Elapsed", "ETA",
+        "Targets",
+    ] {
+        lines.push(stats_box_row(
+            label,
+            metric_value(metrics, label),
+            inner_width,
+        ));
+    }
+    lines.push(format!("└{}┘", "─".repeat(inner_width)));
+    lines
+}
+
+fn stats_box_row(label: &str, value: &str, inner_width: usize) -> String {
+    let label_width = 9;
+    let content_width = inner_width.saturating_sub(2);
+    let value_width = content_width.saturating_sub(label_width);
+    let value = truncate_middle(value, value_width);
+    let content = format!("{label:<label_width$}{value:<value_width$}");
+    format!("│ {} │", truncate_right(&content, content_width))
+}
+
+pub fn render_post_run_screen(model: &PostRunScreenModel) -> Vec<String> {
+    render_post_run_screen_with_glyphs(model, GlyphSet::Unicode)
+}
+
+pub fn render_post_run_screen_with_glyphs(
+    model: &PostRunScreenModel,
+    glyphs: GlyphSet,
+) -> Vec<String> {
+    let mut lines = vec![
+        header_line(&model.job_name, &model.status, CANONICAL_WIDTH),
+        divider(CANONICAL_WIDTH),
+        progress_line(
+            &model.completion_label,
+            &model.completion_progress,
+            Some(&format!(
+                "{} verified   ETA {}",
+                metric_value(&model.summary, "Bytes"),
+                metric_value(&model.summary, "ETA")
+            )),
+            CANONICAL_WIDTH,
+        ),
+        blank_line(CANONICAL_WIDTH),
+        pad_to_width("Target Results", CANONICAL_WIDTH),
+        divider(CANONICAL_WIDTH),
+        pad_to_width(
+            &format!(
+                "{:<12} {:>7} {:>7} {:>8} {:>9} {:>11}   {}",
+                "Target", "Planned", "Copied", "Verified", "Copy Fail", "Verify Fail", "Result"
+            ),
+            CANONICAL_WIDTH,
+        ),
+    ];
+
+    for target in &model.target_results {
+        lines.push(render_target_result_row(target));
+    }
+
+    if !model.errors.is_empty() {
+        lines.push(blank_line(CANONICAL_WIDTH));
+        lines.push(pad_to_width("Failures", CANONICAL_WIDTH));
+        lines.push(divider(CANONICAL_WIDTH));
+        lines.push(pad_to_width(
+            &format!("{:<10} {:<8} {:<24} {}", "Target", "Phase", "File", "Error"),
+            CANONICAL_WIDTH,
+        ));
+        for error in &model.errors {
+            lines.push(render_error_row(error));
+        }
+    }
+
+    lines.push(blank_line(CANONICAL_WIDTH));
+    lines.push(pad_to_width("Breakdown", CANONICAL_WIDTH));
+    lines.push(divider(CANONICAL_WIDTH));
+    lines.push(pad_to_width(
+        &format!(
+            "{:<20} {:>7} {:>12} {:>9}",
+            "Bucket", "Files", "Bytes", "Share"
+        ),
+        CANONICAL_WIDTH,
+    ));
 
     for category in &model.categories {
         lines.push(render_category_row(category));
     }
 
-    lines.push(blank_line());
-    lines.push(pad_to_width("Errors"));
-    lines.push(divider());
-    for error in &model.errors {
-        lines.push(render_error_row(&error.label, &error.detail));
+    if model.copied_preview_total > 0 {
+        lines.push(blank_line(CANONICAL_WIDTH));
+        lines.push(pad_to_width("Copied file preview", CANONICAL_WIDTH));
+        lines.push(pad_to_width(
+            &format!(
+                "showing {} of {} copied files",
+                format_count(model.copied_preview_count.min(model.copied_preview_total)),
+                format_count(model.copied_preview_total),
+            ),
+            CANONICAL_WIDTH,
+        ));
     }
 
-    lines
+    apply_glyphs(lines, glyphs)
 }
 
-fn header_line(job_name: &str, status: &str) -> String {
+fn apply_glyphs(lines: Vec<String>, glyphs: GlyphSet) -> Vec<String> {
+    match glyphs {
+        GlyphSet::Unicode => lines,
+        GlyphSet::Ascii => lines.into_iter().map(ascii_line).collect(),
+    }
+}
+
+fn ascii_line(line: String) -> String {
+    line.chars()
+        .map(|ch| match ch {
+            '─' => '-',
+            '┌' | '┐' | '└' | '┘' => '+',
+            '│' => '|',
+            '█' => '#',
+            '…' => '~',
+            '⠋' | '⠙' | '⠹' | '⠸' | '⠼' | '⠴' | '⠦' | '⠧' | '⠇' | '⠏' => '*',
+            other => other,
+        })
+        .collect()
+}
+
+fn render_target_result_row(target: &crate::progress_model::TargetResultRowModel) -> String {
+    let result = if target.copy_failed == 0
+        && target.verify_failed == 0
+        && target.planned == target.copied
+        && target.planned == target.verified
+    {
+        "verified"
+    } else {
+        "attention"
+    };
+    pad_to_width(
+        &format!(
+            "{:<12} {:>7} {:>7} {:>8} {:>9} {:>11}   {}",
+            truncate_middle(&target.target, 12),
+            format_count(target.planned),
+            format_count(target.copied),
+            format_count(target.verified),
+            format_count(target.copy_failed),
+            format_count(target.verify_failed),
+            result,
+        ),
+        CANONICAL_WIDTH,
+    )
+}
+
+fn header_line(job_name: &str, status: &str, width: usize) -> String {
     let left = format!("Pathsync ({job_name})");
-    let gap = CANONICAL_WIDTH.saturating_sub(left.chars().count() + status.chars().count());
+    let gap = width.saturating_sub(left.chars().count() + status.chars().count());
     format!("{left}{}{status}", " ".repeat(gap))
 }
 
-fn divider() -> String {
-    "─".repeat(CANONICAL_WIDTH)
+fn divider(width: usize) -> String {
+    "─".repeat(width)
 }
 
-fn blank_line() -> String {
-    " ".repeat(CANONICAL_WIDTH)
+fn blank_line(width: usize) -> String {
+    " ".repeat(width)
 }
 
-fn progress_line(label: &str, model: &ProgressBarModel, trailing: Option<&str>) -> String {
-    let percent = model.percent.min(100);
-    let bar = rounded_progress_bar_string(percent, model.width.max(LIVE_BAR_WIDTH));
+fn progress_line(
+    label: &str,
+    model: &ProgressBarModel,
+    trailing: Option<&str>,
+    width: usize,
+) -> String {
+    let bar = progress_bar_string(model.percent, model.width.max(LIVE_BAR_WIDTH));
     let trailing = trailing.unwrap_or("");
     if trailing.is_empty() {
-        return pad_to_width(&format!("{label:<19}  {bar}  {percent:>2}%"));
+        return pad_to_width(&format!("{label}  {bar}"), width);
     }
 
-    pad_to_width(&format!("{label:<19}  {bar}  {percent:>2}%  {trailing}"))
+    pad_to_width(&format!("{label}  {bar}   {trailing}"), width)
 }
 
-fn phase_line(label: &str) -> String {
-    pad_to_width(label)
+fn phase_line(label: &str, width: usize) -> String {
+    pad_to_width(label, width)
 }
 
-fn render_worker_row(worker: &WorkerRowModel) -> String {
+fn render_worker_row(worker: &WorkerRowModel, width: usize) -> String {
+    let bar_width = if width < 100 { 4 } else { WORKER_BAR_WIDTH };
     let bar = if worker.idle {
-        "▒".repeat(WORKER_BAR_WIDTH)
+        worker_progress_bar_string(0, bar_width)
     } else {
-        rounded_progress_bar_string(worker.percent, WORKER_BAR_WIDTH)
+        worker_progress_bar_string(worker.percent, bar_width)
     };
-    let item_width = 24;
     let detail = if worker.time.is_empty() {
         "--".to_string()
     } else {
         worker.time.clone()
     };
+    let target = if worker.target.is_empty() {
+        "--"
+    } else {
+        &worker.target
+    };
+    let target_width = if width < 100 { 11 } else { 14 };
+    let target = truncate_middle(target, target_width);
+    let phase = worker.phase.map(|phase| phase.as_label()).unwrap_or("");
+    let phase_width = if width < 100 { 8 } else { 9 };
+    let size_width = if width < 100 { 6 } else { 8 };
+    let rate_width = if width < 100 { 8 } else { 10 };
+    let phase = truncate_middle(phase, phase_width);
+    let size = truncate_middle(&worker.size, size_width);
+    let detail = truncate_middle(&detail, rate_width);
 
     let spinner = worker.spinner_frame.unwrap_or(' ');
+    let fixed_width = spinner.to_string().chars().count()
+        + 1
+        + worker.worker_tag.chars().count()
+        + 2
+        + phase_width
+        + 1
+        + bar.chars().count()
+        + 2
+        + 2
+        + size_width
+        + 2
+        + rate_width
+        + 2
+        + target.chars().count();
+    let max_item_width = if worker.target.is_empty() { 21 } else { 52 };
+    let item_width = width.saturating_sub(fixed_width).clamp(8, max_item_width);
 
-    pad_to_width(&format!(
-        "{spinner} {}  {}  {:<item_width$}  {:>8}  {:>10}",
-        worker.worker_tag,
-        bar,
-        truncate_middle(&worker.item, item_width),
-        worker.size,
-        detail,
-        item_width = item_width
-    ))
+    pad_to_width(
+        &format!(
+            "{spinner} {}  {:<phase_width$} {}  {:<item_width$}  {:>size_width$}  {:>rate_width$}  {}",
+            worker.worker_tag,
+            phase,
+            bar,
+            truncate_middle(&worker.item, item_width),
+            size,
+            detail,
+            target,
+            phase_width = phase_width,
+            item_width = item_width
+        ),
+        width,
+    )
+}
+
+fn render_target_progress_row(target: &TargetProgressRowModel, width: usize) -> String {
+    let bar = progress_bar_string_with_empty(target.percent, TARGET_BAR_WIDTH, ' ');
+    pad_to_width(
+        &format!(
+            "{:<10} {}  {:<18} {:>10}   {} active",
+            truncate_middle(&target.target, 10),
+            bar,
+            truncate_middle(&target.bytes, 18),
+            target.rate,
+            target.active_workers,
+        ),
+        width,
+    )
 }
 
 fn render_category_row(category: &crate::progress_model::CategoryRowModel) -> String {
-    let file_label = if category.files == 1 { "file" } else { "files" };
-    pad_to_width(&format!(
-        "{:<20}{:>7} {:<5}{:>11}{:>9}{:>11}",
-        truncate_middle(&category.label, 20),
-        format_count(category.files),
-        file_label,
-        category.bytes,
-        category.percent,
-        category.time
-    ))
+    pad_to_width(
+        &format!(
+            "{:<20} {:>7} {:>12} {:>9}",
+            truncate_middle(&category.label, 20),
+            format_count(category.files),
+            category.bytes,
+            category.percent,
+        ),
+        CANONICAL_WIDTH,
+    )
 }
 
-fn render_error_row(label: &str, detail: &str) -> String {
-    let label = truncate_middle(label, 24);
-    let detail_width = CANONICAL_WIDTH.saturating_sub(label.chars().count() + 2);
-    let detail = truncate_middle(detail, detail_width);
-    pad_to_width(&format!("{label}  {detail}"))
+fn render_error_row(error: &crate::progress_model::ErrorRowModel) -> String {
+    let fixed_width = 10 + 1 + 8 + 1 + 24 + 1;
+    let error_width = CANONICAL_WIDTH.saturating_sub(fixed_width);
+    pad_to_width(
+        &format!(
+            "{:<10} {:<8} {:<24} {}",
+            truncate_middle(&error.target, 10),
+            truncate_middle(&error.phase, 8),
+            truncate_middle(&error.file, 24),
+            truncate_middle(&error.error, error_width),
+        ),
+        CANONICAL_WIDTH,
+    )
 }
 
-fn rounded_progress_bar_string(percent: usize, width: usize) -> String {
+fn progress_bar_string(percent: usize, width: usize) -> String {
+    progress_bar_string_with_empty(percent, width, '-')
+}
+
+fn worker_progress_bar_string(percent: usize, width: usize) -> String {
+    progress_bar_string_with_empty(percent, width, ' ')
+}
+
+fn progress_bar_string_with_empty(percent: usize, width: usize, empty: char) -> String {
     let filled = filled_cells(percent, width);
     format!(
-        "{}{}",
+        "[{}{}]",
         "█".repeat(filled.min(width)),
-        "▒".repeat(width.saturating_sub(filled.min(width)))
+        empty
+            .to_string()
+            .repeat(width.saturating_sub(filled.min(width)))
     )
 }
 
@@ -259,38 +560,12 @@ fn live_elapsed_eta_row(metrics: &[crate::progress_model::SummaryMetric]) -> Str
     )
 }
 
-fn post_run_counts_row(metrics: &[crate::progress_model::SummaryMetric]) -> String {
-    summary_two_column_row(
-        &metric_pair(metrics, "Scanned"),
-        &format!(
-            "{}, {}, {}",
-            metric_pair(metrics, "Planned"),
-            metric_pair(metrics, "Copied"),
-            metric_pair(metrics, "Failed")
-        ),
-    )
-}
-
-fn post_run_bytes_rate_row(metrics: &[crate::progress_model::SummaryMetric]) -> String {
-    summary_two_column_row(
-        &metric_pair(metrics, "Bytes transferred"),
-        &metric_pair(metrics, "Avg rate"),
-    )
-}
-
-fn post_run_elapsed_skip_row(metrics: &[crate::progress_model::SummaryMetric]) -> String {
-    summary_two_column_row(
-        &metric_pair(metrics, "Elapsed"),
-        &metric_pair(metrics, "Skip rate"),
-    )
-}
-
 fn summary_two_column_row(left: &str, right: &str) -> String {
     let left_width = SUMMARY_RIGHT_COLUMN.max(left.chars().count() + 1);
-    pad_to_width(&format!(
-        "{left:<left_width$}{right}",
-        left_width = left_width
-    ))
+    pad_to_width(
+        &format!("{left:<left_width$}{right}", left_width = left_width),
+        CANONICAL_WIDTH,
+    )
 }
 
 fn metric_pair(metrics: &[crate::progress_model::SummaryMetric], label: &str) -> String {
@@ -305,12 +580,12 @@ fn metric_value<'a>(metrics: &'a [crate::progress_model::SummaryMetric], label: 
         .unwrap_or("--")
 }
 
-fn pad_to_width(value: &str) -> String {
-    let width = value.chars().count();
-    if width >= CANONICAL_WIDTH {
-        value.chars().take(CANONICAL_WIDTH).collect()
+fn pad_to_width(value: &str, width: usize) -> String {
+    let value_width = value.chars().count();
+    if value_width >= width {
+        value.chars().take(width).collect()
     } else {
-        format!("{value}{}", " ".repeat(CANONICAL_WIDTH - width))
+        format!("{value}{}", " ".repeat(width - value_width))
     }
 }
 
@@ -329,6 +604,15 @@ fn truncate_middle(value: &str, max_chars: usize) -> String {
     let head: String = chars[..head_len].iter().collect();
     let tail: String = chars[chars.len() - tail_len..].iter().collect();
     format!("{head}…{tail}")
+}
+
+fn truncate_right(value: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= max_chars {
+        value.to_string()
+    } else {
+        chars[..max_chars].iter().collect()
+    }
 }
 
 fn format_count(value: usize) -> String {

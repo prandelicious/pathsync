@@ -1,0 +1,60 @@
+<h2>Question 8: What belongs on each live worker row?</h2>
+<p class="subtitle">The worker row is the highest-frequency line in the UI. Every field has to earn its space.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Workers
+⠋ T01  hashing    [██████████        ]  A001_C014_0101AB.MP4      8.2 GB   78.4 MB/s   T7
+⠙ T02  copying    [████████          ]  A001_C015_0101AB.MP4      7.9 GB   64.0 MB/s   Archive
+⠹ T03  verifying  [██                ]  GX010193.MP4              2.1 GB   41.8 MB/s   T7</pre>
+    </div>
+    <div class="card-body">
+      <h3>A. Phase + Bar + File + Size + Rate + Target</h3>
+      <p>Dense but complete. Target is a final column, not parenthesized into the rate field.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Workers
+⠋ T01  hashing    A001_C014_0101AB.MP4      8.2 GB   78.4 MB/s   T7
+⠙ T02  copying    A001_C015_0101AB.MP4      7.9 GB   64.0 MB/s   Archive
+⠹ T03  verifying  GX010193.MP4              2.1 GB   41.8 MB/s   T7</pre>
+    </div>
+    <div class="card-body">
+      <h3>B. No Worker Bar</h3>
+      <p>More filename room. Loses per-file progress, especially useful for long hashing/copying phases.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">Workers
+⠋ T01  T7       hashing    [██████████        ]  A001_C014_0101AB.MP4      8.2 GB   78.4 MB/s
+⠙ T02  Archive  copying    [████████          ]  A001_C015_0101AB.MP4      7.9 GB   64.0 MB/s
+⠹ T03  T7       verifying  [██                ]  GX010193.MP4              2.1 GB   41.8 MB/s</pre>
+    </div>
+    <div class="card-body">
+      <h3>C. Target Near Worker ID</h3>
+      <p>Emphasizes destination ownership, but pushes phase/bar/file to the right.</p>
+    </div>
+  </div>
+</div>
+
+<div class="pros-cons">
+  <div class="pros">
+    <h4>My recommendation: A</h4>
+    <ul>
+      <li>The per-file bar is valuable for large files and hashing phases.</li>
+      <li>Putting target as its own final column keeps filenames more recognizable than parenthesized suffixes.</li>
+      <li>The visual scan order is natural: worker, state, progress, file, size/rate, destination.</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>Tradeoff</h4>
+    <ul>
+      <li>On narrow terminals, this needs adaptive truncation and may shorten the bar first.</li>
+    </ul>
+  </div>
+</div>

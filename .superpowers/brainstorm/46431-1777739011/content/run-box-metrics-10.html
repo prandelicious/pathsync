@@ -1,0 +1,88 @@
+<h2>Question 10: What should be permanent in the right Run box?</h2>
+<p class="subtitle">The Run box is the stable anchor across live and summary views. It should contain only metrics that are useful at a glance.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">┌ Run ─────────────────────┐
+│ Scanned    2,941         │
+│ Planned    318           │
+│ Copied     141           │
+│ Verified   141           │
+│ Failed     1             │
+│ Bytes      58.2 / 133 GB │
+│ Rate       142.4 MB/s    │
+│ Elapsed    7m08s         │
+│ ETA        8m46s         │
+│ Targets    2             │
+└──────────────────────────┘</pre>
+    </div>
+    <div class="card-body">
+      <h3>A. Core Run Metrics Only</h3>
+      <p>Stable, compact, and easy to scan. Worker counts stay out of the box.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">┌ Run ─────────────────────┐
+│ Scanned    2,941         │
+│ Planned    318           │
+│ Copied     141           │
+│ Verified   141           │
+│ Failed     1             │
+│ Bytes      58.2 / 133 GB │
+│ Rate       142.4 MB/s    │
+│ Elapsed    7m08s         │
+│ ETA        8m46s         │
+│ Copy W     4             │
+│ Verify W   2             │
+│ Targets    2             │
+└──────────────────────────┘</pre>
+    </div>
+    <div class="card-body">
+      <h3>B. Include Worker Counts</h3>
+      <p>Useful for debugging, but makes the box taller and mixes configuration with outcome metrics.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <pre style="font-size:12px;line-height:1.35;margin:0;white-space:pre;overflow:auto;color:#d6d3e8;background:#171625;padding:16px;border-radius:6px">┌ Run ─────────────────────┐
+│ Status     Copying       │
+│ Phase      Large files   │
+│ Scanned    2,941         │
+│ Planned    318           │
+│ Copied     141           │
+│ Verified   141           │
+│ Failed     1             │
+│ Bytes      58.2 / 133 GB │
+│ Rate       142.4 MB/s    │
+│ Elapsed    7m08s         │
+│ ETA        8m46s         │
+│ Targets    2             │
+└──────────────────────────┘</pre>
+    </div>
+    <div class="card-body">
+      <h3>C. Include Status and Phase</h3>
+      <p>More self-contained, but duplicates the left-pane header and phase line.</p>
+    </div>
+  </div>
+</div>
+
+<div class="pros-cons">
+  <div class="pros">
+    <h4>My recommendation: A</h4>
+    <ul>
+      <li>The Run box should be the run ledger: scanned, planned, copied, verified, failed, bytes, rate, elapsed, ETA, targets.</li>
+      <li>Worker counts are operational details already visible in the worker rows.</li>
+      <li>Keeping the box short gives more vertical room to workers, target strip, and failure details.</li>
+    </ul>
+  </div>
+  <div class="cons">
+    <h4>Tradeoff</h4>
+    <ul>
+      <li>If worker tuning becomes important later, worker counts can move into a debug/verbose mode.</li>
+    </ul>
+  </div>
+</div>
