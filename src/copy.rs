@@ -38,19 +38,25 @@ const BRAILLE_SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '
 #[allow(dead_code)]
 const HASH_BUFFER_SIZE: usize = 1024 * 1024;
 
-#[allow(dead_code)]
+/// A file's content signature: size plus an `xxh3_128` digest. This is the
+/// integrity anchor used throughout the copy/staging pipeline -- see the
+/// plan's "Integrity anchor is the source signature" decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileSignature {
-    size: u64,
-    xxh3_128: u128,
+pub(crate) struct FileSignature {
+    pub(crate) size: u64,
+    pub(crate) xxh3_128: u128,
 }
 
-#[allow(dead_code)]
+/// A source file's `size/mtime/dev/ino` key, used to detect mid-run
+/// mutation via [`ensure_source_unchanged`]. `size` and `mtime` are
+/// `pub(crate)` because staging (`src/stage.rs`) needs them directly (the
+/// reserved byte count and the mtime to stamp on the spool copy) without a
+/// redundant extra `fs::metadata` call.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SourceSignatureKey {
+pub(crate) struct SourceSignatureKey {
     path: PathBuf,
-    size: u64,
-    mtime: Option<std::time::SystemTime>,
+    pub(crate) size: u64,
+    pub(crate) mtime: Option<std::time::SystemTime>,
     #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
@@ -789,19 +795,35 @@ fn copy_file(
 static AFTER_COPY_TEST_HOOK: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 
 #[cfg(test)]
-fn set_after_copy_test_hook(hook: Box<dyn FnOnce() + Send>) {
+pub(crate) fn set_after_copy_test_hook(hook: Box<dyn FnOnce() + Send>) {
     *AFTER_COPY_TEST_HOOK.lock().unwrap() = Some(hook);
 }
 
 #[cfg(test)]
-fn run_after_copy_test_hook() {
+pub(crate) fn run_after_copy_test_hook() {
     if let Some(hook) = AFTER_COPY_TEST_HOOK.lock().unwrap().take() {
         hook();
     }
 }
 
 #[cfg(not(test))]
-fn run_after_copy_test_hook() {}
+pub(crate) fn run_after_copy_test_hook() {}
+
+/// Serializes tests (in this module and in `src/stage.rs`) that use
+/// [`set_after_copy_test_hook`]/[`run_after_copy_test_hook`]. The hook is a
+/// single process-wide slot and `cargo test` runs tests in parallel by
+/// default, so two tests both using it at once could clobber or steal each
+/// other's closure. Hold the returned guard for the duration of any test
+/// that touches the hook.
+#[cfg(test)]
+static TEST_HOOK_GUARD: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn after_copy_test_hook_guard() -> std::sync::MutexGuard<'static, ()> {
+    TEST_HOOK_GUARD
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
 
 fn copy_failure(
     plan: &TransferPlan,
@@ -949,7 +971,7 @@ fn panic_failure(worker: usize, operation: CopyOperation) -> CopyFailure {
     }
 }
 
-fn classify_failure(
+pub(crate) fn classify_failure(
     kind: ErrorKind,
     raw_os_error: Option<i32>,
     operation: CopyOperation,
@@ -978,7 +1000,7 @@ fn classify_failure(
     CopyFailureClassification::Local
 }
 
-fn temp_path_for(dest: &Path) -> PathBuf {
+pub(crate) fn temp_path_for(dest: &Path) -> PathBuf {
     dest.with_extension(format!(
         "{}.pathsync-part",
         dest.extension()
@@ -987,8 +1009,7 @@ fn temp_path_for(dest: &Path) -> PathBuf {
     ))
 }
 
-#[allow(dead_code)]
-fn source_signature_key(path: &Path) -> io::Result<SourceSignatureKey> {
+pub(crate) fn source_signature_key(path: &Path) -> io::Result<SourceSignatureKey> {
     let metadata = fs::metadata(path)?;
     Ok(SourceSignatureKey {
         path: path.to_path_buf(),
@@ -1007,8 +1028,10 @@ fn source_signature_key(path: &Path) -> io::Result<SourceSignatureKey> {
     })
 }
 
-#[allow(dead_code)]
-fn ensure_source_unchanged(path: &Path, expected: &SourceSignatureKey) -> io::Result<()> {
+pub(crate) fn ensure_source_unchanged(
+    path: &Path,
+    expected: &SourceSignatureKey,
+) -> io::Result<()> {
     let actual = source_signature_key(path)?;
     if &actual == expected {
         Ok(())
@@ -1020,8 +1043,11 @@ fn ensure_source_unchanged(path: &Path, expected: &SourceSignatureKey) -> io::Re
     }
 }
 
-#[allow(dead_code)]
-fn hash_file_xxh3_128<F>(path: &Path, size: u64, mut progress: F) -> io::Result<FileSignature>
+pub(crate) fn hash_file_xxh3_128<F>(
+    path: &Path,
+    size: u64,
+    mut progress: F,
+) -> io::Result<FileSignature>
 where
     F: FnMut(u64),
 {
@@ -2884,6 +2910,7 @@ mod tests {
 
     #[test]
     fn source_changed_after_copy_removes_destination_and_sends_failure() {
+        let _hook_guard = after_copy_test_hook_guard();
         let temp = TempDir::new("pathsync-source-changed-post-copy");
         let source = temp.path().join("source/photo.jpg");
         let target = temp.path().join("target");

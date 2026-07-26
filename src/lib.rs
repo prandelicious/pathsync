@@ -9,6 +9,7 @@ pub mod policy;
 pub mod progress_format;
 pub mod progress_model;
 pub mod spool;
+mod stage;
 
 use std::fs;
 use std::path::{Path, PathBuf};
