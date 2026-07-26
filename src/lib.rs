@@ -4,6 +4,7 @@ mod copy_fast_path;
 pub mod date;
 pub mod error;
 pub mod format;
+mod lanes;
 pub mod plan;
 pub mod policy;
 pub mod progress_format;

@@ -103,7 +103,7 @@ struct CopyExecutionContext {
 }
 
 #[derive(Debug)]
-enum WorkerEvent {
+pub(crate) enum WorkerEvent {
     PhaseStarted {
         phase: PhaseKind,
         worker_count: usize,
@@ -151,7 +151,7 @@ enum WorkerEvent {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
-enum SizeBucket {
+pub(crate) enum SizeBucket {
     Large,
     #[default]
     Small,
@@ -959,7 +959,7 @@ fn copy_transfer_failure(
     }
 }
 
-fn panic_failure(worker: usize, operation: CopyOperation) -> CopyFailure {
+pub(crate) fn panic_failure(worker: usize, operation: CopyOperation) -> CopyFailure {
     CopyFailure {
         source: PathBuf::from(format!("<worker-{worker}>")),
         dest: None,
