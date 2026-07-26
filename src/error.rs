@@ -139,6 +139,8 @@ pub enum CopyOperation {
     WorkerPanic,
     #[error("ui_panic")]
     UiPanic,
+    #[error("reserve")]
+    Reserve,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +166,8 @@ pub enum CopyError {
     Internal { message: String },
     #[error("progress UI thread panicked")]
     UiThreadPanicked,
+    #[error("staging run-start validation failed: {message}")]
+    StagingValidationFailed { message: String },
 }
 
 #[derive(Debug, Error)]

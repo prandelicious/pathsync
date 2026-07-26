@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use filetime::{FileTime, set_file_mtime};
-use pathsync::{build_transfer_plan, config};
+use pathsync::config::{ResolvedJob, ResolvedStaging};
+use pathsync::policy::{ComparePolicy, TimezonePolicy, TransferPolicy};
+use pathsync::{build_transfer_plan, build_transfer_plan_with_stats, config};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -814,6 +816,318 @@ fn planning_rejects_same_destination_collisions_without_content_dedupe() {
         }
         other => panic!("expected collision error, got {other:?}"),
     }
+}
+
+/// Directly constructs a staged `ResolvedJob`, bypassing config parsing.
+/// `ResolvedStaging.max_bytes` is byte-granular, while the TOML `staging`
+/// config table only accepts whole `max_gb` (and rejects `0`), so tests
+/// that need a small/precise cap (e.g. "cap smaller than the largest
+/// planned file") build a `ResolvedJob` directly here rather than writing
+/// a config file, the same way `load_job` below already does for
+/// non-staged jobs.
+fn resolved_staged_job(
+    source: &Path,
+    targets: Vec<PathBuf>,
+    transfer_policy: TransferPolicy,
+    staging: ResolvedStaging,
+) -> ResolvedJob {
+    ResolvedJob {
+        name: "sync".to_string(),
+        source: source.to_path_buf(),
+        targets,
+        extensions: vec!["jpg".to_string()],
+        compare_policy: ComparePolicy::SizeMtime,
+        transfer_policy,
+        timezone_policy: TimezonePolicy::Local,
+        parallel: 4,
+        template: "{filename}".to_string(),
+        staging: Some(staging),
+    }
+}
+
+#[test]
+fn staged_run_with_cap_smaller_than_largest_file_fails_fast_without_partial_writes() {
+    let root = TempDir::new("pathsync-staging-cap-too-small");
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(&spool_dir).unwrap();
+    write_file(&source.join("big.jpg"), &[b'x'; 4096]);
+
+    let job = resolved_staged_job(
+        &source,
+        vec![target.clone()],
+        TransferPolicy::Standard,
+        ResolvedStaging {
+            dir: spool_dir.clone(),
+            max_bytes: Some(1024),
+            min_free_bytes: 0,
+        },
+    );
+
+    let plan_build = build_transfer_plan_with_stats(&job, false).unwrap();
+    assert_eq!(plan_build.plans.len(), 1);
+
+    let error = pathsync::copy::run_copy(&job, plan_build.plans, plan_build.stats)
+        .expect_err("run must fail fast when the cap is smaller than the largest planned file");
+    match error {
+        pathsync::error::CopyError::StagingValidationFailed { message } => {
+            assert!(
+                message.contains("capacity cap"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("expected StagingValidationFailed, got {other:?}"),
+    }
+
+    assert!(
+        !target.join("big.jpg").exists(),
+        "no partial target write must exist after fail-fast validation"
+    );
+    let spool_entries: Vec<_> = fs::read_dir(&spool_dir).unwrap().collect();
+    assert!(
+        spool_entries.is_empty(),
+        "no spool residue after fail-fast validation: {spool_entries:?}"
+    );
+}
+
+#[test]
+fn staged_run_only_drains_to_targets_that_still_need_the_file() {
+    let root = TempDir::new("pathsync-staging-compare-interplay");
+    let source = root.path().join("source");
+    let target_a = root.path().join("target-a");
+    let target_b = root.path().join("target-b");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target_a).unwrap();
+    fs::create_dir_all(&target_b).unwrap();
+    fs::create_dir_all(&spool_dir).unwrap();
+
+    let source_file = source.join("photo.jpg");
+    write_file(&source_file, b"shared-bytes");
+    let mtime = FileTime::from_unix_time(1_700_000_000, 0);
+    set_file_mtime(&source_file, mtime).unwrap();
+
+    // Pre-seed target A with an already-matching copy (same size + mtime)
+    // so planning produces no `TransferPlan` for A, only for B -- existing
+    // planning behavior (untouched by staging).
+    let existing = target_a.join("photo.jpg");
+    write_file(&existing, b"shared-bytes");
+    set_file_mtime(&existing, mtime).unwrap();
+
+    let job = resolved_staged_job(
+        &source,
+        vec![target_a.clone(), target_b.clone()],
+        TransferPolicy::Standard,
+        ResolvedStaging {
+            dir: spool_dir.clone(),
+            max_bytes: None,
+            min_free_bytes: 0,
+        },
+    );
+
+    let plan_build = build_transfer_plan_with_stats(&job, false).unwrap();
+    assert_eq!(
+        plan_build.plans.len(),
+        1,
+        "planning must skip the already-matching target A copy"
+    );
+    assert_eq!(plan_build.plans[0].dest, target_b.join("photo.jpg"));
+
+    let result = pathsync::copy::run_copy(&job, plan_build.plans, plan_build.stats);
+    assert!(result.is_ok(), "{result:?}");
+
+    assert_eq!(
+        fs::read(target_b.join("photo.jpg")).unwrap(),
+        b"shared-bytes"
+    );
+    assert_eq!(
+        fs::read(&existing).unwrap(),
+        b"shared-bytes",
+        "target A's pre-existing file must be untouched"
+    );
+
+    let spool_entries: Vec<_> = fs::read_dir(&spool_dir).unwrap().collect();
+    assert!(
+        spool_entries.is_empty(),
+        "spool run directory must be cleaned up once draining finishes: {spool_entries:?}"
+    );
+}
+
+#[test]
+fn staged_single_target_job_completes_and_reports_source_released() {
+    let root = TempDir::new("pathsync-staging-single-target");
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    write_file(&source.join("photo.jpg"), b"staged-single-target-bytes");
+
+    let config_path = root.path().join("config.toml");
+    let text = format!(
+        r#"
+default_job = "sync"
+
+[jobs.sync]
+enabled = true
+source = "{source}"
+target = "{target}"
+extensions = ["jpg"]
+compare = {{ mode = "size_mtime" }}
+transfer = {{ mode = "standard" }}
+layout = "flat"
+
+[jobs.sync.staging]
+dir = "{staging_dir}"
+max_gb = 1
+min_free_gb = 0
+"#,
+        source = source.display(),
+        target = target.display(),
+        staging_dir = spool_dir.display(),
+    );
+    fs::write(&config_path, text).unwrap();
+
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap()]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(
+        fs::read(target.join("photo.jpg")).unwrap(),
+        b"staged-single-target-bytes"
+    );
+    assert!(
+        output.stdout.contains("source released"),
+        "stdout={}",
+        output.stdout
+    );
+    assert!(output.stdout.contains("VERIFIED"));
+}
+
+#[test]
+fn staged_adaptive_run_stages_and_verifies_mixed_large_and_small_files() {
+    let root = TempDir::new("pathsync-staging-adaptive");
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    write_file(&source.join("large.jpg"), &[b'L'; 2_000_000]);
+    write_file(&source.join("small.jpg"), &[b'S'; 64]);
+
+    let config_path = root.path().join("config.toml");
+    let text = format!(
+        r#"
+default_job = "sync"
+
+[jobs.sync]
+enabled = true
+source = "{source}"
+target = "{target}"
+extensions = ["jpg"]
+compare = {{ mode = "path" }}
+transfer = {{ mode = "adaptive", large_file_threshold_mb = 1 }}
+layout = "flat"
+parallel = 2
+
+[jobs.sync.staging]
+dir = "{staging_dir}"
+max_gb = 1
+min_free_gb = 0
+"#,
+        source = source.display(),
+        target = target.display(),
+        staging_dir = spool_dir.display(),
+    );
+    fs::write(&config_path, text).unwrap();
+
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap()]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(fs::read(target.join("large.jpg")).unwrap().len(), 2_000_000);
+    assert_eq!(fs::read(target.join("small.jpg")).unwrap(), &[b'S'; 64][..]);
+    assert!(output.stdout.contains("source released"));
+    assert!(output.stdout.contains("VERIFIED"));
+}
+
+#[cfg(unix)]
+#[test]
+fn staged_run_with_unreadable_source_reports_failure_and_still_releases() {
+    let root = TempDir::new("pathsync-staging-failure");
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    write_file(&source.join("good.jpg"), b"good-bytes");
+    let bad = source.join("bad.jpg");
+    write_file(&bad, b"bad-bytes");
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let config_path = root.path().join("config.toml");
+    let text = format!(
+        r#"
+default_job = "sync"
+
+[jobs.sync]
+enabled = true
+source = "{source}"
+target = "{target}"
+extensions = ["jpg"]
+compare = {{ mode = "path" }}
+transfer = {{ mode = "standard" }}
+layout = "flat"
+
+[jobs.sync.staging]
+dir = "{staging_dir}"
+max_gb = 1
+min_free_gb = 0
+"#,
+        source = source.display(),
+        target = target.display(),
+        staging_dir = spool_dir.display(),
+    );
+    fs::write(&config_path, text).unwrap();
+
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap()]);
+
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(
+        !output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output.stdout.contains("ATTENTION"),
+        "stdout={}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains("source released"),
+        "release milestone must still fire once every planned file is terminal: stdout={}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains("with staging failures"),
+        "release event must note the staging failure: stdout={}",
+        output.stdout
+    );
+    assert_eq!(fs::read(target.join("good.jpg")).unwrap(), b"good-bytes");
+    assert!(!target.join("bad.jpg").exists());
 }
 
 fn load_job(source: &Path, target: &Path, compare_mode: &str) -> config::ResolvedJob {
