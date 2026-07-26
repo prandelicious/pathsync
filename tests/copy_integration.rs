@@ -821,6 +821,7 @@ fn load_job(source: &Path, target: &Path, compare_mode: &str) -> config::Resolve
         default_job: Some("sync".to_string()),
         parallel: None,
         timezone: None,
+        staging: None,
         jobs: [(
             "sync".to_string(),
             config::JobConfig {
@@ -840,6 +841,7 @@ fn load_job(source: &Path, target: &Path, compare_mode: &str) -> config::Resolve
                 }),
                 parallel: None,
                 timezone: None,
+                staging: None,
                 layout: config::LayoutConfig::Preset("flat".to_string()),
             },
         )]

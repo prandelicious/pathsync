@@ -192,6 +192,9 @@ fn print_jobs(config: &Config) {
             "  parallel   : {}",
             job.parallel.or(config.parallel).unwrap_or(4)
         );
+        if let Some(staging_summary) = staging_config_summary(job, config) {
+            println!("  staging    : {}", staging_summary);
+        }
         println!();
     }
 }
@@ -248,6 +251,32 @@ fn transfer_config_summary(transfer: Option<&TransferConfig>) -> String {
             transfer.large_file_threshold_mb.unwrap_or(100)
         ),
         other => other.to_string(),
+    }
+}
+
+fn staging_config_summary(job: &config::JobConfig, config: &Config) -> Option<String> {
+    let staging = job.staging.as_ref().or(config.staging.as_ref())?;
+    let mut parts = Vec::new();
+
+    // Show directory if present
+    if let Some(dir) = &staging.dir {
+        parts.push(format!("dir={}", dir.display()));
+    }
+
+    // Show max_gb if present
+    if let Some(max_gb) = staging.max_gb {
+        parts.push(format!("max={} GB", max_gb));
+    }
+
+    // Show min_free_gb if present
+    if let Some(min_free_gb) = staging.min_free_gb {
+        parts.push(format!("min_free={} GB", min_free_gb));
+    }
+
+    if parts.is_empty() {
+        Some("enabled (defaults)".to_string())
+    } else {
+        Some(parts.join(", "))
     }
 }
 

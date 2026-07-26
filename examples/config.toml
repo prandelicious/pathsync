@@ -42,3 +42,13 @@ extensions = ["mp4", "jpg"]
 compare = { mode = "size_mtime" }
 transfer = { mode = "adaptive", large_file_threshold_mb = 250 }
 layout = { kind = "template", value = "{year}/{month}/{ext}/{source_rel_dir}/{filename}" }
+
+[jobs.staged_example]
+enabled = false
+source = "/path/to/source"
+targets = ["/path/to/target-a", "/path/to/target-b"]
+extensions = ["mp4", "jpg"]
+compare = { mode = "size_mtime" }
+transfer = { mode = "adaptive", large_file_threshold_mb = 100 }
+layout = "year_month"
+staging = { max_gb = 500, min_free_gb = 10 }

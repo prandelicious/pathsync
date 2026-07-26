@@ -553,6 +553,383 @@ timezone = "Mars/Olympus"
     ));
 }
 
+#[test]
+fn staging_absent_resolves_to_none() {
+    let root = unique_temp_dir("pathsync-config-staging-absent");
+    let input = root.join("input");
+    let output = root.join("output");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+
+    let raw = r#"
+default_job = "vlog"
+
+[jobs.vlog]
+enabled = true
+source = "{input}"
+target = "{output}"
+extensions = ["jpg"]
+layout = "flat"
+"#;
+    let raw = raw
+        .replace("{input}", &input.display().to_string())
+        .replace("{output}", &output.display().to_string());
+
+    let config: config::Config = toml::from_str(&raw).unwrap();
+    let job = config::resolve_job(&config, None, None, false, None).unwrap();
+
+    assert_eq!(job.staging, None);
+}
+
+#[test]
+fn job_staging_overrides_global_staging() {
+    let root = unique_temp_dir("pathsync-config-staging-override");
+    let input = root.join("input");
+    let output = root.join("output");
+    let global_spool = root.join("global-spool");
+    let job_spool = root.join("job-spool");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+
+    let raw = r#"
+default_job = "vlog"
+
+[staging]
+dir = "{global_spool}"
+max_gb = 50
+min_free_gb = 10
+
+[jobs.vlog]
+enabled = true
+source = "{input}"
+target = "{output}"
+extensions = ["jpg"]
+layout = "flat"
+
+[jobs.vlog.staging]
+dir = "{job_spool}"
+max_gb = 100
+"#;
+    let raw = raw
+        .replace("{input}", &input.display().to_string())
+        .replace("{output}", &output.display().to_string())
+        .replace("{global_spool}", &global_spool.display().to_string())
+        .replace("{job_spool}", &job_spool.display().to_string());
+
+    let config: config::Config = toml::from_str(&raw).unwrap();
+    let job = config::resolve_job(&config, None, None, false, None).unwrap();
+
+    let staging = job.staging.unwrap();
+    assert_eq!(staging.dir, job_spool);
+    assert_eq!(staging.max_bytes, Some(100 * 1024 * 1024 * 1024));
+    assert_eq!(staging.min_free_bytes, 10 * 1024 * 1024 * 1024);
+}
+
+#[test]
+fn global_staging_applies_when_job_has_none() {
+    let root = unique_temp_dir("pathsync-config-staging-global");
+    let input = root.join("input");
+    let output = root.join("output");
+    let global_spool = root.join("global-spool");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+
+    let raw = r#"
+default_job = "vlog"
+
+[staging]
+dir = "{global_spool}"
+max_gb = 50
+min_free_gb = 10
+
+[jobs.vlog]
+enabled = true
+source = "{input}"
+target = "{output}"
+extensions = ["jpg"]
+layout = "flat"
+"#;
+    let raw = raw
+        .replace("{input}", &input.display().to_string())
+        .replace("{output}", &output.display().to_string())
+        .replace("{global_spool}", &global_spool.display().to_string());
+
+    let config: config::Config = toml::from_str(&raw).unwrap();
+    let job = config::resolve_job(&config, None, None, false, None).unwrap();
+
+    let staging = job.staging.unwrap();
+    assert_eq!(staging.dir, global_spool);
+    assert_eq!(staging.max_bytes, Some(50 * 1024 * 1024 * 1024));
+    assert_eq!(staging.min_free_bytes, 10 * 1024 * 1024 * 1024);
+}
+
+#[test]
+fn staging_defaults_min_free_gb_to_5() {
+    let root = unique_temp_dir("pathsync-config-staging-min-free");
+    let input = root.join("input");
+    let output = root.join("output");
+    let spool = root.join("spool");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+
+    let raw = r#"
+default_job = "vlog"
+
+[jobs.vlog]
+enabled = true
+source = "{input}"
+target = "{output}"
+extensions = ["jpg"]
+layout = "flat"
+
+[jobs.vlog.staging]
+dir = "{spool}"
+"#;
+    let raw = raw
+        .replace("{input}", &input.display().to_string())
+        .replace("{output}", &output.display().to_string())
+        .replace("{spool}", &spool.display().to_string());
+
+    let config: config::Config = toml::from_str(&raw).unwrap();
+    let job = config::resolve_job(&config, None, None, false, None).unwrap();
+
+    let staging = job.staging.unwrap();
+    assert_eq!(staging.min_free_bytes, 5 * 1024 * 1024 * 1024);
+}
+
+#[test]
+fn staging_rejects_max_gb_zero() {
+    let root = unique_temp_dir("pathsync-config-staging-max-zero");
+    let input = root.join("input");
+    let output = root.join("output");
+    let spool = root.join("spool");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+
+    let raw = r#"
+default_job = "vlog"
+
+[jobs.vlog]
+enabled = true
+source = "{input}"
+target = "{output}"
+extensions = ["jpg"]
+layout = "flat"
+
+[jobs.vlog.staging]
+dir = "{spool}"
+max_gb = 0
+"#;
+    let raw = raw
+        .replace("{input}", &input.display().to_string())
+        .replace("{output}", &output.display().to_string())
+        .replace("{spool}", &spool.display().to_string());
+
+    let config: config::Config = toml::from_str(&raw).unwrap();
+    let err = config::resolve_job(&config, None, None, false, None).unwrap_err();
+
+    assert!(matches!(err, ConfigError::StagingMaxGbZero));
+}
+
+#[test]
+fn staging_rejects_dir_equal_to_source() {
+    let root = unique_temp_dir("pathsync-config-staging-source-conflict");
+    let input = root.join("input");
+    let output = root.join("output");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+
+    let raw = r#"
+default_job = "vlog"
+
+[jobs.vlog]
+enabled = true
+source = "{input}"
+target = "{output}"
+extensions = ["jpg"]
+layout = "flat"
+
+[jobs.vlog.staging]
+dir = "{input}"
+"#;
+    let raw = raw
+        .replace("{input}", &input.display().to_string())
+        .replace("{output}", &output.display().to_string());
+
+    let config: config::Config = toml::from_str(&raw).unwrap();
+    let err = config::resolve_job(&config, None, None, false, None).unwrap_err();
+
+    assert!(matches!(
+        err,
+        ConfigError::StagingDirConflictsWithSource { .. }
+    ));
+}
+
+#[test]
+fn staging_rejects_dir_inside_source() {
+    let root = unique_temp_dir("pathsync-config-staging-source-inside");
+    let input = root.join("input");
+    let output = root.join("output");
+    let spool = input.join("spool");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+
+    let raw = r#"
+default_job = "vlog"
+
+[jobs.vlog]
+enabled = true
+source = "{input}"
+target = "{output}"
+extensions = ["jpg"]
+layout = "flat"
+
+[jobs.vlog.staging]
+dir = "{spool}"
+"#;
+    let raw = raw
+        .replace("{input}", &input.display().to_string())
+        .replace("{output}", &output.display().to_string())
+        .replace("{spool}", &spool.display().to_string());
+
+    let config: config::Config = toml::from_str(&raw).unwrap();
+    let err = config::resolve_job(&config, None, None, false, None).unwrap_err();
+
+    assert!(matches!(
+        err,
+        ConfigError::StagingDirConflictsWithSource { .. }
+    ));
+}
+
+#[test]
+fn staging_rejects_dir_containing_source() {
+    let root = unique_temp_dir("pathsync-config-staging-source-contains");
+    let input = root.join("input");
+    let output = root.join("output");
+    let spool = root.join("spool");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+
+    let raw = r#"
+default_job = "vlog"
+
+[jobs.vlog]
+enabled = true
+source = "{input}"
+target = "{output}"
+extensions = ["jpg"]
+layout = "flat"
+
+[jobs.vlog.staging]
+dir = "{spool}"
+"#;
+    let raw = raw
+        .replace("{input}", &input.display().to_string())
+        .replace("{output}", &output.display().to_string())
+        .replace("{spool}", &spool.display().to_string());
+
+    let config: config::Config = toml::from_str(&raw).unwrap();
+    let _result = config::resolve_job(&config, None, None, false, None);
+
+    // The staging dir does not contain input, so this should be OK.
+    // Now test the case where staging dir contains the source.
+    let bad_raw = r#"
+default_job = "vlog"
+
+[jobs.vlog]
+enabled = true
+source = "{spool}"
+target = "{output}"
+extensions = ["jpg"]
+layout = "flat"
+
+[jobs.vlog.staging]
+dir = "{root}"
+"#;
+    let bad_raw = bad_raw
+        .replace("{spool}", &spool.display().to_string())
+        .replace("{output}", &output.display().to_string())
+        .replace("{root}", &root.display().to_string());
+
+    let config: config::Config = toml::from_str(&bad_raw).unwrap();
+    let err = config::resolve_job(&config, None, None, false, None).unwrap_err();
+
+    assert!(matches!(
+        err,
+        ConfigError::StagingDirConflictsWithSource { .. }
+    ));
+}
+
+#[test]
+fn staging_rejects_dir_equal_to_target() {
+    let root = unique_temp_dir("pathsync-config-staging-target-conflict");
+    let input = root.join("input");
+    let output = root.join("output");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+
+    let raw = r#"
+default_job = "vlog"
+
+[jobs.vlog]
+enabled = true
+source = "{input}"
+target = "{output}"
+extensions = ["jpg"]
+layout = "flat"
+
+[jobs.vlog.staging]
+dir = "{output}"
+"#;
+    let raw = raw
+        .replace("{input}", &input.display().to_string())
+        .replace("{output}", &output.display().to_string());
+
+    let config: config::Config = toml::from_str(&raw).unwrap();
+    let err = config::resolve_job(&config, None, None, false, None).unwrap_err();
+
+    assert!(matches!(
+        err,
+        ConfigError::StagingDirConflictsWithTarget { .. }
+    ));
+}
+
+#[test]
+fn staging_rejects_dir_inside_target() {
+    let root = unique_temp_dir("pathsync-config-staging-target-inside");
+    let input = root.join("input");
+    let output = root.join("output");
+    let spool = output.join("spool");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&output).unwrap();
+
+    let raw = r#"
+default_job = "vlog"
+
+[jobs.vlog]
+enabled = true
+source = "{input}"
+target = "{output}"
+extensions = ["jpg"]
+layout = "flat"
+
+[jobs.vlog.staging]
+dir = "{spool}"
+"#;
+    let raw = raw
+        .replace("{input}", &input.display().to_string())
+        .replace("{output}", &output.display().to_string())
+        .replace("{spool}", &spool.display().to_string());
+
+    let config: config::Config = toml::from_str(&raw).unwrap();
+    let err = config::resolve_job(&config, None, None, false, None).unwrap_err();
+
+    assert!(matches!(
+        err,
+        ConfigError::StagingDirConflictsWithTarget { .. }
+    ));
+}
+
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)

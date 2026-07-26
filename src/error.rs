@@ -54,6 +54,18 @@ pub enum ConfigError {
     UnsupportedLayoutPreset { preset: String },
     #[error("invalid timezone: {value}")]
     InvalidTimezone { value: String },
+    #[error("staging max_gb must be greater than 0")]
+    StagingMaxGbZero,
+    #[error("{message}")]
+    StagingDirConflictsWithSource { message: String },
+    #[error("{message}")]
+    StagingDirConflictsWithTarget { message: String },
+    #[error("staging directory creation failed: {path}")]
+    StagingDirCreationFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, Error)]
