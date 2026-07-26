@@ -69,6 +69,31 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Error)]
+pub enum SpoolError {
+    #[error("failed to {op} at {path}: {source}")]
+    Io {
+        op: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "job `{job_name}` already has a live spool run at {path} (pid {pid}); refusing to start a concurrent run"
+    )]
+    ConcurrentRunDetected {
+        job_name: String,
+        pid: i32,
+        path: PathBuf,
+    },
+    #[error("reservation of {requested} bytes exceeds the spool capacity cap of {cap} bytes")]
+    ExceedsCapacity { requested: u64, cap: u64 },
+    #[error(
+        "reservation of {requested} bytes cannot be satisfied and the spool has zero entries outstanding to evict; would deadlock"
+    )]
+    WouldDeadlock { requested: u64 },
+}
+
+#[derive(Debug, Error)]
 pub enum DateError {
     #[error("failed to resolve date components for timezone policy `{policy}`")]
     ResolveTimezone { policy: String },
