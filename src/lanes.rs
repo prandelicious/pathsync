@@ -251,23 +251,87 @@ fn start_one_lane(
     }
 }
 
-/// Panic-safety mechanism required by R3/R7: wraps a lane worker's whole
-/// run, so that on *either* normal return (queue drained/closed) or panic
-/// unwind, every entry this target is still pending on gets released from
-/// the spool store instead of leaking capacity forever. Firing on normal
-/// return too is intentionally harmless: `mark_all_remaining_terminal_for_target`
-/// is a documented no-op for entries already terminal (idempotent per
-/// entry/target pair), so this guard never double-releases or interferes
-/// with entries the lane already completed normally.
+/// Panic-safety mechanism required by R3/R7, scoped to a single worker's
+/// own responsibility -- mirrors `stage.rs`'s `StageReleaseGuard` arm/disarm
+/// pattern rather than firing unconditionally on every drop.
+///
+/// Armed only for the window a worker holds an entry it hasn't yet handed
+/// off through the normal path (copy worker: handed to the verify queue;
+/// verify worker: `mark_terminal` called after verification completes) and
+/// disarmed immediately once that happens, so ordinary successful
+/// completion of an entry -- and the eventual normal loop exit once the
+/// queue drains/closes -- never triggers this guard's `Drop` logic.
+///
+/// On a genuine panic while armed, `Drop` releases exactly what this
+/// worker itself still owned and nothing more: the one entry it was
+/// actively handling (`current_entry`), plus any entries still sitting
+/// unconsumed in *this worker's own* queue (via the cloned `rx`) -- since
+/// this worker's thread is unwinding, nothing else will ever drain them.
+/// It deliberately does not use `mark_all_remaining_terminal_for_target`,
+/// which sweeps every entry still pending on the whole target index
+/// regardless of which worker (copy or verify) actually holds it. That
+/// broader scope was the bug: a copy worker's guard could fire on every
+/// normal completion (not just panics) and race ahead of the verify
+/// worker's own verification of the same entries, and a verify worker's
+/// panic could evict spool files the lane's still-healthy copy worker
+/// hasn't read yet. Scoping release to only this worker's own queue avoids
+/// both.
 struct LaneReleaseGuard {
     spool: Arc<SpoolStore>,
     target_index: usize,
+    /// A second handle onto this worker's own inbound queue, used only to
+    /// drain and release any entries still sitting there on a panic -- see
+    /// the struct docs. Never raced against the worker's own `recv()` loop:
+    /// `Drop` only runs after that loop has already stopped consuming
+    /// (either normal exit with `armed == false`, a no-op, or mid-panic
+    /// unwind on the same thread).
+    rx: Receiver<LaneEntry>,
+    armed: bool,
+    current_entry: Option<EntryId>,
+}
+
+impl LaneReleaseGuard {
+    fn new(spool: Arc<SpoolStore>, target_index: usize, rx: Receiver<LaneEntry>) -> Self {
+        Self {
+            spool,
+            target_index,
+            rx,
+            armed: false,
+            current_entry: None,
+        }
+    }
+
+    /// Arms the guard for the window during which `entry_id` is owned by
+    /// this worker and hasn't yet been handed off (copy) or driven to a
+    /// terminal outcome through the normal path (verify).
+    fn arm(&mut self, entry_id: EntryId) {
+        self.current_entry = Some(entry_id);
+        self.armed = true;
+    }
+
+    /// Disarms once the current entry's fate has been settled through the
+    /// normal path, so a subsequent panic on a *later* entry -- or the
+    /// eventual normal loop exit -- doesn't re-release this one.
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.current_entry = None;
+    }
 }
 
 impl Drop for LaneReleaseGuard {
     fn drop(&mut self) {
-        self.spool
-            .mark_all_remaining_terminal_for_target(self.target_index);
+        if !self.armed {
+            return;
+        }
+        if let Some(entry_id) = self.current_entry.take() {
+            self.spool.mark_terminal(entry_id, self.target_index);
+        }
+        // This worker's thread is unwinding, so nothing will ever call
+        // `recv()` on its queue again -- drain and release whatever is
+        // still sitting there rather than leaking that capacity forever.
+        while let Ok(entry) = self.rx.try_recv() {
+            self.spool.mark_terminal(entry.entry_id, self.target_index);
+        }
     }
 }
 
@@ -279,13 +343,11 @@ fn run_copy_worker(
     event_tx: Sender<WorkerEvent>,
     spool: Arc<SpoolStore>,
 ) {
-    let _release_guard = LaneReleaseGuard {
-        spool: Arc::clone(&spool),
-        target_index,
-    };
+    let mut release_guard = LaneReleaseGuard::new(Arc::clone(&spool), target_index, rx.clone());
     let mut next_transfer_id = 1_usize;
 
     while let Ok(entry) = rx.recv() {
+        release_guard.arm(entry.entry_id);
         let transfer_id = next_transfer_id;
         next_transfer_id += 1;
 
@@ -311,6 +373,13 @@ fn run_copy_worker(
                 // `cfg(test)` and when nothing is armed.
                 run_lane_copy_test_hook(&entry);
 
+                // The entry is about to be handed off to the verify queue,
+                // so this worker no longer owns it -- disarm before the
+                // handoff so a panic on a *later* entry can't re-release
+                // this one, and so ordinary successful completion never
+                // trips the guard's `Drop` logic.
+                release_guard.disarm();
+
                 let _ = event_tx.send(WorkerEvent::Finished {
                     worker: worker_id,
                     bucket: SizeBucket::Small,
@@ -324,9 +393,9 @@ fn run_copy_worker(
                     // The verify worker already exited (e.g. it panicked).
                     // The entry never got a terminal outcome recorded by
                     // the verify side in that case, so release it directly
-                    // rather than relying solely on this thread's own
-                    // release guard (which only covers *this* worker's
-                    // pending set, not entries already handed off).
+                    // rather than relying on this thread's own release
+                    // guard, which was just disarmed above precisely
+                    // because the entry was believed handed off.
                     spool.mark_terminal(send_err.0.entry_id, target_index);
                 }
             }
@@ -336,6 +405,7 @@ fn run_copy_worker(
                     failure,
                 });
                 spool.mark_terminal(entry.entry_id, target_index);
+                release_guard.disarm();
             }
         }
     }
@@ -349,13 +419,11 @@ fn run_verify_worker(
     event_tx: Sender<WorkerEvent>,
     spool: Arc<SpoolStore>,
 ) {
-    let _release_guard = LaneReleaseGuard {
-        spool: Arc::clone(&spool),
-        target_index,
-    };
+    let mut release_guard = LaneReleaseGuard::new(Arc::clone(&spool), target_index, rx.clone());
     let mut next_transfer_id = 1_usize;
 
     while let Ok(entry) = rx.recv() {
+        release_guard.arm(entry.entry_id);
         let transfer_id = next_transfer_id;
         next_transfer_id += 1;
 
@@ -369,6 +437,13 @@ fn run_verify_worker(
             dest: entry.dest.clone(),
             total: entry.size,
         });
+
+        // Test-only hook, firing right after this entry is dequeued for
+        // verification and before verification itself runs. A no-op
+        // outside `cfg(test)` and when nothing is armed; see
+        // `run_lane_copy_test_hook` above for why this is `Fn`/keyed on the
+        // entry rather than single-shot.
+        run_lane_verify_test_hook(&entry);
 
         let result = verify_lane_transfer(&entry, |done| {
             let _ = event_tx.send(WorkerEvent::Progress {
@@ -395,8 +470,12 @@ fn run_verify_worker(
 
         // Terminal either way (verified or failed): decrement this
         // target's refcount on the entry so the spool can evict once every
-        // needing target has reported.
+        // needing target has reported. This is the normal path settling
+        // the entry's fate, so disarm the guard right after -- a panic
+        // from here on (e.g. on the *next* entry) must not re-release this
+        // one.
         spool.mark_terminal(entry.entry_id, target_index);
+        release_guard.disarm();
     }
 }
 
@@ -639,6 +718,37 @@ fn run_lane_copy_test_hook(entry: &LaneEntry) {
 
 #[cfg(not(test))]
 fn run_lane_copy_test_hook(_entry: &LaneEntry) {}
+
+/// Verify-side counterpart to [`run_lane_copy_test_hook`], invoked right
+/// after an entry is dequeued for verification and before verification
+/// itself runs. Lets a test hold the verify worker on a specific entry to
+/// observe state strictly between "the copy worker handed this entry off
+/// and moved on" and "the verify worker actually verified it" -- e.g.
+/// proving the copy worker's normal completion never releases an entry
+/// still awaiting verification.
+#[cfg(test)]
+static LANE_VERIFY_TEST_HOOK: std::sync::Mutex<Option<LaneCopyHook>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn set_lane_verify_test_hook(hook: LaneCopyHook) {
+    *LANE_VERIFY_TEST_HOOK.lock().unwrap() = Some(hook);
+}
+
+#[cfg(test)]
+fn clear_lane_verify_test_hook() {
+    *LANE_VERIFY_TEST_HOOK.lock().unwrap() = None;
+}
+
+#[cfg(test)]
+fn run_lane_verify_test_hook(entry: &LaneEntry) {
+    let hook = LANE_VERIFY_TEST_HOOK.lock().unwrap().clone();
+    if let Some(hook) = hook {
+        hook(entry);
+    }
+}
+
+#[cfg(not(test))]
+fn run_lane_verify_test_hook(_entry: &LaneEntry) {}
 
 #[cfg(test)]
 mod tests {
@@ -1209,6 +1319,139 @@ mod tests {
         }
 
         // Capacity fully released despite the panic.
+        store.reserve(1024).unwrap();
+    }
+
+    #[test]
+    fn copy_worker_normal_completion_does_not_prematurely_release_entry_awaiting_verify() {
+        let _hook_guard = after_copy_test_hook_guard();
+        let temp = TempDir::new("no-premature-release");
+        let store = Arc::new(
+            SpoolStore::open(temp.path().join("spool").as_path(), "job", None, 0).unwrap(),
+        );
+        let target = temp.path().join("target");
+        let (event_tx, event_rx) = unbounded::<WorkerEvent>();
+        let layout = LaneWorkerLayout::new(1, 1);
+
+        let lanes = start_target_lanes(
+            std::slice::from_ref(&target),
+            Arc::clone(&store),
+            layout,
+            event_tx.clone(),
+        );
+
+        // Gate: hold the verify worker on "gated.bin" until the test
+        // explicitly releases it. This lets us observe state strictly
+        // between "the copy worker finished this entry and moved on" and
+        // "the verify worker actually verified it" -- real blocking on a
+        // channel, not a sleep-based guess.
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = StdMutex::new(release_rx);
+        clear_lane_verify_test_hook();
+        set_lane_verify_test_hook(Arc::new(move |entry: &LaneEntry| {
+            if entry.display_name == "gated.bin" {
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("verify worker must be released by the test, not time out");
+            }
+        }));
+
+        // Register the entry pending on target 0 (the real lane under
+        // test) *and* a second, phantom target index (1) that no lane
+        // services. Target 1 stays deliberately pending until the test
+        // resolves it directly below, which turns "was target 0 already
+        // (wrongly) marked terminal by the copy worker's guard?" into an
+        // observable eviction question: resolving only the phantom target
+        // evicts the entry if and only if target 0 had *also* already
+        // gone terminal.
+        let payload = b"gated-payload";
+        let entry = stage_entry(
+            &store,
+            "gated.bin",
+            payload,
+            target.join("gated.bin"),
+            [0usize, 1usize],
+        );
+        let spool_path = entry.spool_path.clone();
+        let entry_id = entry.entry_id;
+        lanes[0].sender().send(entry).unwrap();
+
+        // Wait for the copy step to finish -- proves the copy worker's
+        // guard already disarmed and handed the entry to the verify
+        // queue -- all while the verify worker is still parked in the
+        // hook above, i.e. strictly before target 0 could legitimately go
+        // terminal.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut saw_finished = false;
+        while std::time::Instant::now() < deadline {
+            match event_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(WorkerEvent::Finished { .. }) => {
+                    saw_finished = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(
+            saw_finished,
+            "copy step must finish (and hand off to verify) before verify is released"
+        );
+
+        // Drive the copy worker to a genuine normal (non-panicking) loop
+        // exit -- closing its queue -- while the verify worker remains
+        // stalled on this very entry, exercising the copy worker's
+        // guard's normal-exit `Drop` path (a no-op per the fix) at
+        // exactly the moment it matters. `TargetLane::join` blocks on the
+        // verify worker too, so run it on a background thread.
+        let mut lanes = lanes.into_iter();
+        let lane = lanes.next().unwrap();
+        let (report_tx, report_rx) = unbounded::<WorkerEvent>();
+        let join_handle = thread::spawn(move || {
+            lane.join(&report_tx);
+        });
+        thread::sleep(Duration::from_millis(100));
+
+        // The crux of the test: target 0 must not yet be terminal for this
+        // entry. Resolve only the phantom target (1) and confirm the spool
+        // file still exists -- if the copy worker's normal completion had
+        // wrongly released target 0 too (the bug this test guards
+        // against), the entry would have both targets terminal right now
+        // and evict, deleting the spool file before verify ever ran.
+        store.mark_terminal(entry_id, 1);
+        assert!(
+            spool_path.exists(),
+            "entry must not evict before the verify worker actually verifies target 0 -- \
+             a premature release would mean the copy worker's normal completion wrongly \
+             triggered its guard's bulk-release logic"
+        );
+
+        // Now let verify actually run and finish for real.
+        release_tx.send(()).unwrap();
+        join_handle.join().unwrap();
+        while let Ok(event) = report_rx.try_recv() {
+            if let WorkerEvent::Error { .. } = event {
+                panic!("unexpected worker error/panic in normal-completion test");
+            }
+        }
+
+        clear_lane_verify_test_hook();
+        drop(event_tx);
+
+        // Both targets are now terminal (1 resolved above, 0 resolved by
+        // the real verify pass) -- the entry must evict for real.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while spool_path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "entry never evicted after verify genuinely completed"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
         store.reserve(1024).unwrap();
     }
 }
