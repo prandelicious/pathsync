@@ -257,13 +257,12 @@ pub(crate) fn stage_file(
             // pending set to empty is what triggers `evict_locked` to
             // release them.
             //
-            // This deliberately does NOT use
-            // `mark_all_remaining_terminal_for_target`: that hook releases
-            // *every* live entry pending on a target index, which would be
-            // wrong here -- other files may be mid-stage concurrently for
-            // the same target lane, and this failure must only affect this
-            // one entry. Per-entry `mark_terminal` (idempotent, entry-id
-            // scoped) is the correct tool.
+            // This deliberately does NOT do a target-wide bulk release:
+            // releasing *every* live entry pending on a target index would
+            // be wrong here -- other files may be mid-stage concurrently
+            // for the same target lane, and this failure must only affect
+            // this one entry. Per-entry `mark_terminal` (idempotent,
+            // entry-id scoped) is the correct tool.
             let entry_id = spool.register(spool_path.clone(), size, targets.iter().copied());
             for &target in &targets {
                 spool.mark_terminal(entry_id, target);

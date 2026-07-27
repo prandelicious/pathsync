@@ -397,10 +397,8 @@ impl SpoolStore {
     ///
     /// `pending_targets` is the set of target-lane indices that still need
     /// to read this entry before it can be evicted (not merely a count: the
-    /// explicit indices let [`mark_terminal`](Self::mark_terminal) and
-    /// [`mark_all_remaining_terminal_for_target`](Self::mark_all_remaining_terminal_for_target)
-    /// be idempotent per (entry, target) pair and let the bulk hook release
-    /// only the entries that actually still need the given target).
+    /// explicit indices let [`mark_terminal`](Self::mark_terminal) be
+    /// idempotent per (entry, target) pair).
     ///
     /// If `pending_targets` is empty, the entry evicts immediately (the
     /// spool file at `path` is deleted and its bytes released).
@@ -447,38 +445,14 @@ impl SpoolStore {
     ///
     /// **Idempotency**: calling this a second time for the same (entry,
     /// target) pair is a documented no-op, not a panic or double-decrement.
-    /// This matters because a panicking lane's drop guard
-    /// ([`mark_all_remaining_terminal_for_target`](Self::mark_all_remaining_terminal_for_target))
-    /// may race with or follow a normal in-flight `mark_terminal` call for
-    /// the same entry/target; idempotency makes both orders safe.
-    /// Calling it for an already-fully-evicted `entry_id` is also a no-op.
+    /// This matters because a panicking lane's drop guard (e.g.
+    /// `lanes.rs`'s `LaneReleaseGuard`) may race with or follow a normal
+    /// in-flight `mark_terminal` call for the same entry/target; idempotency
+    /// makes both orders safe. Calling it for an already-fully-evicted
+    /// `entry_id` is also a no-op.
     pub(crate) fn mark_terminal(&self, entry_id: EntryId, target_index: usize) {
         let mut guard = self.state.lock().unwrap();
         if mark_terminal_locked(&mut guard, entry_id.0, target_index) {
-            self.cond.notify_all();
-        }
-    }
-
-    /// Bulk panic-safety hook: marks every currently-live entry terminal
-    /// for `target_index`, as if that target's lane called
-    /// [`mark_terminal`](Self::mark_terminal) on each of its still-pending
-    /// entries. Intended to be called from a panic/drop-guard in a target
-    /// lane worker so a mid-drain panic still releases spool capacity for
-    /// every entry that lane was holding, instead of leaking it.
-    ///
-    /// Safe to call even for entries `target_index` was never pending on
-    /// (a no-op for those, via the same idempotency as `mark_terminal`) and
-    /// safe to call more than once.
-    pub(crate) fn mark_all_remaining_terminal_for_target(&self, target_index: usize) {
-        let mut guard = self.state.lock().unwrap();
-        let ids: Vec<u64> = guard.entries.keys().copied().collect();
-        let mut evicted_any = false;
-        for id in ids {
-            if mark_terminal_locked(&mut guard, id, target_index) {
-                evicted_any = true;
-            }
-        }
-        if evicted_any {
             self.cond.notify_all();
         }
     }
@@ -849,40 +823,6 @@ mod tests {
             .recv_timeout(StdDuration::from_secs(5))
             .expect("blocked reserve() must unblock after the eviction, not hang");
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn panic_safety_hook_releases_all_pending_entries_for_a_target() {
-        let root = TempDir::new("panic-hook");
-        let store = SpoolStore::open(root.path(), "job", Some(1024), 0).unwrap();
-
-        store.reserve(30).unwrap();
-        let p1 = write_spool_file(&store, "p1.bin", &[4u8; 10]);
-        let p2 = write_spool_file(&store, "p2.bin", &[5u8; 10]);
-        let p3 = write_spool_file(&store, "p3.bin", &[6u8; 10]);
-        // Target 0 is pending on all three entries; target 1 only on p2.
-        let id1 = store.register(p1.clone(), 10, [0usize]);
-        let id2 = store.register(p2.clone(), 10, [0usize, 1usize]);
-        let id3 = store.register(p3.clone(), 10, [0usize]);
-
-        // Simulate "target 0's worker died with N entries still pending
-        // for it."
-        store.mark_all_remaining_terminal_for_target(0);
-
-        assert!(!p1.exists(), "entry only pending on target 0 must evict");
-        assert!(p2.exists(), "entry still pending on target 1 must survive");
-        assert!(!p3.exists(), "entry only pending on target 0 must evict");
-
-        // The still-alive target can still terminate its own entry normally.
-        store.mark_terminal(id2, 1);
-        assert!(!p2.exists());
-
-        // Calling the hook again is safe (already-released ids are no-ops).
-        store.mark_all_remaining_terminal_for_target(0);
-        let _ = (id1, id3);
-
-        // Capacity fully released.
-        store.reserve(1024).unwrap();
     }
 
     #[test]

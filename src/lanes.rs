@@ -267,15 +267,14 @@ fn start_one_lane(
 /// actively handling (`current_entry`), plus any entries still sitting
 /// unconsumed in *this worker's own* queue (via the cloned `rx`) -- since
 /// this worker's thread is unwinding, nothing else will ever drain them.
-/// It deliberately does not use `mark_all_remaining_terminal_for_target`,
-/// which sweeps every entry still pending on the whole target index
-/// regardless of which worker (copy or verify) actually holds it. That
-/// broader scope was the bug: a copy worker's guard could fire on every
-/// normal completion (not just panics) and race ahead of the verify
-/// worker's own verification of the same entries, and a verify worker's
-/// panic could evict spool files the lane's still-healthy copy worker
-/// hasn't read yet. Scoping release to only this worker's own queue avoids
-/// both.
+/// It deliberately does not do a target-wide bulk release that sweeps
+/// every entry still pending on the whole target index regardless of
+/// which worker (copy or verify) actually holds it. That broader scope
+/// was the bug: a copy worker's guard could fire on every normal
+/// completion (not just panics) and race ahead of the verify worker's own
+/// verification of the same entries, and a verify worker's panic could
+/// evict spool files the lane's still-healthy copy worker hasn't read
+/// yet. Scoping release to only this worker's own queue avoids both.
 struct LaneReleaseGuard {
     spool: Arc<SpoolStore>,
     target_index: usize,
