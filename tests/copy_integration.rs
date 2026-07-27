@@ -1393,6 +1393,293 @@ min_free_gb = 0
     );
 }
 
+/// U8 end-to-end proof that the staged relay pipeline's three objectives --
+/// source released as soon as possible, a slow target never blocks
+/// progress, integrity verified end-to-end -- hold together in one
+/// realistic multi-target scenario.
+///
+/// The "slow" lane is created structurally, not via a test hook: this test
+/// drives the compiled binary as a real subprocess (`run_pathsync`), so
+/// `lanes.rs`'s `#[cfg(test)]`-gated stall hooks aren't reachable (same
+/// constraint documented on
+/// `staged_run_reports_source_released_before_the_targets_own_completion_line`
+/// above, whose large-file technique this test follows). `target-fast`
+/// already holds a byte-identical, same-mtime copy of the large file, so
+/// `size_mtime` compare-policy planning skips it there; `target-slow` must
+/// copy and verify both the small shared file and the large file, giving it
+/// ~17x `target-fast`'s planned bytes and making it structurally finish
+/// later, with no artificial stall required.
+#[test]
+fn staged_multi_target_run_with_slow_lane_proves_release_and_integrity() {
+    let root = TempDir::new("pathsync-staging-e2e");
+    let source = root.path().join("source");
+    let target_fast = root.path().join("target-fast");
+    let target_slow = root.path().join("target-slow");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target_fast).unwrap();
+    fs::create_dir_all(&target_slow).unwrap();
+
+    let shared_bytes = vec![b's'; 512 * 1024];
+    let big_bytes = vec![b'b'; 8 * 1024 * 1024];
+    write_file(&source.join("shared.jpg"), &shared_bytes);
+    write_file(&source.join("big.jpg"), &big_bytes);
+
+    // Give the large file a distinctive mtime so the pre-seeded copy on
+    // target-fast can be made to match it exactly (size_mtime compare).
+    let big_mtime = FileTime::from_unix_time(1_700_000_100, 0);
+    set_file_mtime(source.join("big.jpg"), big_mtime).unwrap();
+
+    // Pre-seed target-fast with an already-matching copy of the large file
+    // (same size + mtime) so planning skips it there entirely -- target-fast
+    // only ever needs the small shared file; target-slow needs both.
+    let preseeded_big = target_fast.join("big.jpg");
+    write_file(&preseeded_big, &big_bytes);
+    set_file_mtime(&preseeded_big, big_mtime).unwrap();
+
+    let config_path = root.path().join("config.toml");
+    let text = format!(
+        r#"
+default_job = "sync"
+
+[jobs.sync]
+enabled = true
+source = "{source}"
+targets = ["{target_fast}", "{target_slow}"]
+extensions = ["jpg"]
+compare = {{ mode = "size_mtime" }}
+transfer = {{ mode = "standard" }}
+layout = "flat"
+
+[jobs.sync.staging]
+dir = "{staging_dir}"
+max_gb = 1
+min_free_gb = 0
+"#,
+        source = source.display(),
+        target_fast = target_fast.display(),
+        target_slow = target_slow.display(),
+        staging_dir = spool_dir.display(),
+    );
+    fs::write(&config_path, text).unwrap();
+
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap()]);
+
+    // --- Run completes with success; exit code reflects it ---
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output.stdout.contains("VERIFIED"),
+        "stdout={}",
+        output.stdout
+    );
+    assert!(
+        !output.stdout.contains("ATTENTION"),
+        "stdout={}",
+        output.stdout
+    );
+
+    // --- Full verification: every target's files present and correct ---
+    assert_eq!(
+        fs::read(target_fast.join("shared.jpg")).unwrap(),
+        shared_bytes
+    );
+    assert_eq!(
+        fs::read(target_slow.join("shared.jpg")).unwrap(),
+        shared_bytes
+    );
+    assert_eq!(fs::read(target_slow.join("big.jpg")).unwrap(), big_bytes);
+    // target-fast's pre-seeded big.jpg was skipped by planning, so this run
+    // never touched it -- still present, unchanged.
+    assert_eq!(fs::read(&preseeded_big).unwrap(), big_bytes);
+
+    let target_fast_row = format!(
+        "{:<22} {:>7} {:>7} {:>8} {:>9} {:>11}   {}",
+        "target-fast", 1, 1, 1, 0, 0, "verified"
+    );
+    let target_slow_row = format!(
+        "{:<22} {:>7} {:>7} {:>8} {:>9} {:>11}   {}",
+        "target-slow", 2, 2, 2, 0, 0, "verified"
+    );
+    assert!(
+        output.stdout.contains(&target_fast_row),
+        "expected target-fast's fully verified Target Results row {target_fast_row:?}; stdout={}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains(&target_slow_row),
+        "expected target-slow's fully verified Target Results row {target_slow_row:?}; stdout={}",
+        output.stdout
+    );
+
+    // --- Source read exactly once per file: staging-once semantics ---
+    // Direct read-count instrumentation isn't reachable through this
+    // subprocess harness (per the plan's Sources & Research notes), so this
+    // proves the same property the plan accepts as sufficient: two distinct
+    // source files are staged exactly once each, even though three real
+    // target copies happen (shared -> both targets, big -> target-slow
+    // only) -- "Staged" must read 2 files, strictly less than "Copied"'s 3.
+    let staged_bytes = shared_bytes.len() as u64 + big_bytes.len() as u64;
+    let expected_staged_line = format!(
+        "{:<12} {:>3} files   {:>10}",
+        "Staged",
+        2,
+        pathsync::format::human_bytes(staged_bytes)
+    );
+    assert!(
+        output.stdout.contains(&expected_staged_line),
+        "expected exact Staged line {expected_staged_line:?} (source read once per file); stdout={}",
+        output.stdout
+    );
+    let copied_bytes = shared_bytes.len() as u64 * 2 + big_bytes.len() as u64;
+    let expected_copied_line = format!(
+        "{:<12} {:>3} files   {:>10}",
+        "Copied",
+        3,
+        pathsync::format::human_bytes(copied_bytes)
+    );
+    assert!(
+        output.stdout.contains(&expected_copied_line),
+        "expected exact Copied line {expected_copied_line:?}; stdout={}",
+        output.stdout
+    );
+
+    // --- Source released before the slower target's own completion ---
+    // target-slow's Target Results row only reaches "verified bytes ==
+    // planned bytes" once its last file (the large one) is copied and
+    // verified; the release milestone must already have fired by then,
+    // since target-slow's lane only receives that file's `LaneEntry` after
+    // staging finishes, and release fires no earlier than that hand-off
+    // (see `run_one_staging_task` in `src/copy.rs`) plus target-slow still
+    // has a full copy+verify pass over 8MB left to do afterward -- ample
+    // margin, not a close race.
+    let released_at = output.stdout.find("source released").unwrap_or_else(|| {
+        panic!("release line missing: stdout={}", output.stdout);
+    });
+    let target_slow_total = shared_bytes.len() as u64 + big_bytes.len() as u64;
+    let target_slow_done_marker = format!(
+        "target target-slow | {0} / {0} |",
+        pathsync::format::human_bytes(target_slow_total)
+    );
+    let target_slow_done_at = output
+        .stdout
+        .find(&target_slow_done_marker)
+        .unwrap_or_else(|| {
+            panic!(
+                "target-slow completion marker {target_slow_done_marker:?} missing: stdout={}",
+                output.stdout
+            )
+        });
+    assert!(
+        released_at < target_slow_done_at,
+        "release must be reported before the slow target finishes draining: released_at={released_at} target_slow_done_at={target_slow_done_at}\nstdout={}",
+        output.stdout
+    );
+
+    // --- Spool ends up empty: no residual files after the run ---
+    let spool_entries: Vec<_> = fs::read_dir(&spool_dir).unwrap().collect();
+    assert!(
+        spool_entries.is_empty(),
+        "spool run directory must be cleaned up after the run: {spool_entries:?}"
+    );
+}
+
+/// U8 crash-orphan simulation: a stale spool run directory left behind by a
+/// crashed prior run of the same job must be cleaned up automatically the
+/// next time that job runs staged, without disturbing the new run.
+///
+/// The stale directory's lockfile names a definitely-dead pid, constructed
+/// the same way `src/spool.rs`'s own orphan-cleanup unit tests do (spawn a
+/// trivial child process and reap it, rather than guessing an "unlikely"
+/// pid number) -- reused here for the same reason: a real dead pid, not a
+/// probabilistic one.
+#[test]
+fn staged_run_cleans_up_stale_orphan_spool_directory_from_crashed_prior_run() {
+    let root = TempDir::new("pathsync-staging-orphan-cleanup");
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(&spool_dir).unwrap();
+    write_file(&source.join("photo.jpg"), b"orphan-cleanup-bytes");
+
+    // Pre-seed a stale sibling run directory for the same job ("sync"),
+    // mimicking a crashed prior staged run.
+    let stale_run_dir = spool_dir.join("sync-oldrun");
+    fs::create_dir_all(&stale_run_dir).unwrap();
+    let mut child = Command::new("true")
+        .spawn()
+        .expect("failed to spawn helper process");
+    let dead_pid = child.id();
+    child.wait().expect("failed to reap helper process");
+    // ".pathsync-lock" mirrors `src/spool.rs`'s private `LOCK_FILE_NAME`
+    // constant, which isn't part of the public API this integration test
+    // can import; the literal is the stable on-disk lockfile filename any
+    // spool store must recognize regardless of internal module structure.
+    fs::write(stale_run_dir.join(".pathsync-lock"), dead_pid.to_string()).unwrap();
+    fs::write(stale_run_dir.join("leftover.bin"), b"stale spool residue").unwrap();
+
+    let config_path = root.path().join("config.toml");
+    let text = format!(
+        r#"
+default_job = "sync"
+
+[jobs.sync]
+enabled = true
+source = "{source}"
+target = "{target}"
+extensions = ["jpg"]
+compare = {{ mode = "size_mtime" }}
+transfer = {{ mode = "standard" }}
+layout = "flat"
+
+[jobs.sync.staging]
+dir = "{staging_dir}"
+max_gb = 1
+min_free_gb = 0
+"#,
+        source = source.display(),
+        target = target.display(),
+        staging_dir = spool_dir.display(),
+    );
+    fs::write(&config_path, text).unwrap();
+
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap()]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(
+        fs::read(target.join("photo.jpg")).unwrap(),
+        b"orphan-cleanup-bytes"
+    );
+    assert!(
+        output.stdout.contains("source released"),
+        "stdout={}",
+        output.stdout
+    );
+
+    assert!(
+        !stale_run_dir.exists(),
+        "stale orphaned run directory from the simulated crashed run must be cleaned up"
+    );
+
+    let spool_entries: Vec<_> = fs::read_dir(&spool_dir).unwrap().collect();
+    assert!(
+        spool_entries.is_empty(),
+        "no leftover cruft (stale or this run's own directory) must remain in the spool root \
+         after a normal run: {spool_entries:?}"
+    );
+}
+
 fn load_job(source: &Path, target: &Path, compare_mode: &str) -> config::ResolvedJob {
     let config = config::Config {
         default_job: Some("sync".to_string()),
