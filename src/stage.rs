@@ -52,7 +52,13 @@ fn set_after_stage_copy_test_hook(hook: Box<dyn FnOnce() + Send>) {
 
 #[cfg(test)]
 fn run_after_stage_copy_test_hook() {
-    if let Some(hook) = AFTER_STAGE_COPY_TEST_HOOK.lock().unwrap().take() {
+    // Extract the hook into an owned local *before* calling it, so the
+    // mutex guard is dropped before `hook()` runs -- otherwise a panicking
+    // hook (used to test panic-safety) would poison this static mutex for
+    // the rest of the test process, per Rust's temporary lifetime extension
+    // inside `if let` scrutinees.
+    let hook = AFTER_STAGE_COPY_TEST_HOOK.lock().unwrap().take();
+    if let Some(hook) = hook {
         hook();
     }
 }
@@ -102,6 +108,61 @@ pub(crate) enum StageError {
     Failed(StageFailure),
 }
 
+/// Panic-safety guard mirroring `lanes.rs`'s `LaneReleaseGuard`: covers the
+/// window in [`stage_file`] between a successful `reserve` and this file's
+/// own terminal registration (the `Ok`/`Err` arms below). If the executing
+/// thread panics inside that window -- e.g. partway through
+/// `run_staging_copy`'s copy/hash/read-back-verify sequence -- `Drop`
+/// releases the reservation instead of leaking it forever.
+///
+/// `SpoolStore`'s public API has no "release an unregistered reservation"
+/// method; the only release mechanism it exposes is `register` (to create a
+/// trackable entry) followed by `mark_terminal` per pending target (to drive
+/// it to eviction). So on a panic this guard does exactly what
+/// `stage_file`'s existing ordinary-error cleanup path already does, just
+/// from a `Drop` impl instead of inline.
+///
+/// Must be disarmed (via [`disarm`](Self::disarm)) once `stage_file` reaches
+/// its own normal success or ordinary-failure cleanup, so the panic-safety
+/// path and the explicit cleanup path never both fire for the same
+/// reservation -- a double release would register two defunct entries for
+/// the same reservation and double-count eviction bookkeeping.
+struct StageReleaseGuard<'a> {
+    spool: &'a SpoolStore,
+    armed: bool,
+    temp_path: PathBuf,
+    spool_path: PathBuf,
+    size: u64,
+    targets: Vec<usize>,
+}
+
+impl<'a> StageReleaseGuard<'a> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StageReleaseGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Best-effort cleanup: whichever of temp/final path exists. Mirrors
+        // the ordinary-error cleanup path's own best-effort removal.
+        let _ = fs::remove_file(&self.temp_path);
+        let _ = fs::remove_file(&self.spool_path);
+
+        let entry_id = self.spool.register(
+            self.spool_path.clone(),
+            self.size,
+            self.targets.iter().copied(),
+        );
+        for &target in &self.targets {
+            self.spool.mark_terminal(entry_id, target);
+        }
+    }
+}
+
 /// Stages one planned source file into `spool`: reserves capacity, copies
 /// source -> spool temp file while hashing in-flight (single source read),
 /// fsyncs, sets the spool file's mtime to the source's mtime, renames into
@@ -142,8 +203,23 @@ pub(crate) fn stage_file(
     let spool_path = unique_spool_path(spool.run_dir(), source);
     let temp_path = temp_path_for(&spool_path);
 
+    // Panic-safety: armed for the duration of `run_staging_copy` below (the
+    // reserve->copy->verify window) and disarmed immediately once it
+    // returns, before `stage_file`'s own success/failure cleanup runs. See
+    // `StageReleaseGuard`.
+    let mut release_guard = StageReleaseGuard {
+        spool,
+        armed: true,
+        temp_path: temp_path.clone(),
+        spool_path: spool_path.clone(),
+        size,
+        targets: targets.clone(),
+    };
+
     let stage_result =
         run_staging_copy(source, &source_key, &temp_path, &spool_path, &mut progress);
+
+    release_guard.disarm();
 
     match stage_result {
         Ok(signature) => {
@@ -632,6 +708,49 @@ mod tests {
             "no temp or spool residue must remain after a staging failure"
         );
 
+        assert_reservation_released(store, payload.len() as u64);
+    }
+
+    #[test]
+    fn panic_mid_staging_releases_reservation_and_leaves_no_dangling_entry() {
+        let _hook_guard = after_copy_test_hook_guard();
+        let temp = TempDir::new("panic-safety");
+        let source = temp.path().join("source/panic.bin");
+        let payload = b"payload-that-triggers-a-forced-panic-mid-staging";
+        write_file(&source, payload);
+
+        let store = Arc::new(
+            SpoolStore::open(
+                temp.path().join("spool").as_path(),
+                "job",
+                Some(payload.len() as u64),
+                0,
+            )
+            .unwrap(),
+        );
+        let run_dir = store.run_dir().to_path_buf();
+
+        // Fires inside `run_staging_copy`, after the rename into place but
+        // before read-back verification -- squarely inside the
+        // reserve->copy->verify window `StageReleaseGuard` covers.
+        set_after_stage_copy_test_hook(Box::new(|| {
+            panic!("forced test panic mid-staging");
+        }));
+
+        let store_for_call = Arc::clone(&store);
+        let source_for_call = source.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            stage_file(&store_for_call, &source_for_call, [0usize, 1usize], |_| {})
+        }));
+        assert!(result.is_err(), "stage_file must have panicked");
+
+        assert!(
+            run_dir_entries(&run_dir).is_empty(),
+            "no temp or spool residue must remain after a panic mid-staging"
+        );
+
+        // Capacity released: a fresh reservation for the same size succeeds
+        // promptly, proving the guard's Drop ran instead of leaking it.
         assert_reservation_released(store, payload.len() as u64);
     }
 
