@@ -21,7 +21,8 @@ use plan::{FileContext, PlanBuild, PlanJob, TransferPlan};
 use progress_format::{render_live_screen, render_post_run_screen};
 use progress_model::{
     CategoryRowModel, ErrorRowModel, LiveScreenModel, PostRunScreenModel, ProgressBarModel,
-    SummaryMetric, TargetProgressRowModel, TargetResultRowModel, WorkerRowModel,
+    SourceReleaseState, SummaryMetric, TargetProgressRowModel, TargetResultRowModel,
+    WorkerRowModel, source_release_banner,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,6 +330,14 @@ fn preview_live_screen_model() -> LiveScreenModel {
             TargetProgressRowModel::new("T7", 47, "31.0 GB / 66.5 GB", "78.4 MB/s", 2),
             TargetProgressRowModel::new("Archive", 41, "27.2 GB / 66.5 GB", "64.0 MB/s", 1),
         ],
+        // Illustrates the staged relay milestone (R2) so `--preview-ui`
+        // stays reviewable without a real staged config: this canned run
+        // is "mid-copy" everywhere else, but the source-released banner
+        // doesn't depend on the rest of the snapshot, so showing it here
+        // costs nothing and needs no second canned model.
+        release_banner: source_release_banner(SourceReleaseState::Released {
+            had_failures: false,
+        }),
     }
 }
 
@@ -367,5 +376,8 @@ fn preview_post_run_screen_model() -> PostRunScreenModel {
         ],
         copied_preview_count: 20,
         copied_preview_total: 316,
+        release_banner: source_release_banner(SourceReleaseState::Released {
+            had_failures: false,
+        }),
     }
 }

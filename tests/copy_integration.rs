@@ -191,6 +191,7 @@ fn preview_ui_flag_renders_canned_live_and_post_copy_screens_without_config() {
     );
     assert!(live.stdout.contains("LIVE / COPY-LARGE"));
     assert!(!live.stdout.contains("ATTENTION"));
+    assert!(live.stdout.contains("source released"));
 
     assert!(
         post.status.success(),
@@ -200,6 +201,7 @@ fn preview_ui_flag_renders_canned_live_and_post_copy_screens_without_config() {
     );
     assert!(post.stdout.contains("ATTENTION"));
     assert!(!post.stdout.contains("LIVE / COPY-LARGE"));
+    assert!(post.stdout.contains("source released"));
 
     assert!(
         all.status.success(),
@@ -209,6 +211,7 @@ fn preview_ui_flag_renders_canned_live_and_post_copy_screens_without_config() {
     );
     assert!(all.stdout.contains("LIVE / COPY-LARGE"));
     assert!(all.stdout.contains("ATTENTION"));
+    assert!(all.stdout.contains("source released"));
 }
 
 #[test]
@@ -1060,6 +1063,85 @@ min_free_gb = 0
     assert_eq!(fs::read(target.join("small.jpg")).unwrap(), &[b'S'; 64][..]);
     assert!(output.stdout.contains("source released"));
     assert!(output.stdout.contains("VERIFIED"));
+}
+
+/// R2's early-release property, proved without any test-only stall hook:
+/// `run_copy` is driven here as a real subprocess (`run_pathsync`), so
+/// none of `lanes.rs`'s `#[cfg(test)]`-gated hooks are reachable (they only
+/// exist in the `pathsync` lib's own unit-test build, not the plain build
+/// this integration test's binary links against). Instead this test uses a
+/// large-enough file that draining structurally can't finish before
+/// staging does: the target lane only receives its `LaneEntry` once
+/// staging's read+hash+spool-write+read-back-verify pass is fully done
+/// (`run_one_staging_task` hands the entry to the lane, then fires the
+/// release milestone), and draining then has to redo an equally expensive
+/// copy+verify pass over the same bytes from the spool. Two full sequential
+/// I/O passes over several megabytes give ample margin over the
+/// microseconds-scale channel-send that fires the release event, so the
+/// ordering asserted below is not a close race.
+#[test]
+fn staged_run_reports_source_released_before_the_targets_own_completion_line() {
+    let root = TempDir::new("pathsync-staging-early-release");
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    write_file(&source.join("big.jpg"), &[b'x'; 8_000_000]);
+
+    let config_path = root.path().join("config.toml");
+    let text = format!(
+        r#"
+default_job = "sync"
+
+[jobs.sync]
+enabled = true
+source = "{source}"
+target = "{target}"
+extensions = ["jpg"]
+compare = {{ mode = "size_mtime" }}
+transfer = {{ mode = "standard" }}
+layout = "flat"
+
+[jobs.sync.staging]
+dir = "{staging_dir}"
+max_gb = 1
+min_free_gb = 0
+"#,
+        source = source.display(),
+        target = target.display(),
+        staging_dir = spool_dir.display(),
+    );
+    fs::write(&config_path, text).unwrap();
+
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap()]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(fs::read(target.join("big.jpg")).unwrap().len(), 8_000_000);
+
+    // `target` is the directory literally named "target" here, so
+    // `target_result_label` renders it as "target" and the per-Verified
+    // plain-output line (`plain_target_progress_lines`) reads
+    // "target target | ...". That line only ever prints when the target's
+    // lane finishes verifying a file, so its first occurrence is the
+    // target's own completion line.
+    let released_at = output.stdout.find("source released").unwrap_or_else(|| {
+        panic!("release line missing: stdout={}", output.stdout);
+    });
+    let target_done_at = output.stdout.find("target target | ").unwrap_or_else(|| {
+        panic!("target completion line missing: stdout={}", output.stdout);
+    });
+
+    assert!(
+        released_at < target_done_at,
+        "release must be reported before the target finishes draining: released_at={released_at} target_done_at={target_done_at}\nstdout={}",
+        output.stdout
+    );
 }
 
 #[cfg(unix)]
