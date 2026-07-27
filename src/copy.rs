@@ -25,9 +25,9 @@ use crate::progress_format::{
 };
 use crate::progress_model::{
     CategoryRowModel, ErrorRowModel, LiveScreenModel, PhaseKind, PostRunScreenModel,
-    ProgressBarModel, ProgressSnapshot, SummaryMetric, TargetProgressRowModel,
+    ProgressBarModel, ProgressSnapshot, SourceReleaseState, SummaryMetric, TargetProgressRowModel,
     TargetResultRowModel, TransferCategory, TransferRowPhase, WorkerRowModel, active_worker_slots,
-    phase_label,
+    apply_source_released, phase_label, source_release_banner,
 };
 use crate::spool::SpoolStore;
 use crate::stage::{self, StageError};
@@ -195,6 +195,10 @@ struct ProgressState {
     failed: bool,
     failed_count: usize,
     started: Instant,
+    /// Staged mode only (R2); stays `Pending` for direct (non-staged) runs,
+    /// which never observe `WorkerEvent::SourceReleased`. Kept off
+    /// `ProgressSnapshot` -- see [`SourceReleaseState`]'s doc comment.
+    release: SourceReleaseState,
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +307,7 @@ impl ProgressState {
             failed: false,
             failed_count: 0,
             started: Instant::now(),
+            release: SourceReleaseState::Pending,
         }
     }
 
@@ -1026,13 +1031,16 @@ fn run_copy_staged(
     // Sizes `worker_states` once for the whole run (staging block plus
     // every target lane's copy/verify block, per `LaneWorkerLayout`) before
     // anything else is dispatched, so no later event can index past the
-    // array -- see `LaneWorkerLayout`'s doc comment.
-    let staging_phase = match job.transfer_policy {
-        TransferPolicy::Standard => PhaseKind::SmallFiles,
-        TransferPolicy::Adaptive { .. } => PhaseKind::Adaptive,
-    };
+    // array -- see `LaneWorkerLayout`'s doc comment. `PhaseKind::Staging`
+    // (U6) is used regardless of standard/adaptive transfer policy: unlike
+    // the direct pipeline, staged mode never fires a second `PhaseStarted`
+    // to swap phases (staging and every target lane run concurrently on
+    // one worker-id space for the whole run), so there is exactly one
+    // phase to label, and it isn't "large files"/"small files"/"adaptive"
+    // -- those describe the direct pipeline's bucket scheduling, not the
+    // staged relay this run is actually doing.
     let _ = event_tx.send(WorkerEvent::PhaseStarted {
-        phase: staging_phase,
+        phase: PhaseKind::Staging,
         worker_count: layout.total_workers(),
     });
 
@@ -2002,12 +2010,9 @@ fn render_progress_tty(rx: Receiver<WorkerEvent>, context: RenderContext) -> Res
                     report.record_failure(failure.clone());
                     true
                 }
-                WorkerEvent::SourceReleased { had_failures: _ } => {
-                    // TODO(U6): render the real "source released" banner in
-                    // the live screen. No-op for now so the live loop stays
-                    // exhaustive and doesn't crash on the new staged-mode
-                    // event; nothing here needs to trigger a redraw.
-                    false
+                WorkerEvent::SourceReleased { had_failures } => {
+                    state.release = apply_source_released(state.release, had_failures);
+                    true
                 }
             },
             Err(RecvTimeoutError::Timeout) => state.active_workers > 0,
@@ -2034,6 +2039,7 @@ fn render_progress_tty(rx: Receiver<WorkerEvent>, context: RenderContext) -> Res
             &report,
             context.planning_stats.skipped_existing_files,
             context.planning_stats.skipped_existing_bytes,
+            state.release,
         ),
         glyphs,
     );
@@ -2239,17 +2245,12 @@ fn render_progress_plain(
                 last_progress_line = Instant::now();
             }
             WorkerEvent::SourceReleased { had_failures } => {
-                // TODO(U6): render the real "source released" banner; this
-                // is a minimal placeholder so the milestone is at least
-                // observable in plain output without hardware access.
-                println!(
-                    "source released{}",
-                    if had_failures {
-                        " (with staging failures)"
-                    } else {
-                        ""
-                    }
-                );
+                state.release = apply_source_released(state.release, had_failures);
+                if let Some(banner) = source_release_banner(state.release) {
+                    println!("{banner}");
+                }
+                println!("{}", plain_progress_line(&state.snapshot()));
+                last_progress_line = Instant::now();
             }
         }
     }
@@ -2427,6 +2428,7 @@ fn build_live_screen_model(
         PhaseKind::LargeFiles => "copying large files",
         PhaseKind::SmallFiles => "copying small files",
         PhaseKind::Adaptive => "copying files",
+        PhaseKind::Staging => "relaying via spool",
     };
 
     let workers = worker_states
@@ -2470,6 +2472,7 @@ fn build_live_screen_model(
             PhaseKind::LargeFiles => "LIVE / COPY-LARGE".to_string(),
             PhaseKind::SmallFiles => "LIVE / COPY-SMALL".to_string(),
             PhaseKind::Adaptive => "LIVE / COPY".to_string(),
+            PhaseKind::Staging => "LIVE / RELAY".to_string(),
         },
         summary: vec![
             SummaryMetric::new(
@@ -2510,6 +2513,7 @@ fn build_live_screen_model(
         phase_label: format!("overall  {phase_text}"),
         workers,
         target_progress: build_target_progress_rows(report, worker_states, snapshot.elapsed),
+        release_banner: source_release_banner(state.release),
     }
 }
 
@@ -2578,6 +2582,7 @@ fn build_post_run_screen_model(
     report: &CopyReport,
     skipped_existing_files: usize,
     skipped_existing_bytes: u64,
+    release: SourceReleaseState,
 ) -> PostRunScreenModel {
     let copied_count = report.copied_files.len();
     let copied_bytes = report.bytes_done;
@@ -2748,6 +2753,7 @@ fn build_post_run_screen_model(
         errors,
         copied_preview_count: report.copied_files.len().min(SUMMARY_FILE_PREVIEW_LIMIT),
         copied_preview_total: report.copied_files.len(),
+        release_banner: source_release_banner(release),
     }
 }
 
@@ -4197,7 +4203,8 @@ mod tests {
             systemic_detected: false,
         };
 
-        let model = build_post_run_screen_model(&context, &report, 2, 800);
+        let model =
+            build_post_run_screen_model(&context, &report, 2, 800, SourceReleaseState::Pending);
 
         assert_eq!(model.status, "ATTENTION");
         assert!(model.categories.iter().any(|row| row.label == "copied mp4"));

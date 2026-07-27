@@ -1,7 +1,8 @@
 use pathsync::progress_model::{
-    CategoryRowModel, ErrorRowModel, PhaseKind, ProgressBarModel, ProgressSnapshot, SummaryMetric,
-    TargetResultRowModel, TransferCategory, WorkerRowModel, active_worker_slots, eta,
-    overall_message, phase_label,
+    CategoryRowModel, ErrorRowModel, PhaseKind, ProgressBarModel, ProgressSnapshot,
+    SourceReleaseState, SummaryMetric, TargetResultRowModel, TransferCategory, WorkerRowModel,
+    active_worker_slots, apply_source_released, eta, overall_message, phase_label,
+    source_release_banner,
 };
 use std::time::Duration;
 
@@ -9,6 +10,65 @@ use std::time::Duration;
 fn phase_labels_are_human_readable() {
     assert_eq!(phase_label(PhaseKind::LargeFiles), "large files");
     assert_eq!(phase_label(PhaseKind::SmallFiles), "small files");
+    assert_eq!(phase_label(PhaseKind::Staging), "staged relay");
+}
+
+#[test]
+fn source_release_state_starts_pending_with_no_banner() {
+    let state = SourceReleaseState::default();
+    assert_eq!(state, SourceReleaseState::Pending);
+    assert!(!state.is_released());
+    assert_eq!(source_release_banner(state), None);
+}
+
+#[test]
+fn apply_source_released_transitions_to_released_exactly_on_the_event() {
+    let released = apply_source_released(SourceReleaseState::Pending, false);
+    assert_eq!(
+        released,
+        SourceReleaseState::Released {
+            had_failures: false
+        }
+    );
+    assert!(released.is_released());
+}
+
+#[test]
+fn apply_source_released_distinguishes_clean_from_with_failures() {
+    let clean = apply_source_released(SourceReleaseState::Pending, false);
+    let with_failures = apply_source_released(SourceReleaseState::Pending, true);
+
+    let clean_banner = source_release_banner(clean).expect("clean release must have a banner");
+    let failed_banner =
+        source_release_banner(with_failures).expect("failed release must have a banner");
+
+    assert!(clean_banner.contains("source released"));
+    assert!(!clean_banner.contains("with staging failures"));
+    assert!(failed_banner.contains("source released"));
+    assert!(failed_banner.contains("with staging failures"));
+}
+
+#[test]
+fn apply_source_released_never_regresses_back_to_pending() {
+    let released = apply_source_released(SourceReleaseState::Pending, false);
+    // A second observation (defensive against a hypothetical duplicate
+    // event) must stay released, not bounce back to `Pending`.
+    let still_released = apply_source_released(released, false);
+    assert!(still_released.is_released());
+    assert_eq!(still_released, released);
+}
+
+#[test]
+fn apply_source_released_keeps_a_failure_once_observed() {
+    let with_failures = apply_source_released(SourceReleaseState::Pending, true);
+    // A later call reporting `had_failures: false` (shouldn't happen in
+    // practice -- the tracker fires once -- but the model stays defensive)
+    // must not erase the already-recorded failure.
+    let still_failed = apply_source_released(with_failures, false);
+    assert_eq!(
+        still_failed,
+        SourceReleaseState::Released { had_failures: true }
+    );
 }
 
 #[test]
@@ -62,6 +122,12 @@ fn overall_message_reports_success_and_failure_outcomes() {
     assert!(overall_message(&failure).contains("copy failed"));
     assert!(overall_message(&in_progress).contains("copying large files"));
     assert!(overall_message(&in_progress).contains("2 active"));
+
+    let staging = ProgressSnapshot {
+        phase: PhaseKind::Staging,
+        ..in_progress
+    };
+    assert!(overall_message(&staging).contains("relaying via spool"));
 }
 
 #[test]
