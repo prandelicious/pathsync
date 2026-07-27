@@ -295,6 +295,30 @@ pub fn render_post_run_screen_with_glyphs(
         lines.push(render_target_result_row(target));
     }
 
+    if let Some(staging) = &model.staging {
+        lines.push(blank_line(CANONICAL_WIDTH));
+        lines.push(pad_to_width("Staging", CANONICAL_WIDTH));
+        lines.push(divider(CANONICAL_WIDTH));
+        lines.push(pad_to_width(
+            &format!(
+                "Staged       {:>7} files   {:>10}",
+                format_count(staging.staged_files),
+                staging.staged_bytes
+            ),
+            CANONICAL_WIDTH,
+        ));
+        lines.push(pad_to_width(
+            &format!("Peak spool usage   {}", staging.peak_spool_bytes),
+            CANONICAL_WIDTH,
+        ));
+        if let Some(released) = &staging.released_after {
+            lines.push(pad_to_width(
+                &format!("Source released    {released}"),
+                CANONICAL_WIDTH,
+            ));
+        }
+    }
+
     if !model.errors.is_empty() {
         lines.push(blank_line(CANONICAL_WIDTH));
         lines.push(pad_to_width("Failures", CANONICAL_WIDTH));

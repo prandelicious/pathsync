@@ -107,6 +107,7 @@ fn post_run_model() -> PostRunScreenModel {
         copied_preview_count: 20,
         copied_preview_total: 316,
         release_banner: None,
+        staging: None,
     }
 }
 

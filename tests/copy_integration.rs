@@ -1212,6 +1212,187 @@ min_free_gb = 0
     assert!(!target.join("bad.jpg").exists());
 }
 
+/// Regression test for the staging-hop double-count bug (U7): a staged
+/// run's `WorkerEvent::Finished` fires once for the source->spool staging
+/// hop (`dest` is a spool path) and once more per target lane's
+/// spool->target copy (`dest` is the real target path). Before the fix,
+/// the render loop's generic `copied_files`/byte totals counted all of
+/// these, inflating "Copied" by one extra (spool-path) entry per unique
+/// staged file. This asserts the exact `Breakdown` line: with 2 targets
+/// and 1 staged file, "Copied" must read exactly 2 files (one per real
+/// target copy), not 3.
+#[test]
+fn staged_multi_target_run_reports_only_real_target_copies_not_the_staging_hop() {
+    let root = TempDir::new("pathsync-staging-double-count");
+    let source = root.path().join("source");
+    let target_a = root.path().join("ta");
+    let target_b = root.path().join("tb");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target_a).unwrap();
+    fs::create_dir_all(&target_b).unwrap();
+    let contents = b"double-count-regression-bytes";
+    write_file(&source.join("photo.jpg"), contents);
+
+    let config_path = root.path().join("config.toml");
+    let text = format!(
+        r#"
+default_job = "sync"
+
+[jobs.sync]
+enabled = true
+source = "{source}"
+targets = ["{target_a}", "{target_b}"]
+extensions = ["jpg"]
+compare = {{ mode = "path" }}
+transfer = {{ mode = "standard" }}
+layout = "flat"
+
+[jobs.sync.staging]
+dir = "{staging_dir}"
+max_gb = 1
+min_free_gb = 0
+"#,
+        source = source.display(),
+        target_a = target_a.display(),
+        target_b = target_b.display(),
+        staging_dir = spool_dir.display(),
+    );
+    fs::write(&config_path, text).unwrap();
+
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap()]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(fs::read(target_a.join("photo.jpg")).unwrap(), contents);
+    assert_eq!(fs::read(target_b.join("photo.jpg")).unwrap(), contents);
+
+    let file_size = contents.len() as u64;
+    let expected_copied_line = format!(
+        "{:<12} {:>3} files   {:>10}",
+        "Copied",
+        2,
+        pathsync::format::human_bytes(file_size * 2)
+    );
+    assert!(
+        output.stdout.contains(&expected_copied_line),
+        "expected exact Copied breakdown line {expected_copied_line:?} \
+         (regression: the staging hop must not be counted as a third copy); \
+         stdout={}",
+        output.stdout
+    );
+
+    let expected_staged_line = format!(
+        "{:<12} {:>3} files   {:>10}",
+        "Staged",
+        1,
+        pathsync::format::human_bytes(file_size)
+    );
+    assert!(
+        output.stdout.contains(&expected_staged_line),
+        "expected exact Staged line {expected_staged_line:?} \
+         (one staging hop regardless of target count); stdout={}",
+        output.stdout
+    );
+
+    // Peak spool usage: only one file is ever staged in this run, so the
+    // observed peak must be exactly that file's size -- in particular, at
+    // least as large as it (a sane, non-negative reading), not zero and
+    // not some unrelated value.
+    let expected_peak_spool_line = format!(
+        "{:<12} {}",
+        "Peak Spool",
+        pathsync::format::human_bytes(file_size)
+    );
+    assert!(
+        output.stdout.contains(&expected_peak_spool_line),
+        "expected exact Peak Spool line {expected_peak_spool_line:?}; stdout={}",
+        output.stdout
+    );
+}
+
+/// R9: a single staging failure fans out to one `WorkerEvent::Error` per
+/// affected target (same cause, cloned once per target). The post-run
+/// summary must present this as one grouped failure entry naming every
+/// affected destination, not one row per target.
+#[cfg(unix)]
+#[test]
+fn staged_run_with_unreadable_source_reports_one_grouped_failure_for_both_targets() {
+    let root = TempDir::new("pathsync-staging-grouped-failure");
+    let source = root.path().join("source");
+    let target_a = root.path().join("ta");
+    let target_b = root.path().join("tb");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target_a).unwrap();
+    fs::create_dir_all(&target_b).unwrap();
+    write_file(&source.join("good.jpg"), b"good-bytes");
+    let bad = source.join("bad.jpg");
+    write_file(&bad, b"bad-bytes");
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let config_path = root.path().join("config.toml");
+    let text = format!(
+        r#"
+default_job = "sync"
+
+[jobs.sync]
+enabled = true
+source = "{source}"
+targets = ["{target_a}", "{target_b}"]
+extensions = ["jpg"]
+compare = {{ mode = "path" }}
+transfer = {{ mode = "standard" }}
+layout = "flat"
+
+[jobs.sync.staging]
+dir = "{staging_dir}"
+max_gb = 1
+min_free_gb = 0
+"#,
+        source = source.display(),
+        target_a = target_a.display(),
+        target_b = target_b.display(),
+        staging_dir = spool_dir.display(),
+    );
+    fs::write(&config_path, text).unwrap();
+
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap()]);
+
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(
+        !output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(fs::read(target_a.join("good.jpg")).unwrap(), b"good-bytes");
+    assert_eq!(fs::read(target_b.join("good.jpg")).unwrap(), b"good-bytes");
+    assert!(!target_a.join("bad.jpg").exists());
+    assert!(!target_b.join("bad.jpg").exists());
+
+    // Only the grouped Failures-section row names both targets together
+    // ("ta, tb") on the same line as the failing file; a per-target,
+    // ungrouped rendering would produce two separate "bad.jpg" rows, each
+    // naming only one target, and neither would contain both labels.
+    let grouped_lines: Vec<&str> = output
+        .stdout
+        .lines()
+        .filter(|line| line.contains("bad.jpg") && line.contains("ta, tb"))
+        .collect();
+    assert_eq!(
+        grouped_lines.len(),
+        1,
+        "expected exactly one grouped failure row naming both targets, got {grouped_lines:?}\nstdout={}",
+        output.stdout
+    );
+}
+
 fn load_job(source: &Path, target: &Path, compare_mode: &str) -> config::ResolvedJob {
     let config = config::Config {
         default_job: Some("sync".to_string()),

@@ -282,6 +282,18 @@ impl TargetResultRowModel {
     }
 }
 
+/// Staged mode only (R12): staging stats for the post-run summary --
+/// staged files/bytes and peak spool usage always present for a staged
+/// run, `released_after` present only once the source-release milestone
+/// (R2) actually fired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagingSummaryModel {
+    pub staged_files: usize,
+    pub staged_bytes: String,
+    pub peak_spool_bytes: String,
+    pub released_after: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveScreenModel {
     pub job_name: String,
@@ -317,6 +329,10 @@ pub struct PostRunScreenModel {
     /// text as [`LiveScreenModel::release_banner`], carried into the
     /// post-run screen so it stays visible after the live view is replaced.
     pub release_banner: Option<String>,
+    /// Staged mode only (R12): `None` for direct (non-staged) runs and for
+    /// staged runs with no staging activity, so existing output stays
+    /// byte-for-byte unchanged unless a run actually staged something.
+    pub staging: Option<StagingSummaryModel>,
 }
 
 impl ProgressSnapshot {

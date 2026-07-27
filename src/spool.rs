@@ -175,6 +175,13 @@ impl SpoolStore {
         &self.run_dir
     }
 
+    /// Currently reserved/used bytes in the spool, for observability only
+    /// (e.g. sampling peak spool usage for the post-run summary). Purely
+    /// read-only: does not participate in capacity or reservation logic.
+    pub(crate) fn used_bytes(&self) -> u64 {
+        self.state.lock().unwrap().used
+    }
+
     /// Blocks the calling thread until `bytes` can be reserved: the
     /// capacity cap (if any) is not exceeded and the spool volume's
     /// available free space stays at or above the configured min-free

@@ -379,5 +379,6 @@ fn preview_post_run_screen_model() -> PostRunScreenModel {
         release_banner: source_release_banner(SourceReleaseState::Released {
             had_failures: false,
         }),
+        staging: None,
     }
 }
