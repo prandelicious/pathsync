@@ -11,11 +11,13 @@
 //! backpressure in the staged pipeline is the spool store's `reserve` call
 //! (U2), which this module does not touch.
 //!
-//! Not yet wired into `run_copy`: U5 is the production consumer of this
-//! module's public surface (feeding staged entries in and joining lanes at
-//! run end). Directly covered by this module's own tests in the meantime,
-//! matching the `#![allow(dead_code)]` convention already used in
-//! `copy_fast_path.rs`/`stage.rs` for the same reason.
+//! Wired into `run_copy`'s staged relay path via `run_copy_staged` in
+//! `src/copy.rs` (U5), which feeds staged entries into
+//! [`start_target_lanes`]'s lanes and joins them at run end. The
+//! module-level `#![allow(dead_code)]` remains for the handful of items
+//! still exercised only by this module's own tests (forward-looking
+//! surface for later units) -- matching the convention already used in
+//! `copy_fast_path.rs`/`stage.rs`.
 #![allow(dead_code)]
 
 use std::fs;
@@ -113,7 +115,6 @@ pub(crate) struct LaneEntry {
 /// ([`sender`](Self::sender)) callers use to feed staged files destined
 /// for this lane's target.
 pub(crate) struct TargetLane {
-    target_index: usize,
     target_root: PathBuf,
     copy_worker_id: usize,
     verify_worker_id: usize,
@@ -134,14 +135,6 @@ impl TargetLane {
     /// never handed off, so the spool store still thinks it's pending).
     pub(crate) fn sender(&self) -> &Sender<LaneEntry> {
         &self.entry_tx
-    }
-
-    pub(crate) fn target_index(&self) -> usize {
-        self.target_index
-    }
-
-    pub(crate) fn target_root(&self) -> &Path {
-        &self.target_root
     }
 
     /// Closes this lane's input (so its workers drain and stop once their
@@ -249,7 +242,6 @@ fn start_one_lane(
     };
 
     TargetLane {
-        target_index,
         target_root,
         copy_worker_id,
         verify_worker_id,
@@ -721,11 +713,6 @@ mod tests {
             signature: signature_of(payload),
             display_name: name.to_string(),
         }
-    }
-
-    fn recv_timeout(rx: &Receiver<WorkerEvent>, timeout: Duration) -> WorkerEvent {
-        rx.recv_timeout(timeout)
-            .expect("expected a WorkerEvent within timeout")
     }
 
     /// Drains `rx` until either `n` `Verified` events have been seen or the

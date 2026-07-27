@@ -8,10 +8,12 @@
 //! spool-to-target drain lanes (U4) that later consume the entries it
 //! registers.
 //!
-//! Not yet wired into `run_copy`: U4 and U5 are the production consumers
-//! of this module's public surface. Directly covered by this module's own
-//! tests in the meantime -- matches the `#![allow(dead_code)]` convention
-//! already used in `copy_fast_path.rs` for the same reason.
+//! Wired into `run_copy`'s staged relay path via `run_copy_staged` in
+//! `src/copy.rs` (U5), which calls [`stage_file`] for each planned source
+//! file and hands the result off to U4's drain lanes. The module-level
+//! `#![allow(dead_code)]` remains for the handful of items still exercised
+//! only by this module's own tests (forward-looking surface for later
+//! units) -- matches the convention already used in `copy_fast_path.rs`.
 #![allow(dead_code)]
 
 use std::ffi::OsString;
