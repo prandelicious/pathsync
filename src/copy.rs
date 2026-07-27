@@ -1532,17 +1532,33 @@ fn copy_file(
     copy_result
 }
 
+// Thread-local rather than a process-wide `static Mutex`: `run_plan` calls
+// `run_after_copy_test_hook()` unconditionally on every real copy (as a
+// no-op when nothing is armed), and `cargo test` runs test functions
+// concurrently on separate OS threads. With a process-wide slot, any other
+// test doing a real copy at the wrong moment could steal or clobber the
+// hook a test armed for itself -- including before that test's own copy
+// even starts (observed in practice as a spurious `HashSource` failure
+// instead of the intended `SourceChanged` one). Every test that uses this
+// hook sets it and triggers it from the same call stack on its own thread
+// (`run_plan`/`stage_file` called directly, not via a spawned worker), so
+// thread-local storage makes cross-test interference structurally
+// impossible instead of merely unlikely.
 #[cfg(test)]
-static AFTER_COPY_TEST_HOOK: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+thread_local! {
+    static AFTER_COPY_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(test)]
 pub(crate) fn set_after_copy_test_hook(hook: Box<dyn FnOnce() + Send>) {
-    *AFTER_COPY_TEST_HOOK.lock().unwrap() = Some(hook);
+    AFTER_COPY_TEST_HOOK.with(|cell| *cell.borrow_mut() = Some(hook));
 }
 
 #[cfg(test)]
 pub(crate) fn run_after_copy_test_hook() {
-    if let Some(hook) = AFTER_COPY_TEST_HOOK.lock().unwrap().take() {
+    let hook = AFTER_COPY_TEST_HOOK.with(|cell| cell.borrow_mut().take());
+    if let Some(hook) = hook {
         hook();
     }
 }
@@ -1550,12 +1566,13 @@ pub(crate) fn run_after_copy_test_hook() {
 #[cfg(not(test))]
 pub(crate) fn run_after_copy_test_hook() {}
 
-/// Serializes tests (in this module and in `src/stage.rs`) that use
-/// [`set_after_copy_test_hook`]/[`run_after_copy_test_hook`]. The hook is a
-/// single process-wide slot and `cargo test` runs tests in parallel by
-/// default, so two tests both using it at once could clobber or steal each
-/// other's closure. Hold the returned guard for the duration of any test
-/// that touches the hook.
+/// Serializes tests (in `src/lanes.rs`) that use its own still-process-wide
+/// `LANE_COPY_TEST_HOOK`. [`set_after_copy_test_hook`]/[`run_after_copy_test_hook`]
+/// and `src/stage.rs`'s equivalent no longer need this guard -- both are
+/// thread-local now -- but `src/lanes.rs`'s hook fires on a spawned lane
+/// worker thread rather than the test's own thread, so it still needs a
+/// process-wide slot and this mutex to serialize concurrent users of it.
+/// Kept under this name for the existing call sites that already hold it.
 #[cfg(test)]
 static TEST_HOOK_GUARD: Mutex<()> = Mutex::new(());
 

@@ -36,30 +36,38 @@ use crate::spool::{EntryId, SpoolStore};
 /// files can share a basename across different source subdirectories.
 static SPOOL_ENTRY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// A second after-copy test hook, private to this module, mirroring
-/// `src/copy.rs`'s `AFTER_COPY_TEST_HOOK`/`set_after_copy_test_hook`/
-/// `run_after_copy_test_hook` pattern exactly. Kept separate from the
-/// `copy.rs` hook (rather than sharing its single slot for both failure
-/// tests) so that only this module's own tests can ever arm or consume it;
-/// see `run_staging_copy`'s call site for why both hooks fire at the same
-/// point.
+// A second after-copy test hook, private to this module, mirroring
+// `src/copy.rs`'s `AFTER_COPY_TEST_HOOK`/`set_after_copy_test_hook`/
+// `run_after_copy_test_hook` pattern exactly -- including being
+// thread-local rather than a process-wide `static Mutex`, for the same
+// reason: `stage_file` calls `run_after_stage_copy_test_hook()`
+// unconditionally on every real staging copy, so a process-wide slot would
+// let any other test's staging call steal or clobber a hook this module's
+// own tests armed for themselves. Every test using this hook sets it and
+// triggers it from the same call stack on its own thread (`stage_file`
+// called directly, not via a spawned worker), so thread-local storage is
+// sound here for the same reason it is in `src/copy.rs`. Kept separate
+// from the `copy.rs` hook (rather than sharing its single slot for both
+// failure tests) so that only this module's own tests can ever arm or
+// consume it; see `run_staging_copy`'s call site for why both hooks fire
+// at the same point.
 #[cfg(test)]
-static AFTER_STAGE_COPY_TEST_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
-    std::sync::Mutex::new(None);
+thread_local! {
+    static AFTER_STAGE_COPY_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(test)]
 fn set_after_stage_copy_test_hook(hook: Box<dyn FnOnce() + Send>) {
-    *AFTER_STAGE_COPY_TEST_HOOK.lock().unwrap() = Some(hook);
+    AFTER_STAGE_COPY_TEST_HOOK.with(|cell| *cell.borrow_mut() = Some(hook));
 }
 
 #[cfg(test)]
 fn run_after_stage_copy_test_hook() {
     // Extract the hook into an owned local *before* calling it, so the
-    // mutex guard is dropped before `hook()` runs -- otherwise a panicking
-    // hook (used to test panic-safety) would poison this static mutex for
-    // the rest of the test process, per Rust's temporary lifetime extension
-    // inside `if let` scrutinees.
-    let hook = AFTER_STAGE_COPY_TEST_HOOK.lock().unwrap().take();
+    // `RefCell` borrow ends before `hook()` runs -- otherwise a panicking
+    // hook (used to test panic-safety) would panic while still borrowed.
+    let hook = AFTER_STAGE_COPY_TEST_HOOK.with(|cell| cell.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
