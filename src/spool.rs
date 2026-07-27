@@ -5,7 +5,8 @@
 //! events or rendering and is fully unit-testable with temp directories.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -20,7 +21,7 @@ const RESERVE_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Opaque handle to a registered spool entry, returned by [`SpoolStore::register`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct EntryId(u64);
+pub(crate) struct EntryId(u64);
 
 struct SpoolEntry {
     path: PathBuf,
@@ -39,14 +40,30 @@ struct Inner {
     /// evicted to free capacity, so a blocked reservation must fail fast
     /// instead of waiting forever.
     live_entry_count: usize,
+    /// Count of capacity claims granted by [`reserve`](SpoolStore::reserve)
+    /// that have not yet been resolved by a matching
+    /// [`register`](SpoolStore::register) call. A claim is "in flight"
+    /// during the real, non-trivial window between a caller's successful
+    /// `reserve()` and the later `register()` it makes only after a full
+    /// file copy -- so `live_entry_count` alone (which only counts
+    /// registered, evictable entries) undercounts what could still free
+    /// capacity. Every `reserve()` grant increments this; every `register()`
+    /// call decrements it exactly once (register() is always the one path,
+    /// including panic-safety cleanup in stage.rs, that eventually resolves
+    /// a claim). See the deadlock-prevention check in `reserve()`.
+    outstanding_claims: usize,
 }
 
 /// Owns a run-scoped spool directory on internal storage: capacity
 /// accounting with blocking reservation, refcounted entries, eviction, and
 /// orphan cleanup of stale sibling run directories from crashed runs.
-pub struct SpoolStore {
+pub(crate) struct SpoolStore {
     run_dir: PathBuf,
     spool_root: PathBuf,
+    /// Path to this run's job-scoped lock file (see
+    /// [`acquire_job_lock`](SpoolStore::acquire_job_lock)), removed on
+    /// [`close`](SpoolStore::close)/[`Drop`] alongside `run_dir`.
+    job_lock_path: PathBuf,
     cap: Option<u64>,
     min_free_bytes: u64,
     state: Mutex<Inner>,
@@ -59,6 +76,13 @@ impl SpoolStore {
     /// `job_name`.
     ///
     /// On construction:
+    /// - Atomically claims this job's lock file
+    ///   ([`acquire_job_lock`](Self::acquire_job_lock)) via exclusive
+    ///   filesystem creation (`O_EXCL`), so two processes racing to start
+    ///   the same job can never both conclude "safe to proceed": the
+    ///   filesystem itself picks exactly one winner. Fails with
+    ///   [`SpoolError::ConcurrentRunDetected`] if another live process
+    ///   already holds it.
     /// - Scans `spool_root` for sibling run directories belonging to the
     ///   same job (`<job_name>-` prefix). If any sibling names a live pid in
     ///   its lockfile, construction fails with
@@ -73,7 +97,7 @@ impl SpoolStore {
     /// `max_bytes` is the capacity cap (`None` = unbounded); `min_free_bytes`
     /// is the minimum free space that must remain on the spool volume after
     /// a reservation is granted.
-    pub fn open(
+    pub(crate) fn open(
         spool_root: &Path,
         job_name: &str,
         max_bytes: Option<u64>,
@@ -85,6 +109,36 @@ impl SpoolStore {
             source: e,
         })?;
 
+        let job_lock_path = Self::acquire_job_lock(spool_root, job_name)?;
+
+        // From here on, any error must release the job lock we just
+        // claimed: no `SpoolStore` will exist yet to release it via `Drop`.
+        match Self::open_after_job_lock(spool_root, job_name) {
+            Ok((run_dir, state)) => Ok(Self {
+                run_dir,
+                spool_root: spool_root.to_path_buf(),
+                job_lock_path,
+                cap: max_bytes,
+                min_free_bytes,
+                state: Mutex::new(state),
+                cond: Condvar::new(),
+                closed: AtomicBool::new(false),
+            }),
+            Err(e) => {
+                let _ = fs::remove_file(&job_lock_path);
+                Err(e)
+            }
+        }
+    }
+
+    /// Runs the (pre-existing) orphan-cleanup/live-lock scan and creates
+    /// this run's own directory and lockfile. Split out from `open` purely
+    /// so `open` can uniformly release the job lock on any error from this
+    /// point onward.
+    fn open_after_job_lock(
+        spool_root: &Path,
+        job_name: &str,
+    ) -> Result<(PathBuf, Inner), SpoolError> {
         Self::clean_orphans_and_check_live_lock(spool_root, job_name)?;
 
         let run_id = generate_run_id();
@@ -95,36 +149,140 @@ impl SpoolStore {
             source: e,
         })?;
         let lock_path = run_dir.join(LOCK_FILE_NAME);
-        fs::write(&lock_path, std::process::id().to_string()).map_err(|e| SpoolError::Io {
-            op: "write lockfile",
-            path: lock_path,
-            source: e,
+        // Second line embeds the job name explicitly, so sibling scans can
+        // confirm job identity by exact match against lockfile content
+        // instead of a directory-name prefix match (which would otherwise
+        // let e.g. job `backup`'s prefix `backup-` swallow job
+        // `backup-nightly`'s directories). See `sibling_belongs_to_job`.
+        fs::write(&lock_path, format!("{}\n{job_name}\n", std::process::id())).map_err(|e| {
+            SpoolError::Io {
+                op: "write lockfile",
+                path: lock_path,
+                source: e,
+            }
         })?;
 
-        Ok(Self {
+        Ok((
             run_dir,
-            spool_root: spool_root.to_path_buf(),
-            cap: max_bytes,
-            min_free_bytes,
-            state: Mutex::new(Inner {
+            Inner {
                 used: 0,
                 entries: HashMap::new(),
                 next_entry_id: 0,
                 live_entry_count: 0,
-            }),
-            cond: Condvar::new(),
-            closed: AtomicBool::new(false),
-        })
+                outstanding_claims: 0,
+            },
+        ))
+    }
+
+    /// Path to this job's atomic claim file: a single, job-scoped (not
+    /// run-scoped) fixed path shared by every `open()` call for the same
+    /// `job_name`, distinct from the per-run `.pathsync-lock` files inside
+    /// each `<job_name>-<run_id>` directory.
+    fn job_lock_path(spool_root: &Path, job_name: &str) -> PathBuf {
+        spool_root.join(format!(".{job_name}.pathsync-lock"))
+    }
+
+    /// Atomically claims this job's lock file via exclusive creation
+    /// (`create_new`, i.e. `O_EXCL` on Unix), which the filesystem
+    /// guarantees succeeds for at most one caller when raced by multiple
+    /// processes -- closing the TOCTOU window a plain read-then-write
+    /// sequence would leave open. Returns the claimed lock file's path,
+    /// which the caller owns for the lifetime of the resulting
+    /// [`SpoolStore`] and must remove on error/close/drop.
+    ///
+    /// If the lock file already exists, reads the pid inside: a live pid
+    /// means another process genuinely holds this job's lock, so this fails
+    /// with [`SpoolError::ConcurrentRunDetected`]. A dead or genuinely
+    /// unreadable pid means the file is a stale leftover from a crashed
+    /// prior run; it is removed and the claim is retried.
+    ///
+    /// Reading the pid retries briefly (bounded, short sleeps) on empty or
+    /// unparseable content before concluding "stale": `create_new` and the
+    /// content write below are two separate syscalls, not one atomic unit,
+    /// so a racing reader can otherwise observe the file mid-creation
+    /// (0 bytes) and wrongly treat a live, just-claimed lock as stale.
+    fn acquire_job_lock(spool_root: &Path, job_name: &str) -> Result<PathBuf, SpoolError> {
+        let lock_path = Self::job_lock_path(spool_root, job_name);
+        loop {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(mut file) => {
+                    // Best-effort: if the pid write fails, we still hold the
+                    // exclusive claim (the file exists and we created it),
+                    // which is what actually matters for correctness. A
+                    // missing/unreadable pid on a live claim is treated as
+                    // "alive" by a subsequent racer's `is_pid_alive`
+                    // ambiguous-error fallback, so this fails safe.
+                    let _ = file.write_all(std::process::id().to_string().as_bytes());
+                    return Ok(lock_path);
+                }
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    match Self::read_lock_pid_with_retry(&lock_path) {
+                        Some(pid) if is_pid_alive(pid) => {
+                            return Err(SpoolError::ConcurrentRunDetected {
+                                job_name: job_name.to_string(),
+                                pid,
+                                path: lock_path,
+                            });
+                        }
+                        // Dead pid, or still unreadable/unparseable after
+                        // retrying: stale leftover from a crashed run.
+                        // Remove and retry the exclusive create; if another
+                        // process wins the retry, the next iteration's
+                        // alive-pid check catches it.
+                        _ => {
+                            let _ = fs::remove_file(&lock_path);
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(SpoolError::Io {
+                        op: "create job lockfile",
+                        path: lock_path,
+                        source: e,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Reads and parses the pid from `lock_path`, retrying briefly (bounded
+    /// attempts, short sleeps) if the content is missing/empty/unparseable
+    /// before giving up. See [`acquire_job_lock`](Self::acquire_job_lock)
+    /// for why this retry exists: closing the window where a lockfile has
+    /// been `create_new`'d but its content write hasn't landed yet.
+    fn read_lock_pid_with_retry(lock_path: &Path) -> Option<i32> {
+        const ATTEMPTS: u32 = 20;
+        const RETRY_DELAY: Duration = Duration::from_millis(2);
+        for attempt in 0..ATTEMPTS {
+            if let Ok(contents) = fs::read_to_string(lock_path)
+                && let Some(pid) = sibling_pid(&contents)
+            {
+                return Some(pid);
+            }
+            if attempt + 1 < ATTEMPTS {
+                std::thread::sleep(RETRY_DELAY);
+            }
+        }
+        None
     }
 
     /// Two-pass sibling scan: first detect whether any same-job sibling
     /// holds a live lock (failing fast, touching nothing, if so), then
     /// remove orphaned siblings (absent or dead-pid lockfile).
+    ///
+    /// Job identity is decided by EXACT match, never a directory-name
+    /// prefix match: a raw `starts_with("{job_name}-")` would let a shorter
+    /// job name (e.g. `backup`) swallow a longer sibling job's directories
+    /// (e.g. `backup-nightly-<run_id>`), one-directionally. See
+    /// `sibling_belongs_to_job`.
     fn clean_orphans_and_check_live_lock(
         spool_root: &Path,
         job_name: &str,
     ) -> Result<(), SpoolError> {
-        let prefix = format!("{job_name}-");
         let mut orphans: Vec<PathBuf> = Vec::new();
 
         for entry in fs::read_dir(spool_root).map_err(|e| SpoolError::Io {
@@ -143,23 +301,22 @@ impl SpoolStore {
             }
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if !name.starts_with(&prefix) {
+
+            let lock_path = path.join(LOCK_FILE_NAME);
+            let lock_contents = fs::read_to_string(&lock_path).ok();
+            if !sibling_belongs_to_job(&name, lock_contents.as_deref(), job_name) {
                 continue;
             }
 
-            let lock_path = path.join(LOCK_FILE_NAME);
-            match fs::read_to_string(&lock_path) {
-                Ok(contents) => match contents.trim().parse::<i32>() {
-                    Ok(pid) if is_pid_alive(pid) => {
-                        return Err(SpoolError::ConcurrentRunDetected {
-                            job_name: job_name.to_string(),
-                            pid,
-                            path,
-                        });
-                    }
-                    _ => orphans.push(path),
-                },
-                Err(_) => orphans.push(path),
+            match lock_contents.as_deref().and_then(sibling_pid) {
+                Some(pid) if is_pid_alive(pid) => {
+                    return Err(SpoolError::ConcurrentRunDetected {
+                        job_name: job_name.to_string(),
+                        pid,
+                        path,
+                    });
+                }
+                _ => orphans.push(path),
             }
         }
 
@@ -171,7 +328,7 @@ impl SpoolStore {
     }
 
     /// The run-scoped spool directory for this store.
-    pub fn run_dir(&self) -> &Path {
+    pub(crate) fn run_dir(&self) -> &Path {
         &self.run_dir
     }
 
@@ -191,11 +348,15 @@ impl SpoolStore {
     /// Fails immediately (without blocking) rather than waiting when:
     /// - `bytes` alone exceeds the entire cap
     ///   ([`SpoolError::ExceedsCapacity`]); or
-    /// - the reservation cannot currently be satisfied and there are zero
-    ///   live (unevicted) entries in the store, meaning nothing could
-    ///   possibly be evicted to free space
-    ///   ([`SpoolError::WouldDeadlock`]).
-    pub fn reserve(&self, bytes: u64) -> Result<(), SpoolError> {
+    /// - the reservation cannot currently be satisfied, there are zero live
+    ///   (unevicted) entries in the store, AND there are zero outstanding
+    ///   claims (reservations granted but not yet resolved by a matching
+    ///   `register()` call) -- meaning nothing registered and nothing
+    ///   in-flight could possibly free capacity
+    ///   ([`SpoolError::WouldDeadlock`]). A claim still in flight might
+    ///   resolve into a registered, evictable entry, so it alone is enough
+    ///   to keep waiting rather than fail fast.
+    pub(crate) fn reserve(&self, bytes: u64) -> Result<(), SpoolError> {
         if let Some(cap) = self.cap
             && bytes > cap
         {
@@ -219,10 +380,11 @@ impl SpoolStore {
 
             if cap_ok && min_free_ok {
                 guard.used += bytes;
+                guard.outstanding_claims += 1;
                 return Ok(());
             }
 
-            if guard.live_entry_count == 0 {
+            if guard.live_entry_count == 0 && guard.outstanding_claims == 0 {
                 return Err(SpoolError::WouldDeadlock { requested: bytes });
             }
 
@@ -242,7 +404,7 @@ impl SpoolStore {
     ///
     /// If `pending_targets` is empty, the entry evicts immediately (the
     /// spool file at `path` is deleted and its bytes released).
-    pub fn register(
+    pub(crate) fn register(
         &self,
         path: PathBuf,
         size: u64,
@@ -251,6 +413,11 @@ impl SpoolStore {
         let mut guard = self.state.lock().unwrap();
         let id = guard.next_entry_id;
         guard.next_entry_id += 1;
+        // This register() call resolves the claim `reserve()` granted for
+        // this entry's bytes: it converts an in-flight, unregistered claim
+        // into a tracked entry. `saturating_sub` tolerates test-only helpers
+        // that call `register()` without a preceding `reserve()`.
+        guard.outstanding_claims = guard.outstanding_claims.saturating_sub(1);
 
         let remaining: HashSet<usize> = pending_targets.into_iter().collect();
         let already_empty = remaining.is_empty();
@@ -285,7 +452,7 @@ impl SpoolStore {
     /// may race with or follow a normal in-flight `mark_terminal` call for
     /// the same entry/target; idempotency makes both orders safe.
     /// Calling it for an already-fully-evicted `entry_id` is also a no-op.
-    pub fn mark_terminal(&self, entry_id: EntryId, target_index: usize) {
+    pub(crate) fn mark_terminal(&self, entry_id: EntryId, target_index: usize) {
         let mut guard = self.state.lock().unwrap();
         if mark_terminal_locked(&mut guard, entry_id.0, target_index) {
             self.cond.notify_all();
@@ -302,7 +469,7 @@ impl SpoolStore {
     /// Safe to call even for entries `target_index` was never pending on
     /// (a no-op for those, via the same idempotency as `mark_terminal`) and
     /// safe to call more than once.
-    pub fn mark_all_remaining_terminal_for_target(&self, target_index: usize) {
+    pub(crate) fn mark_all_remaining_terminal_for_target(&self, target_index: usize) {
         let mut guard = self.state.lock().unwrap();
         let ids: Vec<u64> = guard.entries.keys().copied().collect();
         let mut evicted_any = false;
@@ -319,10 +486,14 @@ impl SpoolStore {
     /// Explicitly closes the store, removing the run-scoped directory
     /// (spool files and lockfile). Safe to call more than once, and safe to
     /// skip: [`Drop`] calls it automatically at run end.
-    pub fn close(&self) -> std::io::Result<()> {
+    pub(crate) fn close(&self) -> std::io::Result<()> {
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        // Best-effort: release the job-scoped lock claimed by
+        // `acquire_job_lock` so a subsequent `open()` for the same job
+        // isn't blocked by this run's own (now-finished) claim.
+        let _ = fs::remove_file(&self.job_lock_path);
         fs::remove_dir_all(&self.run_dir)
     }
 }
@@ -395,10 +566,55 @@ fn generate_run_id() -> String {
     format!("{nanos:x}-{}", std::process::id())
 }
 
+/// Parses the pid from a sibling's lockfile content (its first line).
+fn sibling_pid(lock_contents: &str) -> Option<i32> {
+    lock_contents.lines().next()?.trim().parse::<i32>().ok()
+}
+
+/// Decides whether a sibling directory named `dir_name` belongs to
+/// `job_name`, by EXACT identity match rather than a directory-name prefix
+/// match (which would let a shorter job name swallow a longer sibling job's
+/// directories, e.g. `backup` matching `backup-nightly-<run_id>`).
+///
+/// Primary check: if `lock_contents` is available and its second line (the
+/// job name, written by [`SpoolStore::open_after_job_lock`]) is present,
+/// that is authoritative -- exact string equality against `job_name`.
+///
+/// Fallback (used when the lockfile is missing/unreadable -- the orphan
+/// case -- or is an old-format lockfile with no embedded job name):
+/// recover the job name from `dir_name` itself. `generate_run_id` produces
+/// run ids of the form `<nanos_hex>-<pid>` (two trailing hyphen-delimited
+/// components), so this tries stripping both one and two trailing
+/// components and accepts an exact match against either -- covering both
+/// real run ids and simpler single-component run ids (as used by this
+/// module's own tests) -- while still requiring exact equality, never a
+/// prefix match, against `job_name`.
+fn sibling_belongs_to_job(dir_name: &str, lock_contents: Option<&str>, job_name: &str) -> bool {
+    if let Some(embedded) = lock_contents.and_then(|c| c.lines().nth(1)) {
+        return embedded == job_name;
+    }
+
+    [1usize, 2usize]
+        .into_iter()
+        .filter_map(|trailing_segments| strip_trailing_hyphen_segments(dir_name, trailing_segments))
+        .any(|candidate| candidate == job_name)
+}
+
+/// Strips `count` trailing `-`-delimited segments from `name`, returning
+/// the remainder, or `None` if `name` doesn't have that many segments.
+fn strip_trailing_hyphen_segments(name: &str, count: usize) -> Option<&str> {
+    let mut end = name.len();
+    for _ in 0..count {
+        end = name[..end].rfind('-')?;
+    }
+    Some(&name[..end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::Barrier;
     use std::sync::atomic::AtomicU32;
     use std::sync::mpsc;
     use std::thread;
@@ -530,16 +746,19 @@ mod tests {
     }
 
     #[test]
-    fn zero_live_entries_fails_fast_instead_of_hanging() {
+    fn zero_live_entries_and_zero_outstanding_claims_fails_fast_instead_of_hanging() {
         let root = TempDir::new("deadlock");
-        // Cap is 0, min-free is 0: any positive reservation can never be
-        // satisfied by capacity, and nothing is registered to evict.
-        let store = SpoolStore::open(root.path(), "job", Some(10), 0).unwrap();
-
-        // Fill capacity with a bare reservation (no registered entry, so
-        // live_entry_count stays 0): simulates "capacity exhausted with
-        // nothing outstanding to evict."
-        store.reserve(10).unwrap();
+        // No cap, so capacity itself is never the constraint (with a
+        // correctly-resolved reserve()/register() pairing, capacity alone
+        // can never be the bottleneck when both live_entry_count and
+        // outstanding_claims are zero -- see `reserve`'s doc comment). Set
+        // min_free_bytes higher than the volume's real available space so
+        // it can genuinely never be satisfied: with nothing registered and
+        // nothing outstanding, nothing could ever free real disk space, so
+        // this must fail fast rather than block.
+        let available = fs4::available_space(root.path()).expect("query available space");
+        let store =
+            SpoolStore::open(root.path(), "job", None, available + 1024 * 1024 * 1024).unwrap();
 
         let (tx, rx) = mpsc::channel();
         let store = Arc::new(store);
@@ -556,6 +775,52 @@ mod tests {
             result,
             Err(SpoolError::WouldDeadlock { requested: 1 })
         ));
+    }
+
+    #[test]
+    fn reserve_blocks_instead_of_spuriously_failing_while_a_claim_is_outstanding_but_unregistered()
+    {
+        // Regresses the P0 race: reserve() used to fast-fail with
+        // WouldDeadlock whenever live_entry_count was zero, even though a
+        // just-granted reservation that hasn't been register()'d yet (the
+        // real, non-trivial window while stage.rs copies a whole file
+        // before registering) could still resolve into an evictable entry.
+        let root = TempDir::new("outstanding-claim");
+        let store = Arc::new(SpoolStore::open(root.path(), "job", Some(10), 0).unwrap());
+
+        // First reservation claims the entire cap but is deliberately NOT
+        // yet registered, simulating the in-flight window.
+        store.reserve(10).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let store_clone = Arc::clone(&store);
+        thread::spawn(move || {
+            // Must BLOCK, not spuriously fail: a claim is still outstanding
+            // and could resolve into an evictable entry.
+            let result = store_clone.reserve(5);
+            let _ = tx.send(result);
+        });
+
+        // Prove it is genuinely still blocked (not merely about to answer):
+        // under the old buggy check this would already have sent an
+        // `Err(WouldDeadlock)` well within this window.
+        let early = rx.recv_timeout(StdDuration::from_millis(300));
+        assert!(
+            early.is_err(),
+            "reserve() must block while a claim is outstanding, not fail fast: got {early:?}"
+        );
+
+        // Resolve the first claim exactly as stage_file's real success path
+        // does: register (converting the claim into a tracked entry), then
+        // mark it terminal (evicting it and freeing capacity).
+        let path = write_spool_file(&store, "claim.bin", &[7u8; 10]);
+        let id = store.register(path, 10, [0usize]);
+        store.mark_terminal(id, 0);
+
+        let result = rx
+            .recv_timeout(StdDuration::from_secs(5))
+            .expect("blocked reserve() must proceed once the outstanding claim resolves, not hang");
+        assert!(result.is_ok(), "expected success, got {result:?}");
     }
 
     #[test]
@@ -671,6 +936,104 @@ mod tests {
             sibling.join(LOCK_FILE_NAME).exists(),
             "live-locked sibling's lockfile must be left untouched"
         );
+    }
+
+    #[test]
+    fn concurrent_open_calls_for_same_job_never_both_succeed() {
+        // Regresses the P1 TOCTOU race: two `open()` calls for the same job
+        // started close together used to both pass the (pure filesystem
+        // read) live-lock check before either had written its own
+        // lockfile, so both could proceed concurrently against the same
+        // job. Run several iterations with a `Barrier` to make the race
+        // window as tight as possible each time, so a regression is caught
+        // reliably rather than passing by accident of OS scheduling.
+        for iteration in 0..30 {
+            let root = TempDir::new(&format!("concurrent-open-{iteration}"));
+            let root_path = root.path().to_path_buf();
+            let barrier = Arc::new(Barrier::new(2));
+
+            let barrier1 = Arc::clone(&barrier);
+            let root1 = root_path.clone();
+            let h1 = thread::spawn(move || {
+                barrier1.wait();
+                SpoolStore::open(&root1, "job", None, 0)
+            });
+
+            let barrier2 = Arc::clone(&barrier);
+            let root2 = root_path.clone();
+            let h2 = thread::spawn(move || {
+                barrier2.wait();
+                SpoolStore::open(&root2, "job", None, 0)
+            });
+
+            let r1 = h1.join().expect("open() thread 1 must not panic");
+            let r2 = h2.join().expect("open() thread 2 must not panic");
+
+            let is_concurrent_err = |r: &Result<SpoolStore, SpoolError>| {
+                matches!(r, Err(SpoolError::ConcurrentRunDetected { .. }))
+            };
+
+            assert!(
+                r1.is_ok() ^ r2.is_ok(),
+                "iteration {iteration}: exactly one of the two concurrent open() calls must succeed"
+            );
+            assert!(
+                is_concurrent_err(&r1) || is_concurrent_err(&r2),
+                "iteration {iteration}: the losing open() call must fail with ConcurrentRunDetected"
+            );
+        }
+    }
+
+    #[test]
+    fn hyphenated_job_name_prefix_collision_does_not_cross_match() {
+        // Regresses P1 #5: job "backup"'s prefix `backup-` used to
+        // raw-prefix-match sibling directories belonging to a DIFFERENT job
+        // "backup-nightly" (e.g. `backup-nightly-<run_id>`), one
+        // -directionally, causing false live-lock conflicts and wrongful
+        // orphan deletion of backup-nightly's spool directories.
+        let root = TempDir::new("prefix-collision");
+
+        // A live "backup-nightly" run (current two-line lockfile format:
+        // pid, then job name).
+        let nightly_live = root.path().join("backup-nightly-liverun");
+        fs::create_dir_all(&nightly_live).unwrap();
+        fs::write(
+            nightly_live.join(LOCK_FILE_NAME),
+            format!("{}\nbackup-nightly\n", std::process::id()),
+        )
+        .unwrap();
+
+        // A crashed "backup-nightly" run (dead pid): would be wrongly
+        // deleted as an "orphan of `backup`" under a raw prefix match.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("failed to spawn helper process");
+        let dead_pid = child.id();
+        child.wait().expect("failed to reap helper process");
+        let nightly_dead = root.path().join("backup-nightly-deadrun");
+        fs::create_dir_all(&nightly_dead).unwrap();
+        fs::write(
+            nightly_dead.join(LOCK_FILE_NAME),
+            format!("{dead_pid}\nbackup-nightly\n"),
+        )
+        .unwrap();
+
+        // Job "backup" (the shorter, prefix-colliding name) must not treat
+        // either sibling as its own: no false live-lock conflict from the
+        // live one, and no wrongful cleanup of the dead one.
+        let store = SpoolStore::open(root.path(), "backup", None, 0)
+            .expect("job `backup` must not see `backup-nightly`'s live run as a conflict");
+
+        assert!(
+            nightly_live.exists(),
+            "backup-nightly's live run must be left untouched by job `backup`"
+        );
+        assert!(
+            nightly_dead.exists(),
+            "backup-nightly's crashed run must not be wrongly deleted by job `backup`'s orphan cleanup"
+        );
+
+        drop(store);
     }
 
     #[test]

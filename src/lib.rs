@@ -9,7 +9,7 @@ pub mod plan;
 pub mod policy;
 pub mod progress_format;
 pub mod progress_model;
-pub mod spool;
+mod spool;
 mod stage;
 
 use std::fs;
