@@ -157,9 +157,9 @@ pub(crate) enum WorkerEvent {
     /// stops depending on the source; `had_failures` lets the UI pick a
     /// clean-release vs release-with-failures banner.
     ///
-    /// U6 owns the real banner rendering; see the `// TODO(U6)` render-loop
-    /// arms below for the placeholder handling that keeps this event from
-    /// crashing the (still exhaustive) match in the meantime.
+    /// The live and plain render loops react to this event to render the
+    /// release banner -- see the `WorkerEvent::SourceReleased` match arms in
+    /// `render_progress_tty`/`render_progress_plain`.
     SourceReleased {
         had_failures: bool,
     },
