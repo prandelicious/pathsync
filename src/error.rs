@@ -54,6 +54,43 @@ pub enum ConfigError {
     UnsupportedLayoutPreset { preset: String },
     #[error("invalid timezone: {value}")]
     InvalidTimezone { value: String },
+    #[error("staging max_gb must be greater than 0")]
+    StagingMaxGbZero,
+    #[error("{message}")]
+    StagingDirConflictsWithSource { message: String },
+    #[error("{message}")]
+    StagingDirConflictsWithTarget { message: String },
+    #[error("staging directory creation failed: {path}")]
+    StagingDirCreationFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum SpoolError {
+    #[error("failed to {op} at {path}: {source}")]
+    Io {
+        op: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "job `{job_name}` already has a live spool run at {path} (pid {pid}); refusing to start a concurrent run"
+    )]
+    ConcurrentRunDetected {
+        job_name: String,
+        pid: i32,
+        path: PathBuf,
+    },
+    #[error("reservation of {requested} bytes exceeds the spool capacity cap of {cap} bytes")]
+    ExceedsCapacity { requested: u64, cap: u64 },
+    #[error(
+        "reservation of {requested} bytes cannot be satisfied and the spool has zero entries outstanding to evict; would deadlock"
+    )]
+    WouldDeadlock { requested: u64 },
 }
 
 #[derive(Debug, Error)]
@@ -102,6 +139,8 @@ pub enum CopyOperation {
     WorkerPanic,
     #[error("ui_panic")]
     UiPanic,
+    #[error("reserve")]
+    Reserve,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +166,8 @@ pub enum CopyError {
     Internal { message: String },
     #[error("progress UI thread panicked")]
     UiThreadPanicked,
+    #[error("staging run-start validation failed: {message}")]
+    StagingValidationFailed { message: String },
 }
 
 #[derive(Debug, Error)]

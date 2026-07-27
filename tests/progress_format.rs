@@ -67,6 +67,7 @@ fn live_model() -> LiveScreenModel {
             TargetProgressRowModel::new("T7", 47, "31.0 GB / 66.5 GB", "78.4 MB/s", 2),
             TargetProgressRowModel::new("Archive", 41, "27.2 GB / 66.5 GB", "64.0 MB/s", 1),
         ],
+        release_banner: None,
     }
 }
 
@@ -105,6 +106,8 @@ fn post_run_model() -> PostRunScreenModel {
         ],
         copied_preview_count: 20,
         copied_preview_total: 316,
+        release_banner: None,
+        staging: None,
     }
 }
 
@@ -334,6 +337,71 @@ fn rendered_post_run_errors_keep_target_specific_destination_context() {
 
     assert!(rendered.contains("Archive"));
     assert!(rendered.contains("permission denied"));
+}
+
+#[test]
+fn narrow_live_screen_omits_release_banner_when_not_yet_released() {
+    let lines = render_live_screen(&live_model());
+    let rendered = lines.join("\n");
+
+    assert!(!rendered.contains("source released"));
+}
+
+#[test]
+fn narrow_live_screen_renders_release_banner_as_a_full_width_line() {
+    let mut model = live_model();
+    model.release_banner = Some("source released \u{2014} safe to disconnect".to_string());
+
+    let lines = render_live_screen(&model);
+
+    assert!(
+        lines
+            .iter()
+            .all(|line| line.chars().count() == CANONICAL_WIDTH)
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("source released \u{2014} safe to disconnect"))
+    );
+}
+
+#[test]
+fn wide_live_screen_renders_release_banner_with_staging_failures_wording() {
+    let mut model = live_model();
+    model.release_banner =
+        Some("source released \u{2014} with staging failures, safe to disconnect".to_string());
+
+    let lines = render_live_screen_with_width(&model, 120);
+    let rendered = lines.join("\n");
+
+    assert!(lines.iter().all(|line| line.chars().count() == 120));
+    assert!(rendered.contains("source released"));
+    assert!(rendered.contains("with staging failures"));
+}
+
+#[test]
+fn post_run_screen_renders_release_banner_when_present() {
+    let mut model = post_run_model();
+    model.release_banner = Some("source released \u{2014} safe to disconnect".to_string());
+
+    let lines = render_post_run_screen(&model);
+    let rendered = lines.join("\n");
+
+    assert!(
+        lines
+            .iter()
+            .all(|line| line.chars().count() == CANONICAL_WIDTH)
+    );
+    assert!(rendered.contains("source released"));
+}
+
+#[test]
+fn post_run_screen_omits_release_banner_when_absent() {
+    let lines = render_post_run_screen(&post_run_model());
+    let rendered = lines.join("\n");
+
+    assert!(!rendered.contains("source released"));
 }
 
 #[test]

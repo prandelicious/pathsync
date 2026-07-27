@@ -20,6 +20,7 @@ fn public_policy_types_are_exposed_through_resolved_jobs() {
         default_job: Some("sync".to_string()),
         parallel: None,
         timezone: Some("UTC".to_string()),
+        staging: None,
         jobs: [(
             "sync".to_string(),
             config::JobConfig {
@@ -39,6 +40,7 @@ fn public_policy_types_are_exposed_through_resolved_jobs() {
                 }),
                 parallel: Some(2),
                 timezone: None,
+                staging: None,
                 layout: config::LayoutConfig::Preset("flat".to_string()),
             },
         )]
@@ -79,6 +81,7 @@ fn public_build_transfer_plan_expands_multi_target_jobs() {
         default_job: Some("sync".to_string()),
         parallel: None,
         timezone: None,
+        staging: None,
         jobs: [(
             "sync".to_string(),
             config::JobConfig {
@@ -91,6 +94,7 @@ fn public_build_transfer_plan_expands_multi_target_jobs() {
                 transfer: None,
                 parallel: None,
                 timezone: None,
+                staging: None,
                 layout: config::LayoutConfig::Preset("flat".to_string()),
             },
         )]
@@ -133,6 +137,7 @@ fn public_build_transfer_plan_reports_identical_collision_sources_without_conten
         default_job: Some("sync".to_string()),
         parallel: None,
         timezone: None,
+        staging: None,
         jobs: [(
             "sync".to_string(),
             config::JobConfig {
@@ -145,6 +150,7 @@ fn public_build_transfer_plan_reports_identical_collision_sources_without_conten
                 transfer: None,
                 parallel: None,
                 timezone: None,
+                staging: None,
                 layout: config::LayoutConfig::Detailed(config::LayoutDetailed {
                     kind: "template".to_string(),
                     value: Some("{filename}".to_string()),
@@ -182,6 +188,7 @@ fn public_build_transfer_plan_returns_typed_collision_errors_for_distinct_conten
         default_job: Some("sync".to_string()),
         parallel: None,
         timezone: None,
+        staging: None,
         jobs: [(
             "sync".to_string(),
             config::JobConfig {
@@ -194,6 +201,7 @@ fn public_build_transfer_plan_returns_typed_collision_errors_for_distinct_conten
                 transfer: None,
                 parallel: None,
                 timezone: None,
+                staging: None,
                 layout: config::LayoutConfig::Detailed(config::LayoutDetailed {
                     kind: "template".to_string(),
                     value: Some("{filename}".to_string()),
@@ -229,6 +237,7 @@ fn public_build_transfer_plan_with_stats_returns_planning_metrics() {
         default_job: Some("sync".to_string()),
         parallel: None,
         timezone: None,
+        staging: None,
         jobs: [(
             "sync".to_string(),
             config::JobConfig {
@@ -243,6 +252,7 @@ fn public_build_transfer_plan_with_stats_returns_planning_metrics() {
                 transfer: None,
                 parallel: None,
                 timezone: None,
+                staging: None,
                 layout: config::LayoutConfig::Preset("flat".to_string()),
             },
         )]

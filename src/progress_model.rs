@@ -7,6 +7,13 @@ pub enum PhaseKind {
     Adaptive,
     LargeFiles,
     SmallFiles,
+    /// Staged relay mode (U6): the single phase covering the whole staged
+    /// run -- staging (source->spool) and every target lane (spool->target)
+    /// running concurrently on one worker-id space, sized once up front by
+    /// `LaneWorkerLayout::total_workers()`. Unlike `LargeFiles`/`SmallFiles`,
+    /// this is not swapped mid-run: staged mode never fires more than one
+    /// `WorkerEvent::PhaseStarted`, so there is nothing to switch between.
+    Staging,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,6 +282,18 @@ impl TargetResultRowModel {
     }
 }
 
+/// Staged mode only (R12): staging stats for the post-run summary --
+/// staged files/bytes and peak spool usage always present for a staged
+/// run, `released_after` present only once the source-release milestone
+/// (R2) actually fired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagingSummaryModel {
+    pub staged_files: usize,
+    pub staged_bytes: String,
+    pub peak_spool_bytes: String,
+    pub released_after: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveScreenModel {
     pub job_name: String,
@@ -286,6 +305,12 @@ pub struct LiveScreenModel {
     pub phase_label: String,
     pub workers: Vec<WorkerRowModel>,
     pub target_progress: Vec<TargetProgressRowModel>,
+    /// Staged mode only (R2): the "source released" milestone text from
+    /// [`source_release_banner`], or `None` before release / outside staged
+    /// mode. Rendered as a prominent extra line when present, so direct
+    /// (non-staged) runs -- which never observe `WorkerEvent::SourceReleased`
+    /// -- render identically to before this field existed.
+    pub release_banner: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,6 +325,14 @@ pub struct PostRunScreenModel {
     pub errors: Vec<ErrorRowModel>,
     pub copied_preview_count: usize,
     pub copied_preview_total: usize,
+    /// Staged mode only (R12, display half): the same release milestone
+    /// text as [`LiveScreenModel::release_banner`], carried into the
+    /// post-run screen so it stays visible after the live view is replaced.
+    pub release_banner: Option<String>,
+    /// Staged mode only (R12): `None` for direct (non-staged) runs and for
+    /// staged runs with no staging activity, so existing output stays
+    /// byte-for-byte unchanged unless a run actually staged something.
+    pub staging: Option<StagingSummaryModel>,
 }
 
 impl ProgressSnapshot {
@@ -317,6 +350,66 @@ pub fn phase_label(phase: PhaseKind) -> &'static str {
         PhaseKind::Adaptive => "adaptive",
         PhaseKind::LargeFiles => "large files",
         PhaseKind::SmallFiles => "small files",
+        PhaseKind::Staging => "staged relay",
+    }
+}
+
+/// Run-level source-release status (R2), tracked alongside the per-tick
+/// [`ProgressSnapshot`] but kept as its own small state machine rather than
+/// a field on it: it only ever moves forward once, on
+/// `WorkerEvent::SourceReleased`, and doesn't participate in the
+/// bytes/files bookkeeping every `ProgressSnapshot` field otherwise shares.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SourceReleaseState {
+    #[default]
+    Pending,
+    Released {
+        had_failures: bool,
+    },
+}
+
+impl SourceReleaseState {
+    pub fn is_released(&self) -> bool {
+        matches!(self, Self::Released { .. })
+    }
+}
+
+/// Applies a `WorkerEvent::SourceReleased { had_failures }` observation to
+/// the current release state. Idempotent and monotonic: once `Released`,
+/// further calls never regress to `Pending`, and `had_failures` is OR'd in
+/// rather than overwritten, so a later call can't downgrade an
+/// already-observed failure back to a clean release. In practice
+/// `StagingReleaseTracker` (`src/copy.rs`) fires the underlying event
+/// exactly once per run, but the render loop applies this defensively.
+pub fn apply_source_released(
+    current: SourceReleaseState,
+    had_failures: bool,
+) -> SourceReleaseState {
+    match current {
+        SourceReleaseState::Released {
+            had_failures: existing,
+        } => SourceReleaseState::Released {
+            had_failures: existing || had_failures,
+        },
+        SourceReleaseState::Pending => SourceReleaseState::Released { had_failures },
+    }
+}
+
+/// The human-facing "source released" milestone text (R2), or `None` while
+/// still pending. `had_failures` selects a distinct wording noting that not
+/// every file made it off the source cleanly, without attempting an exact
+/// failure count -- the render loop that observes this doesn't reliably
+/// know how many of the failures already reported were staging failures
+/// specifically versus later target-side ones.
+pub fn source_release_banner(state: SourceReleaseState) -> Option<String> {
+    match state {
+        SourceReleaseState::Pending => None,
+        SourceReleaseState::Released {
+            had_failures: false,
+        } => Some("source released \u{2014} safe to disconnect".to_string()),
+        SourceReleaseState::Released { had_failures: true } => {
+            Some("source released \u{2014} with staging failures, safe to disconnect".to_string())
+        }
     }
 }
 
@@ -364,6 +457,7 @@ pub fn overall_message(snapshot: &ProgressSnapshot) -> String {
             PhaseKind::LargeFiles => "copying large files",
             PhaseKind::SmallFiles => "copying small files",
             PhaseKind::Adaptive => "copying files",
+            PhaseKind::Staging => "relaying via spool",
         },
     };
 

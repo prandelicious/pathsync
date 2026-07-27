@@ -122,19 +122,22 @@ fn render_live_screen_narrow(model: &LiveScreenModel, width: usize) -> Vec<Strin
     let mut lines = vec![
         header_line(&model.job_name, &model.status, width),
         divider(width),
+    ];
+    lines.extend(release_banner_lines(&model.release_banner, width));
+    lines.extend([
         pad_to_width(&live_counts_row(&model.summary), width),
         pad_to_width(&live_bytes_rate_row(&model.summary), width),
         pad_to_width(&live_elapsed_eta_row(&model.summary), width),
         blank_line(width),
-        progress_line(
-            &model.overall_label,
-            &model.overall_progress,
-            Some(&model.overall_progress_text),
-            width,
-        ),
-        blank_line(width),
-        phase_line(&model.phase_label, width),
-    ];
+    ]);
+    lines.push(progress_line(
+        &model.overall_label,
+        &model.overall_progress,
+        Some(&model.overall_progress_text),
+        width,
+    ));
+    lines.push(blank_line(width));
+    lines.push(phase_line(&model.phase_label, width));
 
     for worker in model.workers.iter().take(VISIBLE_WORKER_ROWS) {
         lines.push(render_worker_row(worker, width));
@@ -155,8 +158,9 @@ fn render_live_screen_wide(model: &LiveScreenModel, width: usize) -> Vec<String>
     let mut lines = vec![
         header_line(&model.job_name, &model.status, width),
         divider(width),
-        blank_line(width),
     ];
+    lines.extend(release_banner_lines(&model.release_banner, width));
+    lines.push(blank_line(width));
 
     let mut left = vec![
         progress_line(
@@ -212,6 +216,17 @@ fn render_live_screen_wide(model: &LiveScreenModel, width: usize) -> Vec<String>
     lines
 }
 
+/// Renders the staged-mode "source released" milestone (R2) as zero or one
+/// full-width line. Zero lines when `banner` is `None` -- i.e. always, for
+/// direct (non-staged) runs -- so existing layouts are byte-for-byte
+/// unchanged unless a run actually observed `WorkerEvent::SourceReleased`.
+fn release_banner_lines(banner: &Option<String>, width: usize) -> Vec<String> {
+    banner
+        .as_deref()
+        .map(|text| vec![pad_to_width(text, width)])
+        .unwrap_or_default()
+}
+
 fn live_stats_box(metrics: &[crate::progress_model::SummaryMetric]) -> Vec<String> {
     let inner_width = WIDE_STATS_BOX_WIDTH - 2;
     let title = " Run ";
@@ -251,6 +266,9 @@ pub fn render_post_run_screen_with_glyphs(
     let mut lines = vec![
         header_line(&model.job_name, &model.status, CANONICAL_WIDTH),
         divider(CANONICAL_WIDTH),
+    ];
+    lines.extend(release_banner_lines(&model.release_banner, CANONICAL_WIDTH));
+    lines.extend([
         progress_line(
             &model.completion_label,
             &model.completion_progress,
@@ -271,10 +289,34 @@ pub fn render_post_run_screen_with_glyphs(
             ),
             CANONICAL_WIDTH,
         ),
-    ];
+    ]);
 
     for target in &model.target_results {
         lines.push(render_target_result_row(target));
+    }
+
+    if let Some(staging) = &model.staging {
+        lines.push(blank_line(CANONICAL_WIDTH));
+        lines.push(pad_to_width("Staging", CANONICAL_WIDTH));
+        lines.push(divider(CANONICAL_WIDTH));
+        lines.push(pad_to_width(
+            &format!(
+                "Staged       {:>7} files   {:>10}",
+                format_count(staging.staged_files),
+                staging.staged_bytes
+            ),
+            CANONICAL_WIDTH,
+        ));
+        lines.push(pad_to_width(
+            &format!("Peak spool usage   {}", staging.peak_spool_bytes),
+            CANONICAL_WIDTH,
+        ));
+        if let Some(released) = &staging.released_after {
+            lines.push(pad_to_width(
+                &format!("Source released    {released}"),
+                CANONICAL_WIDTH,
+            ));
+        }
     }
 
     if !model.errors.is_empty() {

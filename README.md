@@ -24,6 +24,7 @@ The repository currently ships two binaries:
   - different source files that render to the same final destination fail planning
 - Preview screens for the live and post-copy terminal UI
 - Native-copy benchmarking through `bench-copy`
+- Opt-in staged relay mode: early source release plus per-target drain lanes decoupled from slow targets
 
 ## Build and install
 
@@ -108,6 +109,7 @@ Configuration is TOML with these top-level keys:
 - `default_job`: optional default job name
 - `parallel`: optional default worker count
 - `timezone`: optional default timezone for filesystem-mtime date extraction
+- `staging`: optional default staged-relay-mode settings, see [Staged relay mode](#staged-relay-mode)
 - `jobs`: map of job names to job definitions
 
 Each job supports:
@@ -121,6 +123,7 @@ Each job supports:
 - `transfer`: optional transfer policy
 - `parallel`: optional per-job worker count override
 - `timezone`: optional per-job timezone override
+- `staging`: optional staged-relay-mode settings, overrides the top-level default, see [Staged relay mode](#staged-relay-mode)
 - `layout`: destination layout preset or template
 
 Notes:
@@ -258,6 +261,49 @@ For terminal output:
 
 - TTY runs render the full-screen live/post-copy UI
 - non-TTY runs emit plain progress lines and a text summary
+
+## Staged relay mode
+
+Staged relay mode is an opt-in copy pipeline. Instead of copying straight from the source to every target, each planned source file is read once into a spool directory on internal storage (with its `xxh3_128` signature computed in the same read), then every target drains that spool file independently. This buys two things a direct source-to-target pipeline can't:
+
+- the source is released as soon as every planned file is staged and read-back verified in the spool, usually well before the slowest target finishes -- safe to disconnect a camera card or portable drive without waiting on the whole run
+- each target copies and verifies from the spool on its own lane, so a slow or stalled target never blocks staging or any other target's progress
+
+It is off by default: with no `staging` table anywhere in the config, `pathsync` runs the same direct source-to-target pipeline it always has, byte for byte unchanged.
+
+Enable it with a `staging` table on a job, or a top-level `[staging]` table as a default for every job:
+
+```toml
+[jobs.example.staging]
+dir = "/path/to/spool"  # optional; defaults to a state/data directory, see below
+max_gb = 500             # optional; defaults to unbounded
+min_free_gb = 10         # optional; defaults to 5
+```
+
+Keys:
+
+- `dir`: the spool directory, created automatically if it doesn't exist. Defaults to `~/Library/Application Support/pathsync/spool` on macOS, or `$XDG_STATE_HOME/pathsync/spool` (falling back to `~/.local/state/pathsync/spool`) elsewhere. Must not equal, sit inside, or contain the source or any configured target for the job.
+- `max_gb`: spool capacity cap in GB. Defaults to unbounded. `0` is rejected.
+- `min_free_gb`: minimum free space, in GB, that must remain on the spool volume after a reservation. Defaults to `5`.
+
+Precedence matches `parallel`/`timezone`: a job's `staging` table overrides the top-level default field by field, so a job that sets only `max_gb` still inherits `dir` and `min_free_gb` from the top-level table (or the built-in defaults, if neither sets them). A job activates staged mode as soon as either it or the top-level config defines a `staging` table at all, even an empty one.
+
+At run start, before any copying begins, `pathsync` validates the spool and fails fast if:
+
+- the spool directory isn't usable
+- the capacity cap, if set, is smaller than the largest planned file
+- the largest planned file wouldn't fit in the spool volume's free space while keeping `min_free_gb` free
+
+If the spool volume shares a device with a target, `pathsync` warns instead of failing -- staging still runs correctly, but the spool and that target compete for the same disk's bandwidth. Once the spool fills to its cap, new staging reservations block until a drained file evicts and frees space; that's ordinary backpressure, not a failure.
+
+While a staged run is in progress, plain output prints a `source released — safe to disconnect` line (with a failure-noting variant if any file failed staging) the moment every planned file has reached a terminal staging outcome. The post-run summary carries a `Staging` section with staged files/bytes, peak spool usage, and the elapsed time at release.
+
+Safety notes:
+
+- `pathsync` never modifies or deletes source files, staged or not.
+- The spool defaults to a state/data directory, never an OS cache directory: cache contents can be purged by the OS or cleanup tools at any time, and once the source is released the spool may be the only remaining readable copy of files a slow target hasn't drained yet.
+- Once the source is released -- and possibly disconnected -- a spool file that later fails verification on a remaining target can't be re-read from source. The run reports that failure; re-running the job with the source available again restores integrity.
+- Spool entries are deleted as soon as every target that needs them reaches a terminal outcome (verified or failed). A spool run directory orphaned by a crashed prior run of the same job is cleaned up automatically the next time that job runs staged.
 
 ## Copy backend and benchmarking
 

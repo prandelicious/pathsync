@@ -7,15 +7,16 @@ use std::io::{self, BufReader, ErrorKind, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::config::ResolvedJob;
+use crate::config::{ResolvedJob, ResolvedStaging};
 use crate::copy_fast_path::{CopyTransferError, CopyTransferOperation, copy_file_data};
-use crate::error::{CopyError, CopyFailure, CopyFailureClassification, CopyOperation};
+use crate::error::{CopyError, CopyFailure, CopyFailureClassification, CopyOperation, SpoolError};
 use crate::format::{format_duration, human_bytes, human_rate};
+use crate::lanes::{self, LaneEntry, LaneWorkerLayout};
 use crate::plan::{PlanningStats, TransferPlan};
 use crate::policy::TransferPolicy;
 use crate::progress_format::{
@@ -24,10 +25,12 @@ use crate::progress_format::{
 };
 use crate::progress_model::{
     CategoryRowModel, ErrorRowModel, LiveScreenModel, PhaseKind, PostRunScreenModel,
-    ProgressBarModel, ProgressSnapshot, SummaryMetric, TargetProgressRowModel,
-    TargetResultRowModel, TransferCategory, TransferRowPhase, WorkerRowModel, active_worker_slots,
-    phase_label,
+    ProgressBarModel, ProgressSnapshot, SourceReleaseState, StagingSummaryModel, SummaryMetric,
+    TargetProgressRowModel, TargetResultRowModel, TransferCategory, TransferRowPhase,
+    WorkerRowModel, active_worker_slots, apply_source_released, phase_label, source_release_banner,
 };
+use crate::spool::SpoolStore;
+use crate::stage::{self, StageError};
 
 const WORKER_NAME_WIDTH: usize = 36;
 const PLAIN_PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
@@ -38,19 +41,25 @@ const BRAILLE_SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '
 #[allow(dead_code)]
 const HASH_BUFFER_SIZE: usize = 1024 * 1024;
 
-#[allow(dead_code)]
+/// A file's content signature: size plus an `xxh3_128` digest. This is the
+/// integrity anchor used throughout the copy/staging pipeline -- see the
+/// plan's "Integrity anchor is the source signature" decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileSignature {
-    size: u64,
-    xxh3_128: u128,
+pub(crate) struct FileSignature {
+    pub(crate) size: u64,
+    pub(crate) xxh3_128: u128,
 }
 
-#[allow(dead_code)]
+/// A source file's `size/mtime/dev/ino` key, used to detect mid-run
+/// mutation via [`ensure_source_unchanged`]. `size` and `mtime` are
+/// `pub(crate)` because staging (`src/stage.rs`) needs them directly (the
+/// reserved byte count and the mtime to stamp on the spool copy) without a
+/// redundant extra `fs::metadata` call.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SourceSignatureKey {
+pub(crate) struct SourceSignatureKey {
     path: PathBuf,
-    size: u64,
-    mtime: Option<std::time::SystemTime>,
+    pub(crate) size: u64,
+    pub(crate) mtime: Option<std::time::SystemTime>,
     #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
@@ -97,7 +106,7 @@ struct CopyExecutionContext {
 }
 
 #[derive(Debug)]
-enum WorkerEvent {
+pub(crate) enum WorkerEvent {
     PhaseStarted {
         phase: PhaseKind,
         worker_count: usize,
@@ -142,10 +151,22 @@ enum WorkerEvent {
         worker: usize,
         failure: CopyFailure,
     },
+    /// Staged mode only (U5): fired exactly once, when every planned source
+    /// file has reached a terminal staging outcome (staged-and-verified, or
+    /// staging-failed -- both terminal per R2). Marks the point the run
+    /// stops depending on the source; `had_failures` lets the UI pick a
+    /// clean-release vs release-with-failures banner.
+    ///
+    /// The live and plain render loops react to this event to render the
+    /// release banner -- see the `WorkerEvent::SourceReleased` match arms in
+    /// `render_progress_tty`/`render_progress_plain`.
+    SourceReleased {
+        had_failures: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
-enum SizeBucket {
+pub(crate) enum SizeBucket {
     Large,
     #[default]
     Small,
@@ -174,6 +195,10 @@ struct ProgressState {
     failed: bool,
     failed_count: usize,
     started: Instant,
+    /// Staged mode only (R2); stays `Pending` for direct (non-staged) runs,
+    /// which never observe `WorkerEvent::SourceReleased`. Kept off
+    /// `ProgressSnapshot` -- see [`SourceReleaseState`]'s doc comment.
+    release: SourceReleaseState,
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +236,21 @@ struct CopyReport {
     target_results: BTreeMap<String, TargetResult>,
     failed: bool,
     systemic_detected: bool,
+    /// Staged mode only (R12): count/bytes of the source->spool staging hop,
+    /// kept separate from `copied_files`/`large`/`small` (which are real
+    /// source->target copies) so the staging hop never inflates those
+    /// generic totals -- see the `WorkerEvent::Finished` handlers in
+    /// `render_progress_tty`/`render_progress_plain`.
+    staged_files: usize,
+    staged_bytes: u64,
+    /// Staged mode only (R12): a running max of `SpoolStore::used_bytes()`,
+    /// sampled by the render loop as it processes events.
+    peak_spool_bytes: u64,
+    /// Staged mode only (R2, R12): elapsed run time when
+    /// `WorkerEvent::SourceReleased` first arrived, or `None` if staging
+    /// never reached the release milestone (e.g. every task failed via
+    /// `StageError::Reserve`, which never advances the release tracker).
+    source_released_at: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +303,28 @@ impl CopyReport {
         self.target_entry_mut(target).verify_failed += 1;
     }
 
+    /// Records one file completing the source->spool staging hop. Kept
+    /// separate from `record_copy` (real source->target copies) -- see
+    /// `CopyReport::staged_files`'s doc comment.
+    fn record_staged(&mut self, bytes: u64) {
+        self.staged_files += 1;
+        self.staged_bytes += bytes;
+    }
+
+    /// Folds one `SpoolStore::used_bytes()` sample into the running peak.
+    fn note_spool_used(&mut self, used: u64) {
+        self.peak_spool_bytes = self.peak_spool_bytes.max(used);
+    }
+
+    /// Records the elapsed run time at the moment `WorkerEvent::SourceReleased`
+    /// first arrived. Idempotent: only the first call has any effect, since
+    /// the underlying event fires at most once per run.
+    fn record_source_released(&mut self, elapsed: Duration) {
+        if self.source_released_at.is_none() {
+            self.source_released_at = Some(elapsed);
+        }
+    }
+
     fn target_entry_mut(&mut self, target: &Path) -> &mut TargetResult {
         self.target_results
             .entry(target_result_label(target))
@@ -282,6 +344,7 @@ impl ProgressState {
             failed: false,
             failed_count: 0,
             started: Instant::now(),
+            release: SourceReleaseState::Pending,
         }
     }
 
@@ -317,7 +380,34 @@ pub fn print_dry_run(job: &ResolvedJob, plans: &[TransferPlan]) {
     }
 }
 
+/// Entry point for the copy phase. Dispatches to the staged relay pipeline
+/// (U2-U5) when the job opts into staging, or straight through to the
+/// original direct source->target pipeline otherwise.
+///
+/// Per R10, the `job.staging.is_none()` branch below is the *only* place
+/// this function touches the legacy path: it calls [`run_copy_direct`]
+/// exactly as `run_copy` always has, so staging-absent behavior stays
+/// byte-for-byte unchanged. Staged-mode logic lives entirely in
+/// [`run_copy_staged`] and the functions it calls, kept structurally
+/// separate from the legacy body so reverting staged mode is a clean
+/// deletion.
 pub fn run_copy(
+    job: &ResolvedJob,
+    plans: Vec<TransferPlan>,
+    planning_stats: PlanningStats,
+) -> Result<(), CopyError> {
+    match &job.staging {
+        Some(staging) => run_copy_staged(job, staging, plans, planning_stats),
+        None => run_copy_direct(job, plans, planning_stats),
+    }
+}
+
+/// The original direct source->target pipeline, unchanged from before
+/// staged mode existed. Every target copy reads straight from the source
+/// and shares one worker pool / verify queue, per the standard or adaptive
+/// transfer policy. See [`run_copy`] for the staged-mode dispatch this
+/// function is deliberately kept isolated from.
+fn run_copy_direct(
     job: &ResolvedJob,
     plans: Vec<TransferPlan>,
     planning_stats: PlanningStats,
@@ -352,10 +442,10 @@ pub fn run_copy(
         target_results,
     };
     let ui_handle = if use_tty {
-        thread::spawn(move || render_progress_tty(event_rx, render_context))
+        thread::spawn(move || render_progress_tty(event_rx, render_context, None))
     } else {
         print_header_lines_plain(job, task_count, total_bytes, large_file_count);
-        thread::spawn(move || render_progress_plain(event_rx, render_context))
+        thread::spawn(move || render_progress_plain(event_rx, render_context, None))
     };
     let verify_parallel = std::cmp::min(job.targets.len().max(1), 2);
     let verifier_handles = start_verifier_workers(verify_parallel, verify_rx, event_tx.clone());
@@ -378,6 +468,663 @@ pub fn run_copy(
     drop(execution_context);
     drop(verify_tx);
     join_verifier_workers(verifier_handles, &event_tx);
+    drop(event_tx);
+
+    ui_handle.join().map_err(|_| CopyError::UiThreadPanicked)?
+}
+
+// ---------------------------------------------------------------------
+// Staged relay pipeline (U5): wires U2 (spool store), U3 (staging), and U4
+// (per-target drain lanes) into a real run. See `run_copy`'s doc comment
+// for how this stays structurally isolated from `run_copy_direct` above.
+// ---------------------------------------------------------------------
+
+/// One unique source file needing staging, carrying every target that
+/// still needs a copy of it. This is the staging analog of `TransferPlan`,
+/// which fans out one entry per (source, target) pair: staging reads the
+/// source exactly once per file regardless of how many targets need the
+/// result (R1), so plans are grouped back down to one `StagingTask` per
+/// unique source path before scheduling.
+#[derive(Debug, Clone)]
+struct StagingTask {
+    source: PathBuf,
+    size: u64,
+    /// (target index into `job.targets`, resolved destination, display name)
+    needing: Vec<(usize, PathBuf, String)>,
+}
+
+/// Groups `plans` (one entry per source/target pair, already built by
+/// planning -- unchanged) by source path into one [`StagingTask`] per
+/// unique source file. Ordered by source path (via `BTreeMap`) for
+/// deterministic scheduling.
+fn build_staging_tasks(job: &ResolvedJob, plans: &[TransferPlan]) -> Vec<StagingTask> {
+    let mut grouped: BTreeMap<PathBuf, StagingTask> = BTreeMap::new();
+    for plan in plans {
+        let Some(target_index) = job
+            .targets
+            .iter()
+            .position(|target| plan.dest.starts_with(target))
+        else {
+            continue;
+        };
+        let task = grouped
+            .entry(plan.source.clone())
+            .or_insert_with(|| StagingTask {
+                source: plan.source.clone(),
+                size: plan.size,
+                needing: Vec::new(),
+            });
+        task.needing
+            .push((target_index, plan.dest.clone(), plan.display_name.clone()));
+    }
+    grouped.into_values().collect()
+}
+
+fn is_large_staging_task(job: &ResolvedJob, task: &StagingTask) -> bool {
+    match job.transfer_policy {
+        TransferPolicy::Standard => false,
+        TransferPolicy::Adaptive {
+            large_file_threshold_bytes,
+            ..
+        } => task.size >= large_file_threshold_bytes,
+    }
+}
+
+fn staging_task_bucket(job: &ResolvedJob, task: &StagingTask) -> SizeBucket {
+    if is_large_staging_task(job, task) {
+        SizeBucket::Large
+    } else {
+        SizeBucket::Small
+    }
+}
+
+/// Adaptive-policy slot cost for one staging task: a per-source-file large
+/// task costs `large_file_slots` out of the job's `parallel` budget, a
+/// small task costs 1. Unlike `slot_cost`/`adaptive_slot_cost` (which this
+/// deliberately does not reuse -- see `run_staging_adaptive`'s doc
+/// comment), there is no per-target credit/dedupe bookkeeping here: each
+/// unique source file is already exactly one `StagingTask`.
+fn staging_slot_cost(policy: &TransferPolicy, task: &StagingTask) -> usize {
+    match policy {
+        TransferPolicy::Standard => 1,
+        TransferPolicy::Adaptive {
+            large_file_threshold_bytes,
+            large_file_slots,
+            ..
+        } => {
+            if task.size >= *large_file_threshold_bytes {
+                *large_file_slots
+            } else {
+                1
+            }
+        }
+    }
+}
+
+/// Sorts staging tasks large-before-small, mirroring `sort_adaptive_plans`'s
+/// comparison (bucket ascending, then size descending) but tie-broken on
+/// `source` rather than `dest`, since a `StagingTask` has no single
+/// destination.
+fn sort_staging_tasks(job: &ResolvedJob, mut tasks: Vec<StagingTask>) -> Vec<StagingTask> {
+    tasks.sort_by(|a, b| {
+        staging_task_bucket(job, a)
+            .cmp(&staging_task_bucket(job, b))
+            .then_with(|| b.size.cmp(&a.size))
+            .then_with(|| a.source.cmp(&b.source))
+    });
+    tasks
+}
+
+fn receiver_from_staging_tasks(tasks: Vec<StagingTask>) -> Receiver<StagingTask> {
+    let (tx, rx) = unbounded();
+    for task in tasks {
+        tx.send(task).expect("channel send should not fail");
+    }
+    rx
+}
+
+/// Run-start validation for staged mode (R11): fails fast, before the spool
+/// store is opened or any copying starts, when the spool setup can't
+/// possibly succeed. Config resolution (`resolve_staging`, U1) already
+/// created the spool directory and rejected it being inside/equal to the
+/// source or any target, so this only covers checks that need the
+/// *planned files* or live filesystem state at run time.
+fn validate_staging_before_run(
+    job: &ResolvedJob,
+    staging: &ResolvedStaging,
+    plans: &[TransferPlan],
+) -> Result<(), CopyError> {
+    let metadata =
+        fs::metadata(&staging.dir).map_err(|err| CopyError::StagingValidationFailed {
+            message: format!(
+                "spool directory {} is not usable: {err}",
+                staging.dir.display()
+            ),
+        })?;
+    if !metadata.is_dir() {
+        return Err(CopyError::StagingValidationFailed {
+            message: format!("spool path {} is not a directory", staging.dir.display()),
+        });
+    }
+
+    let largest_planned = plans.iter().map(|plan| plan.size).max().unwrap_or(0);
+
+    if let Some(cap) = staging.max_bytes
+        && largest_planned > cap
+    {
+        return Err(CopyError::StagingValidationFailed {
+            message: format!(
+                "spool capacity cap ({}) is smaller than the largest planned file ({})",
+                human_bytes(cap),
+                human_bytes(largest_planned)
+            ),
+        });
+    }
+
+    let available =
+        fs4::available_space(&staging.dir).map_err(|err| CopyError::StagingValidationFailed {
+            message: format!(
+                "failed to query available space on spool volume {}: {err}",
+                staging.dir.display()
+            ),
+        })?;
+    let fits = available
+        .checked_sub(largest_planned)
+        .is_some_and(|remaining| remaining >= staging.min_free_bytes);
+    if !fits {
+        return Err(CopyError::StagingValidationFailed {
+            message: format!(
+                "largest planned file ({}) would not fit in the spool volume's free space ({}) while keeping the configured {} minimum free",
+                human_bytes(largest_planned),
+                human_bytes(available),
+                human_bytes(staging.min_free_bytes)
+            ),
+        });
+    }
+
+    warn_if_spool_shares_device_with_a_target(staging, &job.targets, &metadata);
+
+    Ok(())
+}
+
+/// Same-device check (R11): warns rather than fails when the spool volume
+/// and a target share a device. Chosen over failing because sharing a
+/// device doesn't break correctness -- the spool copy is still
+/// independently verified and the source is still released as soon as
+/// staging completes -- it only means the spool's write amplification and a
+/// target's reads compete for the same disk's bandwidth, a
+/// performance/capacity concern better surfaced as a warning than a hard
+/// failure (this also keeps single-volume setups, including this project's
+/// own test suite, usable without extra configuration).
+#[cfg(unix)]
+fn warn_if_spool_shares_device_with_a_target(
+    staging: &ResolvedStaging,
+    targets: &[PathBuf],
+    spool_metadata: &fs::Metadata,
+) {
+    use std::os::unix::fs::MetadataExt;
+    let spool_dev = spool_metadata.dev();
+    for target in targets {
+        if let Ok(target_metadata) = fs::metadata(target)
+            && target_metadata.dev() == spool_dev
+        {
+            eprintln!(
+                "warning: spool directory {} is on the same device as target {}; staging still runs correctly but writes will compete for the same disk's bandwidth",
+                staging.dir.display(),
+                target.display()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_spool_shares_device_with_a_target(
+    _staging: &ResolvedStaging,
+    _targets: &[PathBuf],
+    _spool_metadata: &fs::Metadata,
+) {
+}
+
+/// Tracks how many planned files have reached a terminal staging outcome
+/// (R2) and fires [`WorkerEvent::SourceReleased`] exactly once, the moment
+/// every planned file has. `StageError::Reserve` failures are deliberately
+/// *not* reported here by callers -- see `stage::StageError`'s doc comment
+/// -- since nothing was reserved for them, so they're not a terminal
+/// staging outcome.
+struct StagingReleaseTracker {
+    terminal_count: AtomicUsize,
+    total: usize,
+    had_failure: AtomicBool,
+}
+
+impl StagingReleaseTracker {
+    fn new(total: usize) -> Self {
+        Self {
+            terminal_count: AtomicUsize::new(0),
+            total,
+            had_failure: AtomicBool::new(false),
+        }
+    }
+
+    /// Records one `StagingTask` reaching a terminal staging outcome.
+    /// `fetch_add`'s return value makes the exactly-once fire race-free
+    /// without a lock: only the single call whose increment lands exactly
+    /// on `total` observes the trigger condition.
+    fn note_terminal(&self, failed: bool, event_tx: &Sender<WorkerEvent>) {
+        if failed {
+            self.had_failure.store(true, Ordering::SeqCst);
+        }
+        let previous = self.terminal_count.fetch_add(1, Ordering::SeqCst);
+        if previous + 1 == self.total {
+            let _ = event_tx.send(WorkerEvent::SourceReleased {
+                had_failures: self.had_failure.load(Ordering::SeqCst),
+            });
+        }
+    }
+}
+
+/// Re-attributes a staging failure cause (whose `dest` points at a spool or
+/// temp path, not a target) to one target's actual planned destination, so
+/// the render loop's existing `failure_target_root`/`record_target_copy_failure`
+/// bookkeeping -- which matches on `failure.dest` against target roots --
+/// keeps working unmodified for staging failures.
+fn attribute_staging_failure(cause: &CopyFailure, dest: &Path) -> CopyFailure {
+    CopyFailure {
+        dest: Some(dest.to_path_buf()),
+        ..cause.clone()
+    }
+}
+
+/// Builds a systemic [`CopyFailure`] for a [`StageError::Reserve`] failure
+/// attributed to one target. Reuses the existing `Systemic` classification
+/// (per the plan's instruction not to invent a new failure channel) rather
+/// than running it through `classify_failure`, since every `Reserve`
+/// failure represents an unrecoverable capacity condition for this run
+/// (see `SpoolError`'s variants), not an ordinary I/O error to classify.
+fn staging_reserve_failure(source: &Path, dest: &Path, err: &SpoolError) -> CopyFailure {
+    CopyFailure {
+        source: source.to_path_buf(),
+        dest: Some(dest.to_path_buf()),
+        operation: CopyOperation::Reserve,
+        kind: ErrorKind::Other,
+        raw_os_error: None,
+        classification: CopyFailureClassification::Systemic,
+        message: err.to_string(),
+    }
+}
+
+/// Stages one `StagingTask` and, on success, hands a `LaneEntry` to every
+/// target lane that needs it. Shared by both the standard and adaptive
+/// staging schedulers below.
+#[allow(clippy::too_many_arguments)]
+fn run_one_staging_task(
+    worker: usize,
+    transfer_id: usize,
+    task: StagingTask,
+    spool: &SpoolStore,
+    lane_senders: &[Sender<LaneEntry>],
+    event_tx: &Sender<WorkerEvent>,
+    bucket: SizeBucket,
+    tracker: &StagingReleaseTracker,
+) {
+    let display_name = task
+        .needing
+        .first()
+        .map(|(_, _, name)| name.clone())
+        .unwrap_or_default();
+    let _ = event_tx.send(WorkerEvent::Started {
+        worker,
+        transfer_id,
+        bucket,
+        // Staging always computes the source signature in the same pass as
+        // the copy (R1); "Hashing" is the closer of the two existing
+        // labels for that combined read, distinguishing it from the pure
+        // `Copying`/`Verifying` phases the target lanes use.
+        phase: TransferRowPhase::Hashing,
+        name: display_name.clone(),
+        source: task.source.clone(),
+        dest: task.source.clone(),
+        total: task.size,
+    });
+
+    let needing_indices: Vec<usize> = task.needing.iter().map(|(idx, _, _)| *idx).collect();
+    let result = stage::stage_file(spool, &task.source, needing_indices, |copied| {
+        let _ = event_tx.send(WorkerEvent::Progress { worker, copied });
+    });
+
+    match result {
+        Ok(staged) => {
+            let _ = event_tx.send(WorkerEvent::Finished {
+                worker,
+                bucket,
+                name: display_name,
+                source: task.source.clone(),
+                dest: staged.spool_path.clone(),
+                bytes: staged.size,
+            });
+            for (target_index, dest, name) in &task.needing {
+                let entry = LaneEntry {
+                    entry_id: staged.entry_id,
+                    source: staged.source.clone(),
+                    spool_path: staged.spool_path.clone(),
+                    dest: dest.clone(),
+                    size: staged.size,
+                    signature: staged.signature,
+                    display_name: name.clone(),
+                };
+                if let Err(send_err) = lane_senders[*target_index].send(entry) {
+                    // This lane's copy worker already exited (e.g.
+                    // panicked): the entry was never handed off, so release
+                    // it directly rather than leaking spool capacity. The
+                    // lane's own panic-to-`WorkerEvent::Error` report
+                    // happens separately when its `TargetLane` is joined.
+                    spool.mark_terminal(send_err.0.entry_id, *target_index);
+                }
+            }
+            tracker.note_terminal(false, event_tx);
+        }
+        Err(StageError::Reserve(err)) => {
+            // Not a terminal staging outcome (see `StagingReleaseTracker`'s
+            // doc comment): nothing was reserved, so nothing to release,
+            // and this run-ending systemic condition is reported without
+            // advancing the release counter.
+            for (_target_index, dest, _name) in &task.needing {
+                let failure = staging_reserve_failure(&task.source, dest, &err);
+                let _ = event_tx.send(WorkerEvent::Error { worker, failure });
+            }
+        }
+        Err(StageError::Failed(failure)) => {
+            for (target_index, cause) in &failure.target_failures {
+                if let Some((_, dest, _)) =
+                    task.needing.iter().find(|(idx, _, _)| idx == target_index)
+                {
+                    let attributed = attribute_staging_failure(cause, dest);
+                    let _ = event_tx.send(WorkerEvent::Error {
+                        worker,
+                        failure: attributed,
+                    });
+                }
+            }
+            tracker.note_terminal(true, event_tx);
+        }
+    }
+}
+
+/// Standard-policy staging scheduler: a plain fixed-size worker pool
+/// draining the `StagingTask` queue, mirroring `execute_phase`'s shape
+/// (not `execute_adaptive`'s -- there is no large/small distinction to
+/// schedule around under the standard policy).
+#[allow(clippy::too_many_arguments)]
+fn run_staging_standard(
+    tasks: Vec<StagingTask>,
+    worker_count: usize,
+    spool: Arc<SpoolStore>,
+    lane_senders: Arc<Vec<Sender<LaneEntry>>>,
+    event_tx: Sender<WorkerEvent>,
+    tracker: Arc<StagingReleaseTracker>,
+    next_transfer_id: Arc<AtomicUsize>,
+) {
+    if tasks.is_empty() {
+        return;
+    }
+
+    let rx = receiver_from_staging_tasks(tasks);
+    let mut handles = Vec::new();
+    for worker in 0..worker_count {
+        let worker_rx = rx.clone();
+        let spool = Arc::clone(&spool);
+        let lane_senders = Arc::clone(&lane_senders);
+        let tx = event_tx.clone();
+        let tracker = Arc::clone(&tracker);
+        let next_transfer_id = Arc::clone(&next_transfer_id);
+        handles.push(thread::spawn(move || {
+            while let Ok(task) = worker_rx.recv() {
+                let transfer_id = next_transfer_id.fetch_add(1, Ordering::Relaxed);
+                run_one_staging_task(
+                    worker,
+                    transfer_id,
+                    task,
+                    &spool,
+                    &lane_senders,
+                    &tx,
+                    SizeBucket::Small,
+                    &tracker,
+                );
+            }
+        }));
+    }
+    drop(rx);
+
+    for (worker, handle) in handles.into_iter().enumerate() {
+        if handle.join().is_err() {
+            let _ = event_tx.send(WorkerEvent::Error {
+                worker,
+                failure: panic_failure(worker, CopyOperation::WorkerPanic),
+            });
+        }
+    }
+}
+
+/// Adaptive-policy staging scheduler: a smaller, staging-specific loop
+/// rather than a reuse of `execute_adaptive`'s machinery. `execute_adaptive`'s
+/// `active_large_sources`/`active_large_targets`/`target_lane_credits`
+/// bookkeeping exists to let multiple `TransferPlan`s that share one large
+/// source file (fanned out across targets) run in parallel without each
+/// separately paying the large-file slot cost, and to cap large files
+/// per-TARGET. Neither concern applies here: `StagingTask`s are already
+/// deduped one-per-source-file (so there's nothing to dedupe-and-share),
+/// and a `StagingTask` isn't tied to one target at all, so a per-target cap
+/// has no meaning at this layer (it still applies inside U4's lanes on the
+/// spool->target hop, not here). What's left, and what this loop reuses,
+/// is exactly: schedule large-before-small (`sort_staging_tasks`, mirroring
+/// `sort_adaptive_plans`) and cap concurrent large-file staging using
+/// `large_file_slots` out of the job's `parallel` budget
+/// (`staging_slot_cost`) -- a plain bin-packing loop over one shared budget.
+#[allow(clippy::too_many_arguments)]
+fn run_staging_adaptive(
+    job: &ResolvedJob,
+    tasks: Vec<StagingTask>,
+    worker_count: usize,
+    spool: Arc<SpoolStore>,
+    lane_senders: Arc<Vec<Sender<LaneEntry>>>,
+    event_tx: Sender<WorkerEvent>,
+    tracker: Arc<StagingReleaseTracker>,
+    next_transfer_id: Arc<AtomicUsize>,
+) {
+    if tasks.is_empty() {
+        return;
+    }
+
+    let mut pending = sort_staging_tasks(job, tasks);
+    let mut idle_workers: Vec<usize> = (0..worker_count).rev().collect();
+    let mut active = Vec::<(usize, usize, thread::JoinHandle<()>)>::new();
+    let mut active_slots = 0_usize;
+    let (done_tx, done_rx) = unbounded::<usize>();
+
+    while !pending.is_empty() || !active.is_empty() {
+        while !idle_workers.is_empty() {
+            let available = job.parallel.saturating_sub(active_slots);
+            let Some(index) = pending
+                .iter()
+                .position(|task| staging_slot_cost(&job.transfer_policy, task) <= available)
+            else {
+                break;
+            };
+
+            let task = pending.remove(index);
+            let worker = idle_workers.pop().expect("idle worker should exist");
+            let cost = staging_slot_cost(&job.transfer_policy, &task);
+            active_slots += cost;
+            let bucket = staging_task_bucket(job, &task);
+
+            let spool = Arc::clone(&spool);
+            let lane_senders = Arc::clone(&lane_senders);
+            let tx = event_tx.clone();
+            let tracker = Arc::clone(&tracker);
+            let done = done_tx.clone();
+            let next_transfer_id = Arc::clone(&next_transfer_id);
+            let handle = thread::spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let transfer_id = next_transfer_id.fetch_add(1, Ordering::Relaxed);
+                    run_one_staging_task(
+                        worker,
+                        transfer_id,
+                        task,
+                        &spool,
+                        &lane_senders,
+                        &tx,
+                        bucket,
+                        &tracker,
+                    );
+                }));
+                if outcome.is_err() {
+                    let _ = tx.send(WorkerEvent::Error {
+                        worker,
+                        failure: panic_failure(worker, CopyOperation::WorkerPanic),
+                    });
+                }
+                let _ = done.send(worker);
+            });
+            active.push((worker, cost, handle));
+        }
+
+        if active.is_empty() {
+            break;
+        }
+
+        let finished_worker = done_rx
+            .recv()
+            .expect("staging worker completion channel should stay open");
+        if let Some(index) = active
+            .iter()
+            .position(|(worker, _, _)| *worker == finished_worker)
+        {
+            let (_worker, cost, handle) = active.swap_remove(index);
+            let _ = handle.join();
+            active_slots = active_slots.saturating_sub(cost);
+            idle_workers.push(finished_worker);
+        }
+    }
+}
+
+/// Staged relay pipeline (R2, R10, R11): runs the staging lane (U3, feeding
+/// the spool) concurrently with per-target drain lanes (U4), under the
+/// job's transfer policy, and fires the source-release milestone once every
+/// planned file is staging-terminal. See `run_copy`'s doc comment for how
+/// this stays isolated from `run_copy_direct`.
+fn run_copy_staged(
+    job: &ResolvedJob,
+    staging: &ResolvedStaging,
+    plans: Vec<TransferPlan>,
+    planning_stats: PlanningStats,
+) -> Result<(), CopyError> {
+    validate_staging_before_run(job, staging, &plans)?;
+
+    let spool = Arc::new(
+        SpoolStore::open(
+            &staging.dir,
+            &job.name,
+            staging.max_bytes,
+            staging.min_free_bytes,
+        )
+        .map_err(|err| CopyError::StagingValidationFailed {
+            message: format!("failed to open spool store: {err}"),
+        })?,
+    );
+
+    let tasks = build_staging_tasks(job, &plans);
+    let total_staging_tasks = tasks.len();
+    let staging_parallel = active_worker_slots(job.parallel, tasks.len());
+    let layout = LaneWorkerLayout::new(staging_parallel, job.targets.len());
+
+    let total_bytes: u64 = plans.iter().map(|plan| plan.size).sum();
+    let task_count = plans.len();
+    let large_file_count = count_large_files(job, &plans);
+    let target_roots = Arc::new(job.targets.clone());
+    let target_results = initial_target_results(&plans, &target_roots);
+    let (event_tx, event_rx) = unbounded::<WorkerEvent>();
+    let source_root = job.source.clone();
+    let job_name = job.name.clone();
+    let target = job.primary_target().to_path_buf();
+    let use_tty = io::stdout().is_terminal();
+    let render_context = RenderContext {
+        job_name,
+        target,
+        target_count: job.targets.len(),
+        source_root,
+        task_count,
+        total_bytes,
+        planning_stats,
+        target_roots: target_roots.clone(),
+        target_results,
+    };
+    let render_spool = Some(Arc::clone(&spool));
+    let ui_handle = if use_tty {
+        thread::spawn(move || render_progress_tty(event_rx, render_context, render_spool))
+    } else {
+        print_header_lines_plain(job, task_count, total_bytes, large_file_count);
+        thread::spawn(move || render_progress_plain(event_rx, render_context, render_spool))
+    };
+
+    // Sizes `worker_states` once for the whole run (staging block plus
+    // every target lane's copy/verify block, per `LaneWorkerLayout`) before
+    // anything else is dispatched, so no later event can index past the
+    // array -- see `LaneWorkerLayout`'s doc comment. `PhaseKind::Staging`
+    // (U6) is used regardless of standard/adaptive transfer policy: unlike
+    // the direct pipeline, staged mode never fires a second `PhaseStarted`
+    // to swap phases (staging and every target lane run concurrently on
+    // one worker-id space for the whole run), so there is exactly one
+    // phase to label, and it isn't "large files"/"small files"/"adaptive"
+    // -- those describe the direct pipeline's bucket scheduling, not the
+    // staged relay this run is actually doing.
+    let _ = event_tx.send(WorkerEvent::PhaseStarted {
+        phase: PhaseKind::Staging,
+        worker_count: layout.total_workers(),
+    });
+
+    let lanes =
+        lanes::start_target_lanes(&job.targets, Arc::clone(&spool), layout, event_tx.clone());
+    let lane_senders: Arc<Vec<Sender<LaneEntry>>> =
+        Arc::new(lanes.iter().map(|lane| lane.sender().clone()).collect());
+
+    let tracker = Arc::new(StagingReleaseTracker::new(total_staging_tasks));
+    if total_staging_tasks == 0 {
+        let _ = event_tx.send(WorkerEvent::SourceReleased {
+            had_failures: false,
+        });
+    }
+    let next_transfer_id = Arc::new(AtomicUsize::new(1));
+
+    match job.transfer_policy {
+        TransferPolicy::Standard => {
+            run_staging_standard(
+                tasks,
+                staging_parallel,
+                Arc::clone(&spool),
+                Arc::clone(&lane_senders),
+                event_tx.clone(),
+                Arc::clone(&tracker),
+                next_transfer_id,
+            );
+        }
+        TransferPolicy::Adaptive { .. } => {
+            run_staging_adaptive(
+                job,
+                tasks,
+                staging_parallel,
+                Arc::clone(&spool),
+                Arc::clone(&lane_senders),
+                event_tx.clone(),
+                Arc::clone(&tracker),
+                next_transfer_id,
+            );
+        }
+    }
+    drop(lane_senders);
+
+    for lane in lanes {
+        lane.join(&event_tx);
+    }
     drop(event_tx);
 
     ui_handle.join().map_err(|_| CopyError::UiThreadPanicked)?
@@ -785,23 +1532,56 @@ fn copy_file(
     copy_result
 }
 
+// Thread-local rather than a process-wide `static Mutex`: `run_plan` calls
+// `run_after_copy_test_hook()` unconditionally on every real copy (as a
+// no-op when nothing is armed), and `cargo test` runs test functions
+// concurrently on separate OS threads. With a process-wide slot, any other
+// test doing a real copy at the wrong moment could steal or clobber the
+// hook a test armed for itself -- including before that test's own copy
+// even starts (observed in practice as a spurious `HashSource` failure
+// instead of the intended `SourceChanged` one). Every test that uses this
+// hook sets it and triggers it from the same call stack on its own thread
+// (`run_plan`/`stage_file` called directly, not via a spawned worker), so
+// thread-local storage makes cross-test interference structurally
+// impossible instead of merely unlikely.
 #[cfg(test)]
-static AFTER_COPY_TEST_HOOK: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
-
-#[cfg(test)]
-fn set_after_copy_test_hook(hook: Box<dyn FnOnce() + Send>) {
-    *AFTER_COPY_TEST_HOOK.lock().unwrap() = Some(hook);
+thread_local! {
+    static AFTER_COPY_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
-fn run_after_copy_test_hook() {
-    if let Some(hook) = AFTER_COPY_TEST_HOOK.lock().unwrap().take() {
+pub(crate) fn set_after_copy_test_hook(hook: Box<dyn FnOnce() + Send>) {
+    AFTER_COPY_TEST_HOOK.with(|cell| *cell.borrow_mut() = Some(hook));
+}
+
+#[cfg(test)]
+pub(crate) fn run_after_copy_test_hook() {
+    let hook = AFTER_COPY_TEST_HOOK.with(|cell| cell.borrow_mut().take());
+    if let Some(hook) = hook {
         hook();
     }
 }
 
 #[cfg(not(test))]
-fn run_after_copy_test_hook() {}
+pub(crate) fn run_after_copy_test_hook() {}
+
+/// Serializes tests (in `src/lanes.rs`) that use its own still-process-wide
+/// `LANE_COPY_TEST_HOOK`. [`set_after_copy_test_hook`]/[`run_after_copy_test_hook`]
+/// and `src/stage.rs`'s equivalent no longer need this guard -- both are
+/// thread-local now -- but `src/lanes.rs`'s hook fires on a spawned lane
+/// worker thread rather than the test's own thread, so it still needs a
+/// process-wide slot and this mutex to serialize concurrent users of it.
+/// Kept under this name for the existing call sites that already hold it.
+#[cfg(test)]
+static TEST_HOOK_GUARD: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn after_copy_test_hook_guard() -> std::sync::MutexGuard<'static, ()> {
+    TEST_HOOK_GUARD
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
 
 fn copy_failure(
     plan: &TransferPlan,
@@ -937,7 +1717,7 @@ fn copy_transfer_failure(
     }
 }
 
-fn panic_failure(worker: usize, operation: CopyOperation) -> CopyFailure {
+pub(crate) fn panic_failure(worker: usize, operation: CopyOperation) -> CopyFailure {
     CopyFailure {
         source: PathBuf::from(format!("<worker-{worker}>")),
         dest: None,
@@ -949,7 +1729,7 @@ fn panic_failure(worker: usize, operation: CopyOperation) -> CopyFailure {
     }
 }
 
-fn classify_failure(
+pub(crate) fn classify_failure(
     kind: ErrorKind,
     raw_os_error: Option<i32>,
     operation: CopyOperation,
@@ -978,7 +1758,7 @@ fn classify_failure(
     CopyFailureClassification::Local
 }
 
-fn temp_path_for(dest: &Path) -> PathBuf {
+pub(crate) fn temp_path_for(dest: &Path) -> PathBuf {
     dest.with_extension(format!(
         "{}.pathsync-part",
         dest.extension()
@@ -987,8 +1767,7 @@ fn temp_path_for(dest: &Path) -> PathBuf {
     ))
 }
 
-#[allow(dead_code)]
-fn source_signature_key(path: &Path) -> io::Result<SourceSignatureKey> {
+pub(crate) fn source_signature_key(path: &Path) -> io::Result<SourceSignatureKey> {
     let metadata = fs::metadata(path)?;
     Ok(SourceSignatureKey {
         path: path.to_path_buf(),
@@ -1007,8 +1786,10 @@ fn source_signature_key(path: &Path) -> io::Result<SourceSignatureKey> {
     })
 }
 
-#[allow(dead_code)]
-fn ensure_source_unchanged(path: &Path, expected: &SourceSignatureKey) -> io::Result<()> {
+pub(crate) fn ensure_source_unchanged(
+    path: &Path,
+    expected: &SourceSignatureKey,
+) -> io::Result<()> {
     let actual = source_signature_key(path)?;
     if &actual == expected {
         Ok(())
@@ -1020,8 +1801,11 @@ fn ensure_source_unchanged(path: &Path, expected: &SourceSignatureKey) -> io::Re
     }
 }
 
-#[allow(dead_code)]
-fn hash_file_xxh3_128<F>(path: &Path, size: u64, mut progress: F) -> io::Result<FileSignature>
+pub(crate) fn hash_file_xxh3_128<F>(
+    path: &Path,
+    size: u64,
+    mut progress: F,
+) -> io::Result<FileSignature>
 where
     F: FnMut(u64),
 {
@@ -1135,7 +1919,11 @@ fn source_signature_entry_result(
     }
 }
 
-fn render_progress_tty(rx: Receiver<WorkerEvent>, context: RenderContext) -> Result<(), CopyError> {
+fn render_progress_tty(
+    rx: Receiver<WorkerEvent>,
+    context: RenderContext,
+    spool: Option<Arc<SpoolStore>>,
+) -> Result<(), CopyError> {
     let term = Term::stdout();
     let glyphs = tty_glyph_set();
     let mut state = ProgressState::new(context.task_count, context.total_bytes);
@@ -1214,13 +2002,24 @@ fn render_progress_tty(rx: Receiver<WorkerEvent>, context: RenderContext) -> Res
                     worker_state.target.clear();
                     worker_state.started = None;
                     state.active_workers = state.active_workers.saturating_sub(1);
-                    report.record_copy(
-                        bucket,
-                        relative_file_label(&context.source_root, &source),
-                        bytes,
-                    );
+                    // `dest` matching a real target root means this is a
+                    // lane's own source->target (or, direct mode,
+                    // source->target) copy; no match means this is the
+                    // staged relay's source->spool hop (`dest` is a spool
+                    // path). Branching here -- rather than always calling
+                    // `record_copy` -- keeps the staging hop out of the
+                    // generic `copied_files`/large/small totals, which
+                    // otherwise double-counts alongside each target lane's
+                    // own `Finished` event for the same bytes.
                     if let Some(target) = target_root_for_dest(&dest, &context.target_roots) {
+                        report.record_copy(
+                            bucket,
+                            relative_file_label(&context.source_root, &source),
+                            bytes,
+                        );
                         report.record_target_copy(&target, bytes);
+                    } else {
+                        report.record_staged(bytes);
                     }
                     true
                 }
@@ -1281,10 +2080,19 @@ fn render_progress_tty(rx: Receiver<WorkerEvent>, context: RenderContext) -> Res
                     report.record_failure(failure.clone());
                     true
                 }
+                WorkerEvent::SourceReleased { had_failures } => {
+                    state.release = apply_source_released(state.release, had_failures);
+                    report.record_source_released(state.started.elapsed());
+                    true
+                }
             },
             Err(RecvTimeoutError::Timeout) => state.active_workers > 0,
             Err(RecvTimeoutError::Disconnected) => break,
         };
+
+        if let Some(spool) = &spool {
+            report.note_spool_used(spool.used_bytes());
+        }
 
         if should_redraw {
             let (_, columns) = term.size();
@@ -1306,6 +2114,7 @@ fn render_progress_tty(rx: Receiver<WorkerEvent>, context: RenderContext) -> Res
             &report,
             context.planning_stats.skipped_existing_files,
             context.planning_stats.skipped_existing_bytes,
+            state.release,
         ),
         glyphs,
     );
@@ -1334,6 +2143,7 @@ fn tty_glyph_set() -> GlyphSet {
 fn render_progress_plain(
     rx: Receiver<WorkerEvent>,
     context: RenderContext,
+    spool: Option<Arc<SpoolStore>>,
 ) -> Result<(), CopyError> {
     let mut state = ProgressState::new(context.task_count, context.total_bytes);
     let mut report = CopyReport {
@@ -1424,13 +2234,21 @@ fn render_progress_plain(
                 worker_state.target.clear();
                 worker_state.started = None;
                 state.active_workers = state.active_workers.saturating_sub(1);
-                report.record_copy(
-                    bucket,
-                    relative_file_label(&context.source_root, &source),
-                    bytes,
-                );
+                // See the matching comment in `render_progress_tty`: only a
+                // real target-matching `dest` is a source->target copy;
+                // otherwise this is the staging hop (spool `dest`), routed
+                // to a dedicated counter instead of the generic one to
+                // avoid double-counting alongside each lane's own
+                // `Finished` event.
                 if let Some(target) = target_root_for_dest(&dest, &context.target_roots) {
+                    report.record_copy(
+                        bucket,
+                        relative_file_label(&context.source_root, &source),
+                        bytes,
+                    );
                     report.record_target_copy(&target, bytes);
+                } else {
+                    report.record_staged(bytes);
                 }
                 println!("{worker_tag}: done: {label}");
                 println!("{}", plain_progress_line(&state.snapshot()));
@@ -1510,6 +2328,19 @@ fn render_progress_plain(
                 println!("{}", plain_progress_line(&state.snapshot()));
                 last_progress_line = Instant::now();
             }
+            WorkerEvent::SourceReleased { had_failures } => {
+                state.release = apply_source_released(state.release, had_failures);
+                report.record_source_released(state.started.elapsed());
+                if let Some(banner) = source_release_banner(state.release) {
+                    println!("{banner}");
+                }
+                println!("{}", plain_progress_line(&state.snapshot()));
+                last_progress_line = Instant::now();
+            }
+        }
+
+        if let Some(spool) = &spool {
+            report.note_spool_used(spool.used_bytes());
         }
     }
 
@@ -1686,6 +2517,7 @@ fn build_live_screen_model(
         PhaseKind::LargeFiles => "copying large files",
         PhaseKind::SmallFiles => "copying small files",
         PhaseKind::Adaptive => "copying files",
+        PhaseKind::Staging => "relaying via spool",
     };
 
     let workers = worker_states
@@ -1729,6 +2561,7 @@ fn build_live_screen_model(
             PhaseKind::LargeFiles => "LIVE / COPY-LARGE".to_string(),
             PhaseKind::SmallFiles => "LIVE / COPY-SMALL".to_string(),
             PhaseKind::Adaptive => "LIVE / COPY".to_string(),
+            PhaseKind::Staging => "LIVE / RELAY".to_string(),
         },
         summary: vec![
             SummaryMetric::new(
@@ -1769,6 +2602,7 @@ fn build_live_screen_model(
         phase_label: format!("overall  {phase_text}"),
         workers,
         target_progress: build_target_progress_rows(report, worker_states, snapshot.elapsed),
+        release_banner: source_release_banner(state.release),
     }
 }
 
@@ -1837,6 +2671,7 @@ fn build_post_run_screen_model(
     report: &CopyReport,
     skipped_existing_files: usize,
     skipped_existing_bytes: u64,
+    release: SourceReleaseState,
 ) -> PostRunScreenModel {
     let copied_count = report.copied_files.len();
     let copied_bytes = report.bytes_done;
@@ -1928,14 +2763,11 @@ fn build_post_run_screen_model(
         ));
     }
 
-    let errors = report
-        .failures
-        .iter()
-        .map(|failure| {
-            let target = failure_target_root(failure, &context.target_roots)
-                .map(|target| target_result_label(&target))
-                .or_else(|| failure.dest.as_deref().map(target_result_label))
-                .unwrap_or_else(|| "--".to_string());
+    let errors = group_failures(&report.failures)
+        .into_iter()
+        .map(|group| {
+            let target = grouped_target_label(&group.dests, &context.target_roots);
+            let failure = group.representative;
             ErrorRowModel::new(
                 target,
                 failure.operation.to_string(),
@@ -2007,7 +2839,25 @@ fn build_post_run_screen_model(
         errors,
         copied_preview_count: report.copied_files.len().min(SUMMARY_FILE_PREVIEW_LIMIT),
         copied_preview_total: report.copied_files.len(),
+        release_banner: source_release_banner(release),
+        staging: staging_summary_model(report),
     }
+}
+
+/// Builds the post-run staging summary (R12), or `None` when the run had no
+/// staging activity -- covers both direct (non-staged) runs and staged runs
+/// that planned nothing, so their post-run screens render identically to
+/// before this field existed.
+fn staging_summary_model(report: &CopyReport) -> Option<StagingSummaryModel> {
+    if report.staged_files == 0 {
+        return None;
+    }
+    Some(StagingSummaryModel {
+        staged_files: report.staged_files,
+        staged_bytes: human_bytes(report.staged_bytes),
+        peak_spool_bytes: human_bytes(report.peak_spool_bytes),
+        released_after: report.source_released_at.map(format_duration),
+    })
 }
 
 fn progress_percent(done: u64, total: u64) -> usize {
@@ -2113,7 +2963,26 @@ fn summary_lines(
         ));
     }
 
-    if !report.failures.is_empty() {
+    if report.staged_files > 0 {
+        lines.push(String::new());
+        lines.push("Staging".to_string());
+        lines.push(section_divider());
+        lines.push(count_row(
+            "Staged",
+            report.staged_files,
+            report.staged_bytes,
+        ));
+        lines.push(summary_row(
+            "Peak Spool",
+            &human_bytes(report.peak_spool_bytes),
+        ));
+        if let Some(released) = report.source_released_at {
+            lines.push(summary_row("Released At", &format_duration(released)));
+        }
+    }
+
+    let failure_groups = group_failures(&report.failures);
+    if !failure_groups.is_empty() {
         lines.push(String::new());
         lines.push("Failures".to_string());
         lines.push(section_divider());
@@ -2121,14 +2990,9 @@ fn summary_lines(
             "{:<18} {:<8} {:<28} {}",
             "Target", "Phase", "File", "Error"
         ));
-        for failure in report.failures.iter().take(SUMMARY_FAILURE_PREVIEW_LIMIT) {
-            let target = failure
-                .dest
-                .as_deref()
-                .and_then(|dest| target_root_for_dest(dest, target_roots))
-                .map(|target| target_result_label(&target))
-                .or_else(|| failure.dest.as_deref().map(target_result_label))
-                .unwrap_or_else(|| "--".to_string());
+        for group in failure_groups.iter().take(SUMMARY_FAILURE_PREVIEW_LIMIT) {
+            let target = grouped_target_label(&group.dests, target_roots);
+            let failure = group.representative;
             lines.push(format!(
                 "{:<18} {:<8} {:<28} {}",
                 truncate_right(&target, 18),
@@ -2137,12 +3001,12 @@ fn summary_lines(
                 single_line_error(&failure.message)
             ));
         }
-        if report.failures.len() > SUMMARY_FAILURE_PREVIEW_LIMIT {
+        if failure_groups.len() > SUMMARY_FAILURE_PREVIEW_LIMIT {
             lines.push(String::new());
             lines.push(format!(
                 "showing {} of {} failures",
                 SUMMARY_FAILURE_PREVIEW_LIMIT,
-                report.failures.len()
+                failure_groups.len()
             ));
         }
     }
@@ -2561,6 +3425,73 @@ fn failure_target_root(failure: &CopyFailure, targets: &[PathBuf]) -> Option<Pat
         .and_then(|dest| target_root_for_dest(dest, targets))
 }
 
+/// One presentation-level failure entry: a representative [`CopyFailure`]
+/// plus every destination it fanned out to. Built by [`group_failures`].
+struct FailureGroup<'a> {
+    representative: &'a CopyFailure,
+    dests: Vec<&'a Path>,
+}
+
+/// Groups `failures` for display (R9): a single staging failure fans out to
+/// one `WorkerEvent::Error` per affected target -- identical clones of the
+/// same underlying cause, differing only in `dest` (see
+/// `attribute_staging_failure`/`staging_reserve_failure`) -- so grouping by
+/// everything except `dest` collapses those clones back into one entry
+/// naming every affected destination. Applied at presentation time only:
+/// `report.failures` itself (and its `len()`, used for the "Failed" count
+/// and exit-code semantics) is untouched.
+///
+/// A plain linear scan rather than a hash-map index: `CopyOperation`/
+/// `ErrorKind` don't derive `Hash`, and the failure counts this runs over
+/// are small (bounded in practice by how many files a run can fail on),
+/// so the simpler O(n^2) scan is preferred over adding a derive just for
+/// this.
+fn group_failures(failures: &[CopyFailure]) -> Vec<FailureGroup<'_>> {
+    let mut groups: Vec<FailureGroup<'_>> = Vec::new();
+    for failure in failures {
+        let existing = groups.iter_mut().find(|group| {
+            group.representative.source == failure.source
+                && group.representative.operation == failure.operation
+                && group.representative.kind == failure.kind
+                && group.representative.raw_os_error == failure.raw_os_error
+                && group.representative.message == failure.message
+        });
+        match existing {
+            Some(group) => {
+                if let Some(dest) = failure.dest.as_deref() {
+                    group.dests.push(dest);
+                }
+            }
+            None => {
+                groups.push(FailureGroup {
+                    representative: failure,
+                    dests: failure.dest.as_deref().into_iter().collect(),
+                });
+            }
+        }
+    }
+    groups
+}
+
+/// Renders a [`FailureGroup`]'s destinations as one label, matching the
+/// single-failure fallback chain used elsewhere (resolved target root's
+/// label, else the raw `dest`'s label, else `"--"` when there's no `dest`
+/// at all) but joining every affected destination.
+fn grouped_target_label(dests: &[&Path], target_roots: &[PathBuf]) -> String {
+    if dests.is_empty() {
+        return "--".to_string();
+    }
+    dests
+        .iter()
+        .map(|dest| {
+            target_root_for_dest(dest, target_roots)
+                .map(|target| target_result_label(&target))
+                .unwrap_or_else(|| target_result_label(dest))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn apply_failure_classification(failure: &mut CopyFailure, permission_failures: &mut usize) {
     if failure.kind == ErrorKind::PermissionDenied {
         *permission_failures += 1;
@@ -2884,6 +3815,7 @@ mod tests {
 
     #[test]
     fn source_changed_after_copy_removes_destination_and_sends_failure() {
+        let _hook_guard = after_copy_test_hook_guard();
         let temp = TempDir::new("pathsync-source-changed-post-copy");
         let source = temp.path().join("source/photo.jpg");
         let target = temp.path().join("target");
@@ -2945,6 +3877,28 @@ mod tests {
             classify_failure(ErrorKind::QuotaExceeded, None, CopyOperation::Write),
             CopyFailureClassification::Systemic
         );
+    }
+
+    #[test]
+    fn staging_reserve_failure_is_always_systemic() {
+        // R9: spool-device exhaustion (`StageError::Reserve`) must classify
+        // as systemic. `staging_reserve_failure` sets this directly rather
+        // than routing through `classify_failure` (see its doc comment), so
+        // this is a focused test of that construction rather than a
+        // `classify_failure` case.
+        let err = SpoolError::ExceedsCapacity {
+            requested: 4_096,
+            cap: 1_024,
+        };
+        let failure = staging_reserve_failure(
+            Path::new("/source/big.jpg"),
+            Path::new("/target/big.jpg"),
+            &err,
+        );
+
+        assert_eq!(failure.classification, CopyFailureClassification::Systemic);
+        assert_eq!(failure.operation, CopyOperation::Reserve);
+        assert_eq!(failure.dest, Some(PathBuf::from("/target/big.jpg")));
     }
 
     #[test]
@@ -3453,9 +4407,11 @@ mod tests {
             target_results: BTreeMap::new(),
             failed: true,
             systemic_detected: false,
+            ..CopyReport::default()
         };
 
-        let model = build_post_run_screen_model(&context, &report, 2, 800);
+        let model =
+            build_post_run_screen_model(&context, &report, 2, 800, SourceReleaseState::Pending);
 
         assert_eq!(model.status, "ATTENTION");
         assert!(model.categories.iter().any(|row| row.label == "copied mp4"));
@@ -3533,5 +4489,435 @@ mod tests {
         assert_eq!(failure.kind, ErrorKind::BrokenPipe);
         assert_eq!(failure.raw_os_error, None);
         assert_eq!(failure.classification, CopyFailureClassification::Local);
+    }
+
+    fn staging_job(transfer_policy: TransferPolicy, targets: Vec<PathBuf>) -> ResolvedJob {
+        ResolvedJob {
+            name: "sync".to_string(),
+            source: PathBuf::from("/source"),
+            targets,
+            extensions: vec!["jpg".to_string()],
+            compare_policy: crate::policy::ComparePolicy::SizeMtime,
+            transfer_policy,
+            timezone_policy: crate::policy::TimezonePolicy::Local,
+            parallel: 4,
+            template: "{filename}".to_string(),
+            staging: None,
+        }
+    }
+
+    #[test]
+    fn build_staging_tasks_groups_plans_by_source_across_targets() {
+        let job = staging_job(
+            TransferPolicy::Standard,
+            vec![PathBuf::from("/target-a"), PathBuf::from("/target-b")],
+        );
+        let plans = vec![
+            TransferPlan {
+                source: PathBuf::from("/source/photo.jpg"),
+                dest: PathBuf::from("/target-a/photo.jpg"),
+                size: 100,
+                display_name: "photo.jpg".to_string(),
+            },
+            TransferPlan {
+                source: PathBuf::from("/source/photo.jpg"),
+                dest: PathBuf::from("/target-b/photo.jpg"),
+                size: 100,
+                display_name: "photo.jpg".to_string(),
+            },
+            TransferPlan {
+                source: PathBuf::from("/source/other.jpg"),
+                dest: PathBuf::from("/target-b/other.jpg"),
+                size: 50,
+                display_name: "other.jpg".to_string(),
+            },
+        ];
+
+        let tasks = build_staging_tasks(&job, &plans);
+
+        assert_eq!(tasks.len(), 2, "one task per unique source file");
+        let photo = tasks
+            .iter()
+            .find(|task| task.source == Path::new("/source/photo.jpg"))
+            .expect("photo.jpg task must exist");
+        assert_eq!(
+            photo.needing.len(),
+            2,
+            "photo.jpg is needed by both targets"
+        );
+        let other = tasks
+            .iter()
+            .find(|task| task.source == Path::new("/source/other.jpg"))
+            .expect("other.jpg task must exist");
+        assert_eq!(
+            other.needing.len(),
+            1,
+            "other.jpg is needed by only target-b"
+        );
+        assert_eq!(other.needing[0].0, 1, "target-b is index 1");
+    }
+
+    #[test]
+    fn sort_staging_tasks_orders_large_before_small_under_adaptive_policy() {
+        let job = staging_job(
+            TransferPolicy::Adaptive {
+                large_file_threshold_bytes: 100,
+                large_file_slots: 2,
+                max_large_per_target: 2,
+            },
+            vec![PathBuf::from("/target")],
+        );
+        let tasks = vec![
+            StagingTask {
+                source: PathBuf::from("/source/small-a.jpg"),
+                size: 40,
+                needing: vec![(
+                    0,
+                    PathBuf::from("/target/small-a.jpg"),
+                    "small-a.jpg".into(),
+                )],
+            },
+            StagingTask {
+                source: PathBuf::from("/source/large-a.jpg"),
+                size: 600,
+                needing: vec![(
+                    0,
+                    PathBuf::from("/target/large-a.jpg"),
+                    "large-a.jpg".into(),
+                )],
+            },
+            StagingTask {
+                source: PathBuf::from("/source/large-b.jpg"),
+                size: 900,
+                needing: vec![(
+                    0,
+                    PathBuf::from("/target/large-b.jpg"),
+                    "large-b.jpg".into(),
+                )],
+            },
+            StagingTask {
+                source: PathBuf::from("/source/small-b.jpg"),
+                size: 20,
+                needing: vec![(
+                    0,
+                    PathBuf::from("/target/small-b.jpg"),
+                    "small-b.jpg".into(),
+                )],
+            },
+        ];
+
+        let sorted = sort_staging_tasks(&job, tasks);
+        let sources: Vec<&str> = sorted
+            .iter()
+            .map(|task| task.source.file_name().unwrap().to_str().unwrap())
+            .collect();
+
+        // Large-before-small (bucket ascending), largest-first within a
+        // bucket (size descending), matching `sort_adaptive_plans`'s
+        // comparison.
+        assert_eq!(
+            sources,
+            vec!["large-b.jpg", "large-a.jpg", "small-a.jpg", "small-b.jpg"]
+        );
+    }
+
+    #[test]
+    fn sort_staging_tasks_orders_by_size_desc_with_all_tasks_in_one_bucket_under_standard_policy() {
+        let job = staging_job(TransferPolicy::Standard, vec![PathBuf::from("/target")]);
+        let tasks = vec![
+            StagingTask {
+                source: PathBuf::from("/source/a.jpg"),
+                size: 10,
+                needing: vec![(0, PathBuf::from("/target/a.jpg"), "a.jpg".into())],
+            },
+            StagingTask {
+                source: PathBuf::from("/source/z.jpg"),
+                size: 900,
+                needing: vec![(0, PathBuf::from("/target/z.jpg"), "z.jpg".into())],
+            },
+        ];
+
+        // Standard policy never buckets anything as large (every task ties
+        // on bucket), so ordering falls through to the same size-descending
+        // comparison `sort_adaptive_plans` uses within a bucket.
+        let sorted = sort_staging_tasks(&job, tasks);
+        assert_eq!(sorted[0].source, PathBuf::from("/source/z.jpg"));
+        assert_eq!(sorted[1].source, PathBuf::from("/source/a.jpg"));
+    }
+
+    #[test]
+    fn staging_slot_cost_matches_adaptive_large_and_small_costs() {
+        let policy = TransferPolicy::Adaptive {
+            large_file_threshold_bytes: 100,
+            large_file_slots: 3,
+            max_large_per_target: 2,
+        };
+        let large = StagingTask {
+            source: PathBuf::from("/source/large.jpg"),
+            size: 200,
+            needing: vec![(0, PathBuf::from("/target/large.jpg"), "large.jpg".into())],
+        };
+        let small = StagingTask {
+            source: PathBuf::from("/source/small.jpg"),
+            size: 10,
+            needing: vec![(0, PathBuf::from("/target/small.jpg"), "small.jpg".into())],
+        };
+
+        assert_eq!(staging_slot_cost(&policy, &large), 3);
+        assert_eq!(staging_slot_cost(&policy, &small), 1);
+        assert_eq!(staging_slot_cost(&TransferPolicy::Standard, &large), 1);
+    }
+
+    #[test]
+    fn staging_release_tracker_fires_exactly_once_when_total_reached() {
+        let (event_tx, event_rx) = unbounded::<WorkerEvent>();
+        let tracker = StagingReleaseTracker::new(2);
+
+        tracker.note_terminal(false, &event_tx);
+        assert!(
+            event_rx.try_recv().is_err(),
+            "must not fire before every planned file is terminal"
+        );
+
+        tracker.note_terminal(true, &event_tx);
+        match event_rx.try_recv().expect("release event must fire") {
+            WorkerEvent::SourceReleased { had_failures } => assert!(had_failures),
+            other => panic!("expected SourceReleased, got {other:?}"),
+        }
+        assert!(
+            event_rx.try_recv().is_err(),
+            "must fire exactly once, not once per terminal call"
+        );
+    }
+
+    /// A staging failure fanned out across targets (R9): same source,
+    /// operation, kind, raw OS error and message, differing only by `dest`
+    /// -- exactly what `attribute_staging_failure` produces per affected
+    /// target.
+    fn fanned_out_staging_failure(dest: &str) -> CopyFailure {
+        CopyFailure {
+            source: PathBuf::from("/source/bad.jpg"),
+            dest: Some(PathBuf::from(dest)),
+            operation: CopyOperation::OpenSource,
+            kind: ErrorKind::PermissionDenied,
+            raw_os_error: None,
+            classification: CopyFailureClassification::Local,
+            message: "permission denied".to_string(),
+        }
+    }
+
+    #[test]
+    fn group_failures_collapses_fanned_out_staging_failures_by_cause() {
+        let failures = vec![
+            fanned_out_staging_failure("/target-a/bad.jpg"),
+            fanned_out_staging_failure("/target-b/bad.jpg"),
+        ];
+
+        let groups = group_failures(&failures);
+
+        assert_eq!(groups.len(), 1, "one cause must produce one group");
+        assert_eq!(
+            groups[0].dests,
+            vec![
+                Path::new("/target-a/bad.jpg"),
+                Path::new("/target-b/bad.jpg")
+            ],
+            "the group must carry every affected destination, in order"
+        );
+    }
+
+    #[test]
+    fn group_failures_keeps_distinct_causes_separate() {
+        let mut different_source = fanned_out_staging_failure("/target-a/other.jpg");
+        different_source.source = PathBuf::from("/source/other.jpg");
+        let failures = vec![
+            fanned_out_staging_failure("/target-a/bad.jpg"),
+            different_source,
+        ];
+
+        let groups = group_failures(&failures);
+
+        assert_eq!(
+            groups.len(),
+            2,
+            "failures with different sources must not be collapsed together"
+        );
+    }
+
+    #[test]
+    fn grouped_target_label_joins_every_affected_destination() {
+        let target_roots = vec![PathBuf::from("/target-a"), PathBuf::from("/target-b")];
+        let dests = vec![
+            Path::new("/target-a/bad.jpg"),
+            Path::new("/target-b/bad.jpg"),
+        ];
+
+        assert_eq!(
+            grouped_target_label(&dests, &target_roots),
+            "target-a, target-b"
+        );
+    }
+
+    #[test]
+    fn summary_lines_shows_staging_stats_and_release_time_when_present() {
+        let target = PathBuf::from("/target");
+        let report = CopyReport {
+            duration: Duration::from_secs(10),
+            staged_files: 3,
+            staged_bytes: 3_000,
+            peak_spool_bytes: 2_000,
+            source_released_at: Some(Duration::from_secs(4)),
+            ..CopyReport::default()
+        };
+
+        let lines = summary_lines(
+            "demo",
+            &target,
+            Path::new("/source"),
+            &report,
+            3,
+            3_000,
+            std::slice::from_ref(&target),
+        );
+
+        assert!(lines.iter().any(|line| line == "Staging"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Staged") && line.contains("3 files"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| { line.contains("Peak Spool") && line.contains(&human_bytes(2_000)) })
+        );
+        assert!(lines.iter().any(|line| {
+            line.contains("Released At") && line.contains(&format_duration(Duration::from_secs(4)))
+        }));
+    }
+
+    #[test]
+    fn summary_lines_omits_release_time_when_staging_never_released() {
+        let target = PathBuf::from("/target");
+        let report = CopyReport {
+            duration: Duration::from_secs(10),
+            staged_files: 1,
+            staged_bytes: 1_000,
+            peak_spool_bytes: 1_000,
+            source_released_at: None,
+            ..CopyReport::default()
+        };
+
+        let lines = summary_lines(
+            "demo",
+            &target,
+            Path::new("/source"),
+            &report,
+            1,
+            1_000,
+            std::slice::from_ref(&target),
+        );
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Staged") && line.contains("1 files"))
+        );
+        assert!(!lines.iter().any(|line| line.contains("Released At")));
+    }
+
+    #[test]
+    fn summary_lines_omits_staging_section_for_direct_runs() {
+        let target = PathBuf::from("/target");
+        let report = CopyReport::default();
+
+        let lines = summary_lines(
+            "demo",
+            &target,
+            Path::new("/source"),
+            &report,
+            0,
+            0,
+            std::slice::from_ref(&target),
+        );
+
+        assert!(!lines.iter().any(|line| line == "Staging"));
+    }
+
+    fn staging_render_context() -> RenderContext {
+        RenderContext {
+            job_name: "demo".to_string(),
+            target: PathBuf::from("/target"),
+            target_count: 1,
+            source_root: PathBuf::from("/source"),
+            task_count: 1,
+            total_bytes: 1_000,
+            planning_stats: PlanningStats {
+                scanned_files: 1,
+                planned_files: 1,
+                planned_bytes: 1_000,
+                skipped_existing_files: 0,
+                skipped_existing_bytes: 0,
+            },
+            target_roots: Arc::new(vec![PathBuf::from("/target")]),
+            target_results: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn post_run_screen_model_includes_staging_summary_when_present() {
+        let context = staging_render_context();
+        let report = CopyReport {
+            staged_files: 1,
+            staged_bytes: 1_000,
+            peak_spool_bytes: 1_000,
+            source_released_at: Some(Duration::from_secs(2)),
+            ..CopyReport::default()
+        };
+
+        let model =
+            build_post_run_screen_model(&context, &report, 0, 0, SourceReleaseState::Pending);
+
+        let staging = model
+            .staging
+            .expect("staging summary must be present for a staged run");
+        assert_eq!(staging.staged_files, 1);
+        assert_eq!(staging.staged_bytes, human_bytes(1_000));
+        assert_eq!(staging.peak_spool_bytes, human_bytes(1_000));
+        assert_eq!(
+            staging.released_after,
+            Some(format_duration(Duration::from_secs(2)))
+        );
+    }
+
+    #[test]
+    fn post_run_screen_model_omits_staging_summary_when_release_pending() {
+        let context = staging_render_context();
+        let report = CopyReport {
+            staged_files: 1,
+            staged_bytes: 1_000,
+            peak_spool_bytes: 1_000,
+            source_released_at: None,
+            ..CopyReport::default()
+        };
+
+        let model =
+            build_post_run_screen_model(&context, &report, 0, 0, SourceReleaseState::Pending);
+
+        let staging = model
+            .staging
+            .expect("staging summary must still be present, just without a release time");
+        assert_eq!(staging.released_after, None);
+    }
+
+    #[test]
+    fn post_run_screen_model_omits_staging_summary_for_direct_runs() {
+        let context = staging_render_context();
+        let report = CopyReport::default();
+
+        let model =
+            build_post_run_screen_model(&context, &report, 0, 0, SourceReleaseState::Pending);
+
+        assert!(model.staging.is_none());
     }
 }

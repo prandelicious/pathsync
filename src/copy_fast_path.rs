@@ -172,6 +172,60 @@ fn copy_file_handles_manual(
     Ok(copied)
 }
 
+/// Buffered copy from `source` to `dest` that feeds every chunk it reads
+/// into `hash_chunk` as it goes, so a caller can compute a running hash in
+/// the same pass that writes the data -- one source read total, not a copy
+/// pass plus a separate hash pass.
+///
+/// Always uses the manual buffered path, never the native OS fast-path
+/// copy: the native backends (`copy_file_range`, `fcopyfile`,
+/// `CopyFileExW`) move bytes kernel-side without handing them to userspace,
+/// so they cannot feed a hasher. Staging (`src/stage.rs`) is the intended
+/// caller; the spool-to-target hop keeps using the native-preferred path
+/// above.
+pub(crate) fn copy_file_data_hashing(
+    source: &Path,
+    dest: &Path,
+    mut hash_chunk: impl FnMut(&[u8]),
+    mut progress: impl FnMut(u64),
+) -> Result<u64, CopyTransferError> {
+    let source_file = open_source_file_for_manual_copy(source)
+        .map_err(|err| CopyTransferError::io(CopyTransferOperation::OpenSource, err))?;
+    let dest_file = open_destination_file_for_manual_copy(dest)
+        .map_err(|err| CopyTransferError::io(CopyTransferOperation::CreateDestination, err))?;
+
+    let mut reader = BufReader::with_capacity(COPY_BUFFER_SIZE, source_file);
+    let mut writer = BufWriter::with_capacity(COPY_BUFFER_SIZE, dest_file);
+    let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
+    let mut copied = 0_u64;
+
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|err| CopyTransferError::io(CopyTransferOperation::ReadSource, err))?;
+        if read == 0 {
+            break;
+        }
+
+        hash_chunk(&buffer[..read]);
+        writer
+            .write_all(&buffer[..read])
+            .map_err(|err| CopyTransferError::io(CopyTransferOperation::WriteDestination, err))?;
+        copied += read as u64;
+        progress(copied);
+    }
+
+    writer
+        .flush()
+        .map_err(|err| CopyTransferError::io(CopyTransferOperation::FlushDestination, err))?;
+    writer
+        .get_ref()
+        .sync_all()
+        .map_err(|err| CopyTransferError::io(CopyTransferOperation::FlushDestination, err))?;
+
+    Ok(copied)
+}
+
 fn copy_file_data_native(
     source_file: &File,
     _source: &Path,

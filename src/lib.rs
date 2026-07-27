@@ -4,10 +4,13 @@ mod copy_fast_path;
 pub mod date;
 pub mod error;
 pub mod format;
+mod lanes;
 pub mod plan;
 pub mod policy;
 pub mod progress_format;
 pub mod progress_model;
+mod spool;
+mod stage;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,7 +21,8 @@ use plan::{FileContext, PlanBuild, PlanJob, TransferPlan};
 use progress_format::{render_live_screen, render_post_run_screen};
 use progress_model::{
     CategoryRowModel, ErrorRowModel, LiveScreenModel, PostRunScreenModel, ProgressBarModel,
-    SummaryMetric, TargetProgressRowModel, TargetResultRowModel, WorkerRowModel,
+    SourceReleaseState, SummaryMetric, TargetProgressRowModel, TargetResultRowModel,
+    WorkerRowModel, source_release_banner,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,6 +196,9 @@ fn print_jobs(config: &Config) {
             "  parallel   : {}",
             job.parallel.or(config.parallel).unwrap_or(4)
         );
+        if let Some(staging_summary) = staging_config_summary(job, config) {
+            println!("  staging    : {}", staging_summary);
+        }
         println!();
     }
 }
@@ -251,6 +258,32 @@ fn transfer_config_summary(transfer: Option<&TransferConfig>) -> String {
     }
 }
 
+fn staging_config_summary(job: &config::JobConfig, config: &Config) -> Option<String> {
+    let staging = job.staging.as_ref().or(config.staging.as_ref())?;
+    let mut parts = Vec::new();
+
+    // Show directory if present
+    if let Some(dir) = &staging.dir {
+        parts.push(format!("dir={}", dir.display()));
+    }
+
+    // Show max_gb if present
+    if let Some(max_gb) = staging.max_gb {
+        parts.push(format!("max={} GB", max_gb));
+    }
+
+    // Show min_free_gb if present
+    if let Some(min_free_gb) = staging.min_free_gb {
+        parts.push(format!("min_free={} GB", min_free_gb));
+    }
+
+    if parts.is_empty() {
+        Some("enabled (defaults)".to_string())
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
 fn preview_live_screen_model() -> LiveScreenModel {
     LiveScreenModel {
         job_name: "vlog-sync".to_string(),
@@ -297,6 +330,14 @@ fn preview_live_screen_model() -> LiveScreenModel {
             TargetProgressRowModel::new("T7", 47, "31.0 GB / 66.5 GB", "78.4 MB/s", 2),
             TargetProgressRowModel::new("Archive", 41, "27.2 GB / 66.5 GB", "64.0 MB/s", 1),
         ],
+        // Illustrates the staged relay milestone (R2) so `--preview-ui`
+        // stays reviewable without a real staged config: this canned run
+        // is "mid-copy" everywhere else, but the source-released banner
+        // doesn't depend on the rest of the snapshot, so showing it here
+        // costs nothing and needs no second canned model.
+        release_banner: source_release_banner(SourceReleaseState::Released {
+            had_failures: false,
+        }),
     }
 }
 
@@ -335,5 +376,9 @@ fn preview_post_run_screen_model() -> PostRunScreenModel {
         ],
         copied_preview_count: 20,
         copied_preview_total: 316,
+        release_banner: source_release_banner(SourceReleaseState::Released {
+            had_failures: false,
+        }),
+        staging: None,
     }
 }

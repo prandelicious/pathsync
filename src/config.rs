@@ -15,6 +15,7 @@ pub struct Config {
     pub default_job: Option<String>,
     pub parallel: Option<usize>,
     pub timezone: Option<String>,
+    pub staging: Option<StagingConfig>,
     pub jobs: BTreeMap<String, JobConfig>,
 }
 
@@ -29,7 +30,15 @@ pub struct JobConfig {
     pub transfer: Option<TransferConfig>,
     pub parallel: Option<usize>,
     pub timezone: Option<String>,
+    pub staging: Option<StagingConfig>,
     pub layout: LayoutConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StagingConfig {
+    pub dir: Option<PathBuf>,
+    pub max_gb: Option<u64>,
+    pub min_free_gb: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,6 +68,13 @@ pub struct LayoutDetailed {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedStaging {
+    pub dir: PathBuf,
+    pub max_bytes: Option<u64>,
+    pub min_free_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedJob {
     pub name: String,
     pub source: PathBuf,
@@ -69,6 +85,7 @@ pub struct ResolvedJob {
     pub timezone_policy: TimezonePolicy,
     pub parallel: usize,
     pub template: String,
+    pub staging: Option<ResolvedStaging>,
 }
 
 impl ResolvedJob {
@@ -183,6 +200,12 @@ pub fn resolve_job(
     let transfer_policy = resolve_transfer_policy(job.transfer.as_ref(), parallel)?;
     let timezone_policy =
         resolve_timezone_policy(config.timezone.as_deref(), job.timezone.as_deref())?;
+    let staging = resolve_staging(
+        job.staging.as_ref(),
+        config.staging.as_ref(),
+        &job.source,
+        &targets,
+    )?;
 
     Ok(ResolvedJob {
         name: job_name.clone(),
@@ -194,6 +217,7 @@ pub fn resolve_job(
         timezone_policy,
         parallel,
         template,
+        staging,
     })
 }
 
@@ -300,6 +324,147 @@ pub fn resolve_timezone_policy(
             value: other.to_string(),
         }),
     }
+}
+
+pub fn resolve_staging(
+    job_staging: Option<&StagingConfig>,
+    global_staging: Option<&StagingConfig>,
+    source: &Path,
+    targets: &[PathBuf],
+) -> Result<Option<ResolvedStaging>, ConfigError> {
+    // If neither job nor global staging is present, return None (backward-compatible path)
+    if job_staging.is_none() && global_staging.is_none() {
+        return Ok(None);
+    }
+
+    // Resolve dir: job overrides global, default to state directory if absent
+    let dir = job_staging
+        .and_then(|s| s.dir.as_ref())
+        .or_else(|| global_staging.and_then(|s| s.dir.as_ref()))
+        .cloned()
+        .unwrap_or_else(default_staging_dir);
+
+    // Ensure staging directory exists
+    fs::create_dir_all(&dir).map_err(|e| ConfigError::StagingDirCreationFailed {
+        path: dir.clone(),
+        source: e,
+    })?;
+
+    // Validate that dir is not inside, equal to, or contains the source
+    if paths_conflict(&dir, source) {
+        return Err(ConfigError::StagingDirConflictsWithSource {
+            message: format!(
+                "staging directory {} conflicts with source directory {}",
+                dir.display(),
+                source.display()
+            ),
+        });
+    }
+
+    // Validate that dir is not inside, equal to, or contains any target
+    for target in targets {
+        if paths_conflict(&dir, target) {
+            return Err(ConfigError::StagingDirConflictsWithTarget {
+                message: format!(
+                    "staging directory {} conflicts with target directory {}",
+                    dir.display(),
+                    target.display()
+                ),
+            });
+        }
+    }
+
+    // Resolve max_gb: job overrides global
+    let max_gb = job_staging
+        .and_then(|s| s.max_gb)
+        .or_else(|| global_staging.and_then(|s| s.max_gb));
+
+    // Reject max_gb == 0
+    if max_gb == Some(0) {
+        return Err(ConfigError::StagingMaxGbZero);
+    }
+
+    // Convert max_gb to bytes using saturating multiply (matching the pattern from transfer_policy)
+    let max_bytes = max_gb.map(|gb| gb.saturating_mul(1024 * 1024 * 1024));
+
+    // Resolve min_free_gb: job overrides global, default to 5
+    let min_free_gb = job_staging
+        .and_then(|s| s.min_free_gb)
+        .or_else(|| global_staging.and_then(|s| s.min_free_gb))
+        .unwrap_or(5);
+
+    // Convert min_free_gb to bytes
+    let min_free_bytes = min_free_gb.saturating_mul(1024 * 1024 * 1024);
+
+    Ok(Some(ResolvedStaging {
+        dir,
+        max_bytes,
+        min_free_bytes,
+    }))
+}
+
+fn default_staging_dir() -> PathBuf {
+    // Try to use XDG_STATE_HOME or dirs::state_dir() for Unix-like systems
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: use ~/Library/Application Support/pathsync/spool
+        dirs::home_dir()
+            .map(|home| home.join("Library/Application Support/pathsync/spool"))
+            .unwrap_or_else(|| PathBuf::from(".pathsync/spool"))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Linux and other Unix-like systems: try XDG_STATE_HOME first, then fall back to ~/.local/state
+        env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|home| home.join(".local/state")))
+            .map(|base| base.join("pathsync/spool"))
+            .unwrap_or_else(|| PathBuf::from(".pathsync/spool"))
+    }
+}
+
+fn paths_conflict(dir: &Path, other: &Path) -> bool {
+    // Normalize both paths to handle . and .. components
+    let dir_normalized = normalize_path(dir);
+    let other_normalized = normalize_path(other);
+
+    // Check if dir equals other
+    if dir_normalized == other_normalized {
+        return true;
+    }
+
+    // Check if dir is inside other (other is a prefix of dir)
+    if dir_normalized.starts_with(&other_normalized) {
+        return true;
+    }
+
+    // Check if other is inside dir (dir is a prefix of other)
+    if other_normalized.starts_with(&dir_normalized) {
+        return true;
+    }
+
+    false
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::CurDir => {
+                // Skip current directory references
+            }
+            _ => {
+                normalized.push(component);
+            }
+        }
+    }
+    normalized
 }
 
 pub fn layout_to_template(layout: &LayoutConfig) -> Result<String, ConfigError> {

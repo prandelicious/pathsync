@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use filetime::{FileTime, set_file_mtime};
-use pathsync::{build_transfer_plan, config};
+use pathsync::config::{ResolvedJob, ResolvedStaging};
+use pathsync::policy::{ComparePolicy, TimezonePolicy, TransferPolicy};
+use pathsync::{build_transfer_plan, build_transfer_plan_with_stats, config};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -189,6 +191,7 @@ fn preview_ui_flag_renders_canned_live_and_post_copy_screens_without_config() {
     );
     assert!(live.stdout.contains("LIVE / COPY-LARGE"));
     assert!(!live.stdout.contains("ATTENTION"));
+    assert!(live.stdout.contains("source released"));
 
     assert!(
         post.status.success(),
@@ -198,6 +201,7 @@ fn preview_ui_flag_renders_canned_live_and_post_copy_screens_without_config() {
     );
     assert!(post.stdout.contains("ATTENTION"));
     assert!(!post.stdout.contains("LIVE / COPY-LARGE"));
+    assert!(post.stdout.contains("source released"));
 
     assert!(
         all.status.success(),
@@ -207,6 +211,7 @@ fn preview_ui_flag_renders_canned_live_and_post_copy_screens_without_config() {
     );
     assert!(all.stdout.contains("LIVE / COPY-LARGE"));
     assert!(all.stdout.contains("ATTENTION"));
+    assert!(all.stdout.contains("source released"));
 }
 
 #[test]
@@ -816,11 +821,871 @@ fn planning_rejects_same_destination_collisions_without_content_dedupe() {
     }
 }
 
+/// Directly constructs a staged `ResolvedJob`, bypassing config parsing.
+/// `ResolvedStaging.max_bytes` is byte-granular, while the TOML `staging`
+/// config table only accepts whole `max_gb` (and rejects `0`), so tests
+/// that need a small/precise cap (e.g. "cap smaller than the largest
+/// planned file") build a `ResolvedJob` directly here rather than writing
+/// a config file, the same way `load_job` below already does for
+/// non-staged jobs.
+fn resolved_staged_job(
+    source: &Path,
+    targets: Vec<PathBuf>,
+    transfer_policy: TransferPolicy,
+    staging: ResolvedStaging,
+) -> ResolvedJob {
+    ResolvedJob {
+        name: "sync".to_string(),
+        source: source.to_path_buf(),
+        targets,
+        extensions: vec!["jpg".to_string()],
+        compare_policy: ComparePolicy::SizeMtime,
+        transfer_policy,
+        timezone_policy: TimezonePolicy::Local,
+        parallel: 4,
+        template: "{filename}".to_string(),
+        staging: Some(staging),
+    }
+}
+
+#[test]
+fn staged_run_with_cap_smaller_than_largest_file_fails_fast_without_partial_writes() {
+    let root = TempDir::new("pathsync-staging-cap-too-small");
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(&spool_dir).unwrap();
+    write_file(&source.join("big.jpg"), &[b'x'; 4096]);
+
+    let job = resolved_staged_job(
+        &source,
+        vec![target.clone()],
+        TransferPolicy::Standard,
+        ResolvedStaging {
+            dir: spool_dir.clone(),
+            max_bytes: Some(1024),
+            min_free_bytes: 0,
+        },
+    );
+
+    let plan_build = build_transfer_plan_with_stats(&job, false).unwrap();
+    assert_eq!(plan_build.plans.len(), 1);
+
+    let error = pathsync::copy::run_copy(&job, plan_build.plans, plan_build.stats)
+        .expect_err("run must fail fast when the cap is smaller than the largest planned file");
+    match error {
+        pathsync::error::CopyError::StagingValidationFailed { message } => {
+            assert!(
+                message.contains("capacity cap"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("expected StagingValidationFailed, got {other:?}"),
+    }
+
+    assert!(
+        !target.join("big.jpg").exists(),
+        "no partial target write must exist after fail-fast validation"
+    );
+    let spool_entries: Vec<_> = fs::read_dir(&spool_dir).unwrap().collect();
+    assert!(
+        spool_entries.is_empty(),
+        "no spool residue after fail-fast validation: {spool_entries:?}"
+    );
+}
+
+#[test]
+fn staged_run_only_drains_to_targets_that_still_need_the_file() {
+    let root = TempDir::new("pathsync-staging-compare-interplay");
+    let source = root.path().join("source");
+    let target_a = root.path().join("target-a");
+    let target_b = root.path().join("target-b");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target_a).unwrap();
+    fs::create_dir_all(&target_b).unwrap();
+    fs::create_dir_all(&spool_dir).unwrap();
+
+    let source_file = source.join("photo.jpg");
+    write_file(&source_file, b"shared-bytes");
+    let mtime = FileTime::from_unix_time(1_700_000_000, 0);
+    set_file_mtime(&source_file, mtime).unwrap();
+
+    // Pre-seed target A with an already-matching copy (same size + mtime)
+    // so planning produces no `TransferPlan` for A, only for B -- existing
+    // planning behavior (untouched by staging).
+    let existing = target_a.join("photo.jpg");
+    write_file(&existing, b"shared-bytes");
+    set_file_mtime(&existing, mtime).unwrap();
+
+    let job = resolved_staged_job(
+        &source,
+        vec![target_a.clone(), target_b.clone()],
+        TransferPolicy::Standard,
+        ResolvedStaging {
+            dir: spool_dir.clone(),
+            max_bytes: None,
+            min_free_bytes: 0,
+        },
+    );
+
+    let plan_build = build_transfer_plan_with_stats(&job, false).unwrap();
+    assert_eq!(
+        plan_build.plans.len(),
+        1,
+        "planning must skip the already-matching target A copy"
+    );
+    assert_eq!(plan_build.plans[0].dest, target_b.join("photo.jpg"));
+
+    let result = pathsync::copy::run_copy(&job, plan_build.plans, plan_build.stats);
+    assert!(result.is_ok(), "{result:?}");
+
+    assert_eq!(
+        fs::read(target_b.join("photo.jpg")).unwrap(),
+        b"shared-bytes"
+    );
+    assert_eq!(
+        fs::read(&existing).unwrap(),
+        b"shared-bytes",
+        "target A's pre-existing file must be untouched"
+    );
+
+    let spool_entries: Vec<_> = fs::read_dir(&spool_dir).unwrap().collect();
+    assert!(
+        spool_entries.is_empty(),
+        "spool run directory must be cleaned up once draining finishes: {spool_entries:?}"
+    );
+}
+
+#[test]
+fn staged_single_target_job_completes_and_reports_source_released() {
+    let root = TempDir::new("pathsync-staging-single-target");
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    write_file(&source.join("photo.jpg"), b"staged-single-target-bytes");
+
+    let config_path = root.path().join("config.toml");
+    let text = format!(
+        r#"
+default_job = "sync"
+
+[jobs.sync]
+enabled = true
+source = "{source}"
+target = "{target}"
+extensions = ["jpg"]
+compare = {{ mode = "size_mtime" }}
+transfer = {{ mode = "standard" }}
+layout = "flat"
+
+[jobs.sync.staging]
+dir = "{staging_dir}"
+max_gb = 1
+min_free_gb = 0
+"#,
+        source = source.display(),
+        target = target.display(),
+        staging_dir = spool_dir.display(),
+    );
+    fs::write(&config_path, text).unwrap();
+
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap()]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(
+        fs::read(target.join("photo.jpg")).unwrap(),
+        b"staged-single-target-bytes"
+    );
+    assert!(
+        output.stdout.contains("source released"),
+        "stdout={}",
+        output.stdout
+    );
+    assert!(output.stdout.contains("VERIFIED"));
+}
+
+#[test]
+fn staged_adaptive_run_stages_and_verifies_mixed_large_and_small_files() {
+    let root = TempDir::new("pathsync-staging-adaptive");
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    write_file(&source.join("large.jpg"), &[b'L'; 2_000_000]);
+    write_file(&source.join("small.jpg"), &[b'S'; 64]);
+
+    let config_path = root.path().join("config.toml");
+    let text = format!(
+        r#"
+default_job = "sync"
+
+[jobs.sync]
+enabled = true
+source = "{source}"
+target = "{target}"
+extensions = ["jpg"]
+compare = {{ mode = "path" }}
+transfer = {{ mode = "adaptive", large_file_threshold_mb = 1 }}
+layout = "flat"
+parallel = 2
+
+[jobs.sync.staging]
+dir = "{staging_dir}"
+max_gb = 1
+min_free_gb = 0
+"#,
+        source = source.display(),
+        target = target.display(),
+        staging_dir = spool_dir.display(),
+    );
+    fs::write(&config_path, text).unwrap();
+
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap()]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(fs::read(target.join("large.jpg")).unwrap().len(), 2_000_000);
+    assert_eq!(fs::read(target.join("small.jpg")).unwrap(), &[b'S'; 64][..]);
+    assert!(output.stdout.contains("source released"));
+    assert!(output.stdout.contains("VERIFIED"));
+}
+
+/// R2's early-release property, proved without any test-only stall hook:
+/// `run_copy` is driven here as a real subprocess (`run_pathsync`), so
+/// none of `lanes.rs`'s `#[cfg(test)]`-gated hooks are reachable (they only
+/// exist in the `pathsync` lib's own unit-test build, not the plain build
+/// this integration test's binary links against). Instead this test uses a
+/// large-enough file that draining structurally can't finish before
+/// staging does: the target lane only receives its `LaneEntry` once
+/// staging's read+hash+spool-write+read-back-verify pass is fully done
+/// (`run_one_staging_task` hands the entry to the lane, then fires the
+/// release milestone), and draining then has to redo an equally expensive
+/// copy+verify pass over the same bytes from the spool. Two full sequential
+/// I/O passes over several megabytes give ample margin over the
+/// microseconds-scale channel-send that fires the release event, so the
+/// ordering asserted below is not a close race.
+#[test]
+fn staged_run_reports_source_released_before_the_targets_own_completion_line() {
+    let root = TempDir::new("pathsync-staging-early-release");
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    write_file(&source.join("big.jpg"), &[b'x'; 8_000_000]);
+
+    let config_path = root.path().join("config.toml");
+    let text = format!(
+        r#"
+default_job = "sync"
+
+[jobs.sync]
+enabled = true
+source = "{source}"
+target = "{target}"
+extensions = ["jpg"]
+compare = {{ mode = "size_mtime" }}
+transfer = {{ mode = "standard" }}
+layout = "flat"
+
+[jobs.sync.staging]
+dir = "{staging_dir}"
+max_gb = 1
+min_free_gb = 0
+"#,
+        source = source.display(),
+        target = target.display(),
+        staging_dir = spool_dir.display(),
+    );
+    fs::write(&config_path, text).unwrap();
+
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap()]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(fs::read(target.join("big.jpg")).unwrap().len(), 8_000_000);
+
+    // `target` is the directory literally named "target" here, so
+    // `target_result_label` renders it as "target" and the per-Verified
+    // plain-output line (`plain_target_progress_lines`) reads
+    // "target target | ...". That line only ever prints when the target's
+    // lane finishes verifying a file, so its first occurrence is the
+    // target's own completion line.
+    let released_at = output.stdout.find("source released").unwrap_or_else(|| {
+        panic!("release line missing: stdout={}", output.stdout);
+    });
+    let target_done_at = output.stdout.find("target target | ").unwrap_or_else(|| {
+        panic!("target completion line missing: stdout={}", output.stdout);
+    });
+
+    assert!(
+        released_at < target_done_at,
+        "release must be reported before the target finishes draining: released_at={released_at} target_done_at={target_done_at}\nstdout={}",
+        output.stdout
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn staged_run_with_unreadable_source_reports_failure_and_still_releases() {
+    let root = TempDir::new("pathsync-staging-failure");
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    write_file(&source.join("good.jpg"), b"good-bytes");
+    let bad = source.join("bad.jpg");
+    write_file(&bad, b"bad-bytes");
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let config_path = root.path().join("config.toml");
+    let text = format!(
+        r#"
+default_job = "sync"
+
+[jobs.sync]
+enabled = true
+source = "{source}"
+target = "{target}"
+extensions = ["jpg"]
+compare = {{ mode = "path" }}
+transfer = {{ mode = "standard" }}
+layout = "flat"
+
+[jobs.sync.staging]
+dir = "{staging_dir}"
+max_gb = 1
+min_free_gb = 0
+"#,
+        source = source.display(),
+        target = target.display(),
+        staging_dir = spool_dir.display(),
+    );
+    fs::write(&config_path, text).unwrap();
+
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap()]);
+
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(
+        !output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output.stdout.contains("ATTENTION"),
+        "stdout={}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains("source released"),
+        "release milestone must still fire once every planned file is terminal: stdout={}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains("with staging failures"),
+        "release event must note the staging failure: stdout={}",
+        output.stdout
+    );
+    assert_eq!(fs::read(target.join("good.jpg")).unwrap(), b"good-bytes");
+    assert!(!target.join("bad.jpg").exists());
+}
+
+/// Regression test for the staging-hop double-count bug (U7): a staged
+/// run's `WorkerEvent::Finished` fires once for the source->spool staging
+/// hop (`dest` is a spool path) and once more per target lane's
+/// spool->target copy (`dest` is the real target path). Before the fix,
+/// the render loop's generic `copied_files`/byte totals counted all of
+/// these, inflating "Copied" by one extra (spool-path) entry per unique
+/// staged file. This asserts the exact `Breakdown` line: with 2 targets
+/// and 1 staged file, "Copied" must read exactly 2 files (one per real
+/// target copy), not 3.
+#[test]
+fn staged_multi_target_run_reports_only_real_target_copies_not_the_staging_hop() {
+    let root = TempDir::new("pathsync-staging-double-count");
+    let source = root.path().join("source");
+    let target_a = root.path().join("ta");
+    let target_b = root.path().join("tb");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target_a).unwrap();
+    fs::create_dir_all(&target_b).unwrap();
+    let contents = b"double-count-regression-bytes";
+    write_file(&source.join("photo.jpg"), contents);
+
+    let config_path = root.path().join("config.toml");
+    let text = format!(
+        r#"
+default_job = "sync"
+
+[jobs.sync]
+enabled = true
+source = "{source}"
+targets = ["{target_a}", "{target_b}"]
+extensions = ["jpg"]
+compare = {{ mode = "path" }}
+transfer = {{ mode = "standard" }}
+layout = "flat"
+
+[jobs.sync.staging]
+dir = "{staging_dir}"
+max_gb = 1
+min_free_gb = 0
+"#,
+        source = source.display(),
+        target_a = target_a.display(),
+        target_b = target_b.display(),
+        staging_dir = spool_dir.display(),
+    );
+    fs::write(&config_path, text).unwrap();
+
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap()]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(fs::read(target_a.join("photo.jpg")).unwrap(), contents);
+    assert_eq!(fs::read(target_b.join("photo.jpg")).unwrap(), contents);
+
+    let file_size = contents.len() as u64;
+    let expected_copied_line = format!(
+        "{:<12} {:>3} files   {:>10}",
+        "Copied",
+        2,
+        pathsync::format::human_bytes(file_size * 2)
+    );
+    assert!(
+        output.stdout.contains(&expected_copied_line),
+        "expected exact Copied breakdown line {expected_copied_line:?} \
+         (regression: the staging hop must not be counted as a third copy); \
+         stdout={}",
+        output.stdout
+    );
+
+    let expected_staged_line = format!(
+        "{:<12} {:>3} files   {:>10}",
+        "Staged",
+        1,
+        pathsync::format::human_bytes(file_size)
+    );
+    assert!(
+        output.stdout.contains(&expected_staged_line),
+        "expected exact Staged line {expected_staged_line:?} \
+         (one staging hop regardless of target count); stdout={}",
+        output.stdout
+    );
+
+    // Peak spool usage: only one file is ever staged in this run, so the
+    // observed peak must be exactly that file's size -- in particular, at
+    // least as large as it (a sane, non-negative reading), not zero and
+    // not some unrelated value.
+    let expected_peak_spool_line = format!(
+        "{:<12} {}",
+        "Peak Spool",
+        pathsync::format::human_bytes(file_size)
+    );
+    assert!(
+        output.stdout.contains(&expected_peak_spool_line),
+        "expected exact Peak Spool line {expected_peak_spool_line:?}; stdout={}",
+        output.stdout
+    );
+}
+
+/// R9: a single staging failure fans out to one `WorkerEvent::Error` per
+/// affected target (same cause, cloned once per target). The post-run
+/// summary must present this as one grouped failure entry naming every
+/// affected destination, not one row per target.
+#[cfg(unix)]
+#[test]
+fn staged_run_with_unreadable_source_reports_one_grouped_failure_for_both_targets() {
+    let root = TempDir::new("pathsync-staging-grouped-failure");
+    let source = root.path().join("source");
+    let target_a = root.path().join("ta");
+    let target_b = root.path().join("tb");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target_a).unwrap();
+    fs::create_dir_all(&target_b).unwrap();
+    write_file(&source.join("good.jpg"), b"good-bytes");
+    let bad = source.join("bad.jpg");
+    write_file(&bad, b"bad-bytes");
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let config_path = root.path().join("config.toml");
+    let text = format!(
+        r#"
+default_job = "sync"
+
+[jobs.sync]
+enabled = true
+source = "{source}"
+targets = ["{target_a}", "{target_b}"]
+extensions = ["jpg"]
+compare = {{ mode = "path" }}
+transfer = {{ mode = "standard" }}
+layout = "flat"
+
+[jobs.sync.staging]
+dir = "{staging_dir}"
+max_gb = 1
+min_free_gb = 0
+"#,
+        source = source.display(),
+        target_a = target_a.display(),
+        target_b = target_b.display(),
+        staging_dir = spool_dir.display(),
+    );
+    fs::write(&config_path, text).unwrap();
+
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap()]);
+
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(
+        !output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(fs::read(target_a.join("good.jpg")).unwrap(), b"good-bytes");
+    assert_eq!(fs::read(target_b.join("good.jpg")).unwrap(), b"good-bytes");
+    assert!(!target_a.join("bad.jpg").exists());
+    assert!(!target_b.join("bad.jpg").exists());
+
+    // Only the grouped Failures-section row names both targets together
+    // ("ta, tb") on the same line as the failing file; a per-target,
+    // ungrouped rendering would produce two separate "bad.jpg" rows, each
+    // naming only one target, and neither would contain both labels.
+    let grouped_lines: Vec<&str> = output
+        .stdout
+        .lines()
+        .filter(|line| line.contains("bad.jpg") && line.contains("ta, tb"))
+        .collect();
+    assert_eq!(
+        grouped_lines.len(),
+        1,
+        "expected exactly one grouped failure row naming both targets, got {grouped_lines:?}\nstdout={}",
+        output.stdout
+    );
+}
+
+/// U8 end-to-end proof that the staged relay pipeline's three objectives --
+/// source released as soon as possible, a slow target never blocks
+/// progress, integrity verified end-to-end -- hold together in one
+/// realistic multi-target scenario.
+///
+/// The "slow" lane is created structurally, not via a test hook: this test
+/// drives the compiled binary as a real subprocess (`run_pathsync`), so
+/// `lanes.rs`'s `#[cfg(test)]`-gated stall hooks aren't reachable (same
+/// constraint documented on
+/// `staged_run_reports_source_released_before_the_targets_own_completion_line`
+/// above, whose large-file technique this test follows). `target-fast`
+/// already holds a byte-identical, same-mtime copy of the large file, so
+/// `size_mtime` compare-policy planning skips it there; `target-slow` must
+/// copy and verify both the small shared file and the large file, giving it
+/// ~17x `target-fast`'s planned bytes and making it structurally finish
+/// later, with no artificial stall required.
+#[test]
+fn staged_multi_target_run_with_slow_lane_proves_release_and_integrity() {
+    let root = TempDir::new("pathsync-staging-e2e");
+    let source = root.path().join("source");
+    let target_fast = root.path().join("target-fast");
+    let target_slow = root.path().join("target-slow");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target_fast).unwrap();
+    fs::create_dir_all(&target_slow).unwrap();
+
+    let shared_bytes = vec![b's'; 512 * 1024];
+    let big_bytes = vec![b'b'; 8 * 1024 * 1024];
+    write_file(&source.join("shared.jpg"), &shared_bytes);
+    write_file(&source.join("big.jpg"), &big_bytes);
+
+    // Give the large file a distinctive mtime so the pre-seeded copy on
+    // target-fast can be made to match it exactly (size_mtime compare).
+    let big_mtime = FileTime::from_unix_time(1_700_000_100, 0);
+    set_file_mtime(source.join("big.jpg"), big_mtime).unwrap();
+
+    // Pre-seed target-fast with an already-matching copy of the large file
+    // (same size + mtime) so planning skips it there entirely -- target-fast
+    // only ever needs the small shared file; target-slow needs both.
+    let preseeded_big = target_fast.join("big.jpg");
+    write_file(&preseeded_big, &big_bytes);
+    set_file_mtime(&preseeded_big, big_mtime).unwrap();
+
+    let config_path = root.path().join("config.toml");
+    let text = format!(
+        r#"
+default_job = "sync"
+
+[jobs.sync]
+enabled = true
+source = "{source}"
+targets = ["{target_fast}", "{target_slow}"]
+extensions = ["jpg"]
+compare = {{ mode = "size_mtime" }}
+transfer = {{ mode = "standard" }}
+layout = "flat"
+
+[jobs.sync.staging]
+dir = "{staging_dir}"
+max_gb = 1
+min_free_gb = 0
+"#,
+        source = source.display(),
+        target_fast = target_fast.display(),
+        target_slow = target_slow.display(),
+        staging_dir = spool_dir.display(),
+    );
+    fs::write(&config_path, text).unwrap();
+
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap()]);
+
+    // --- Run completes with success; exit code reflects it ---
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output.stdout.contains("VERIFIED"),
+        "stdout={}",
+        output.stdout
+    );
+    assert!(
+        !output.stdout.contains("ATTENTION"),
+        "stdout={}",
+        output.stdout
+    );
+
+    // --- Full verification: every target's files present and correct ---
+    assert_eq!(
+        fs::read(target_fast.join("shared.jpg")).unwrap(),
+        shared_bytes
+    );
+    assert_eq!(
+        fs::read(target_slow.join("shared.jpg")).unwrap(),
+        shared_bytes
+    );
+    assert_eq!(fs::read(target_slow.join("big.jpg")).unwrap(), big_bytes);
+    // target-fast's pre-seeded big.jpg was skipped by planning, so this run
+    // never touched it -- still present, unchanged.
+    assert_eq!(fs::read(&preseeded_big).unwrap(), big_bytes);
+
+    let target_fast_row = format!(
+        "{:<22} {:>7} {:>7} {:>8} {:>9} {:>11}   {}",
+        "target-fast", 1, 1, 1, 0, 0, "verified"
+    );
+    let target_slow_row = format!(
+        "{:<22} {:>7} {:>7} {:>8} {:>9} {:>11}   {}",
+        "target-slow", 2, 2, 2, 0, 0, "verified"
+    );
+    assert!(
+        output.stdout.contains(&target_fast_row),
+        "expected target-fast's fully verified Target Results row {target_fast_row:?}; stdout={}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains(&target_slow_row),
+        "expected target-slow's fully verified Target Results row {target_slow_row:?}; stdout={}",
+        output.stdout
+    );
+
+    // --- Source read exactly once per file: staging-once semantics ---
+    // Direct read-count instrumentation isn't reachable through this
+    // subprocess harness (per the plan's Sources & Research notes), so this
+    // proves the same property the plan accepts as sufficient: two distinct
+    // source files are staged exactly once each, even though three real
+    // target copies happen (shared -> both targets, big -> target-slow
+    // only) -- "Staged" must read 2 files, strictly less than "Copied"'s 3.
+    let staged_bytes = shared_bytes.len() as u64 + big_bytes.len() as u64;
+    let expected_staged_line = format!(
+        "{:<12} {:>3} files   {:>10}",
+        "Staged",
+        2,
+        pathsync::format::human_bytes(staged_bytes)
+    );
+    assert!(
+        output.stdout.contains(&expected_staged_line),
+        "expected exact Staged line {expected_staged_line:?} (source read once per file); stdout={}",
+        output.stdout
+    );
+    let copied_bytes = shared_bytes.len() as u64 * 2 + big_bytes.len() as u64;
+    let expected_copied_line = format!(
+        "{:<12} {:>3} files   {:>10}",
+        "Copied",
+        3,
+        pathsync::format::human_bytes(copied_bytes)
+    );
+    assert!(
+        output.stdout.contains(&expected_copied_line),
+        "expected exact Copied line {expected_copied_line:?}; stdout={}",
+        output.stdout
+    );
+
+    // --- Source released before the slower target's own completion ---
+    // target-slow's Target Results row only reaches "verified bytes ==
+    // planned bytes" once its last file (the large one) is copied and
+    // verified; the release milestone must already have fired by then,
+    // since target-slow's lane only receives that file's `LaneEntry` after
+    // staging finishes, and release fires no earlier than that hand-off
+    // (see `run_one_staging_task` in `src/copy.rs`) plus target-slow still
+    // has a full copy+verify pass over 8MB left to do afterward -- ample
+    // margin, not a close race.
+    let released_at = output.stdout.find("source released").unwrap_or_else(|| {
+        panic!("release line missing: stdout={}", output.stdout);
+    });
+    let target_slow_total = shared_bytes.len() as u64 + big_bytes.len() as u64;
+    let target_slow_done_marker = format!(
+        "target target-slow | {0} / {0} |",
+        pathsync::format::human_bytes(target_slow_total)
+    );
+    let target_slow_done_at = output
+        .stdout
+        .find(&target_slow_done_marker)
+        .unwrap_or_else(|| {
+            panic!(
+                "target-slow completion marker {target_slow_done_marker:?} missing: stdout={}",
+                output.stdout
+            )
+        });
+    assert!(
+        released_at < target_slow_done_at,
+        "release must be reported before the slow target finishes draining: released_at={released_at} target_slow_done_at={target_slow_done_at}\nstdout={}",
+        output.stdout
+    );
+
+    // --- Spool ends up empty: no residual files after the run ---
+    let spool_entries: Vec<_> = fs::read_dir(&spool_dir).unwrap().collect();
+    assert!(
+        spool_entries.is_empty(),
+        "spool run directory must be cleaned up after the run: {spool_entries:?}"
+    );
+}
+
+/// U8 crash-orphan simulation: a stale spool run directory left behind by a
+/// crashed prior run of the same job must be cleaned up automatically the
+/// next time that job runs staged, without disturbing the new run.
+///
+/// The stale directory's lockfile names a definitely-dead pid, constructed
+/// the same way `src/spool.rs`'s own orphan-cleanup unit tests do (spawn a
+/// trivial child process and reap it, rather than guessing an "unlikely"
+/// pid number) -- reused here for the same reason: a real dead pid, not a
+/// probabilistic one.
+#[test]
+fn staged_run_cleans_up_stale_orphan_spool_directory_from_crashed_prior_run() {
+    let root = TempDir::new("pathsync-staging-orphan-cleanup");
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    let spool_dir = root.path().join("spool");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(&spool_dir).unwrap();
+    write_file(&source.join("photo.jpg"), b"orphan-cleanup-bytes");
+
+    // Pre-seed a stale sibling run directory for the same job ("sync"),
+    // mimicking a crashed prior staged run.
+    let stale_run_dir = spool_dir.join("sync-oldrun");
+    fs::create_dir_all(&stale_run_dir).unwrap();
+    let mut child = Command::new("true")
+        .spawn()
+        .expect("failed to spawn helper process");
+    let dead_pid = child.id();
+    child.wait().expect("failed to reap helper process");
+    // ".pathsync-lock" mirrors `src/spool.rs`'s private `LOCK_FILE_NAME`
+    // constant, which isn't part of the public API this integration test
+    // can import; the literal is the stable on-disk lockfile filename any
+    // spool store must recognize regardless of internal module structure.
+    fs::write(stale_run_dir.join(".pathsync-lock"), dead_pid.to_string()).unwrap();
+    fs::write(stale_run_dir.join("leftover.bin"), b"stale spool residue").unwrap();
+
+    let config_path = root.path().join("config.toml");
+    let text = format!(
+        r#"
+default_job = "sync"
+
+[jobs.sync]
+enabled = true
+source = "{source}"
+target = "{target}"
+extensions = ["jpg"]
+compare = {{ mode = "size_mtime" }}
+transfer = {{ mode = "standard" }}
+layout = "flat"
+
+[jobs.sync.staging]
+dir = "{staging_dir}"
+max_gb = 1
+min_free_gb = 0
+"#,
+        source = source.display(),
+        target = target.display(),
+        staging_dir = spool_dir.display(),
+    );
+    fs::write(&config_path, text).unwrap();
+
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap()]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(
+        fs::read(target.join("photo.jpg")).unwrap(),
+        b"orphan-cleanup-bytes"
+    );
+    assert!(
+        output.stdout.contains("source released"),
+        "stdout={}",
+        output.stdout
+    );
+
+    assert!(
+        !stale_run_dir.exists(),
+        "stale orphaned run directory from the simulated crashed run must be cleaned up"
+    );
+
+    let spool_entries: Vec<_> = fs::read_dir(&spool_dir).unwrap().collect();
+    assert!(
+        spool_entries.is_empty(),
+        "no leftover cruft (stale or this run's own directory) must remain in the spool root \
+         after a normal run: {spool_entries:?}"
+    );
+}
+
 fn load_job(source: &Path, target: &Path, compare_mode: &str) -> config::ResolvedJob {
     let config = config::Config {
         default_job: Some("sync".to_string()),
         parallel: None,
         timezone: None,
+        staging: None,
         jobs: [(
             "sync".to_string(),
             config::JobConfig {
@@ -840,6 +1705,7 @@ fn load_job(source: &Path, target: &Path, compare_mode: &str) -> config::Resolve
                 }),
                 parallel: None,
                 timezone: None,
+                staging: None,
                 layout: config::LayoutConfig::Preset("flat".to_string()),
             },
         )]
