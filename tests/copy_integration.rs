@@ -191,6 +191,9 @@ fn preview_ui_flag_renders_canned_live_and_post_copy_screens_without_config() {
         live.stderr
     );
     assert!(live.stdout.contains("LIVE / COPY-LARGE"));
+    assert!(live.stdout.contains("Active transfers"));
+    assert!(!live.stdout.contains("┌ Run "));
+    assert!(!live.stdout.contains("overall copying large files"));
     assert!(!live.stdout.contains("ATTENTION"));
     assert!(
         !live.stdout.contains("source released"),
@@ -214,6 +217,9 @@ fn preview_ui_flag_renders_canned_live_and_post_copy_screens_without_config() {
         all.stderr
     );
     assert!(all.stdout.contains("LIVE / COPY-LARGE"));
+    assert!(all.stdout.contains("Active transfers"));
+    assert!(!all.stdout.contains("┌ Run "));
+    assert!(!all.stdout.contains("overall copying large files"));
     assert!(all.stdout.contains("ATTENTION"));
     assert!(all.stdout.contains("source released"));
 

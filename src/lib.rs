@@ -20,8 +20,7 @@ use config::{CompareConfig, Config, LayoutConfig, ResolvedJob, TransferConfig};
 use error::PathsyncError;
 use plan::{FileContext, PlanBuild, PlanJob, TransferPlan};
 use progress_format::{
-    CANONICAL_WIDTH, render_live_screen_with_width, render_may4_live_screen_with_width,
-    render_post_run_screen_with_width,
+    CANONICAL_WIDTH, render_may4_live_screen_with_width, render_post_run_screen_with_width,
 };
 use progress_model::{
     CategoryRowModel, ErrorRowModel, LiveScreenModel, PostRunScreenModel, ProgressBarModel,
@@ -104,18 +103,15 @@ fn preview_terminal_width() -> usize {
 
 pub fn preview_ui_output(mode: PreviewUiMode) -> String {
     let width = preview_terminal_width();
-    let live = render_live_screen_with_width(&preview_live_screen_model(), width).join("\n");
+    let live =
+        render_may4_live_screen_with_width(&preview_may4_live_screen_model(), width).join("\n");
     let post =
         render_post_run_screen_with_width(&preview_post_run_screen_model(), width).join("\n");
 
-    let may4 =
-        render_may4_live_screen_with_width(&preview_may4_live_screen_model(), width).join("\n");
-
     match mode {
-        PreviewUiMode::Live => format!("{live}\n"),
+        PreviewUiMode::Live | PreviewUiMode::May4Live => format!("{live}\n"),
         PreviewUiMode::PostCopy => format!("{post}\n"),
         PreviewUiMode::All => format!("{live}\n\n{post}\n"),
-        PreviewUiMode::May4Live => format!("{may4}\n"),
     }
 }
 
