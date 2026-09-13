@@ -5,6 +5,7 @@ pub enum ComparePolicy {
     Path,
     PathSize,
     SizeMtime,
+    Hash,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -8,6 +8,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::file_hash;
 use crate::policy::{ComparePolicy, normalize_extensions};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,7 +224,14 @@ where
             path: Some(candidate.source.clone()),
             message: err.to_string(),
         })?;
-        if !force && should_skip_existing(job.compare_policy, &source_metadata, &candidate.dest)? {
+        if !force
+            && should_skip_existing(
+                job.compare_policy,
+                &candidate.source,
+                &source_metadata,
+                &candidate.dest,
+            )?
+        {
             stats.skipped_existing_files += 1;
             stats.skipped_existing_bytes += candidate.size;
             continue;
@@ -286,6 +294,7 @@ fn dedupe_same_source_collision_candidates(
 
 pub fn should_skip_existing(
     compare_policy: ComparePolicy,
+    source: &Path,
     source_metadata: &fs::Metadata,
     dest: &Path,
 ) -> Result<bool> {
@@ -307,6 +316,18 @@ pub fn should_skip_existing(
         ComparePolicy::SizeMtime => {
             source_metadata.len() == dest_metadata.len()
                 && file_mtime_seconds(source_metadata)? == file_mtime_seconds(&dest_metadata)?
+        }
+        ComparePolicy::Hash => {
+            source_metadata.len() == dest_metadata.len()
+                && file_hash::xxh3_128(source).map_err(|err| PlanError::Io {
+                    context: "failed to hash source file".to_string(),
+                    path: Some(source.to_path_buf()),
+                    message: err.to_string(),
+                })? == file_hash::xxh3_128(dest).map_err(|err| PlanError::Io {
+                    context: "failed to hash destination file".to_string(),
+                    path: Some(dest.to_path_buf()),
+                    message: err.to_string(),
+                })?
         }
     };
 

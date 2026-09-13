@@ -1,5 +1,7 @@
 # Pathsync Full-Width Progress UI Design
 
+> **Status (2026-09):** Canonical live-layout direction. Post-run verification-first output matches this spec. Wide live TTY still uses a right Run box (`progress_format::render_live_screen_wide`); removing it in favor of the full-width metric rows below is a tracked follow-up.
+
 ## Goal
 
 Replace the live and final side-panel layouts with a full-width terminal UI. The new layout should use the available terminal width for the run facts, active transfers, target progress, and final verification tables without a narrow right `Run` box.

@@ -455,6 +455,50 @@ parallel = 2
 }
 
 #[test]
+fn quiet_plain_output_omits_per_file_progress_but_keeps_summary() {
+    let root = TempDir::new("pathsync-progress-quiet");
+    let source = root.path().join("source");
+    let target = root.path().join("target");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    write_file(&source.join("one/photo.jpg"), &[b'a'; 256]);
+    write_file(&source.join("two/photo.jpg"), &[b'b'; 256]);
+
+    let config_path = root.path().join("config.toml");
+    let text = format!(
+        r#"
+default_job = "sync"
+
+[jobs.sync]
+enabled = true
+source = "{source}"
+target = "{target}"
+extensions = ["jpg"]
+compare = {{ mode = "path" }}
+layout = {{ kind = "template", value = "{{source_rel_dir}}/{{filename}}" }}
+parallel = 2
+"#,
+        source = source.display(),
+        target = target.display(),
+    );
+    fs::write(&config_path, text).unwrap();
+
+    let output = run_pathsync(&["--config", config_path.to_str().unwrap(), "--quiet"]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(output.stdout.contains("phase    :"));
+    assert!(output.stdout.contains("VERIFIED"));
+    assert!(!output.stdout.contains("T01:"));
+    assert!(!output.stdout.contains("done:"));
+    assert!(!output.stdout.contains("copying files |"));
+}
+
+#[test]
 fn final_summary_caps_copied_file_list_for_large_runs() {
     let root = TempDir::new("pathsync-summary-cap");
     let source = root.path().join("source");
@@ -876,8 +920,13 @@ fn staged_run_with_cap_smaller_than_largest_file_fails_fast_without_partial_writ
     let plan_build = build_transfer_plan_with_stats(&job, false).unwrap();
     assert_eq!(plan_build.plans.len(), 1);
 
-    let error = pathsync::copy::run_copy(&job, plan_build.plans, plan_build.stats)
-        .expect_err("run must fail fast when the cap is smaller than the largest planned file");
+    let error = pathsync::copy::run_copy(
+        &job,
+        plan_build.plans,
+        plan_build.stats,
+        pathsync::copy::CopyRunOptions::default(),
+    )
+    .expect_err("run must fail fast when the cap is smaller than the largest planned file");
     match error {
         pathsync::error::CopyError::StagingValidationFailed { message } => {
             assert!(
@@ -942,7 +991,12 @@ fn staged_run_only_drains_to_targets_that_still_need_the_file() {
     );
     assert_eq!(plan_build.plans[0].dest, target_b.join("photo.jpg"));
 
-    let result = pathsync::copy::run_copy(&job, plan_build.plans, plan_build.stats);
+    let result = pathsync::copy::run_copy(
+        &job,
+        plan_build.plans,
+        plan_build.stats,
+        pathsync::copy::CopyRunOptions::default(),
+    );
     assert!(result.is_ok(), "{result:?}");
 
     assert_eq!(

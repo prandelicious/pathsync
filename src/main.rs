@@ -22,6 +22,12 @@ struct Cli {
     #[arg(long, help = "Copy files even when the compare policy would skip them")]
     force: bool,
 
+    #[arg(
+        long,
+        help = "Plain output only: phase changes, release milestones, errors, and final summary"
+    )]
+    quiet: bool,
+
     #[arg(long, help = "Override the configured parallel worker count")]
     parallel: Option<usize>,
 
@@ -65,5 +71,6 @@ fn main() -> Result<()> {
         allow_disabled: cli.allow_disabled,
         extensions: cli.extensions,
         job: cli.job,
+        quiet: cli.quiet,
     })?)
 }

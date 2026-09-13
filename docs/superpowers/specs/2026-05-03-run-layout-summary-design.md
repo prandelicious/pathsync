@@ -1,5 +1,7 @@
 # Pathsync Run Layout and Summary Design
 
+> **Status (2026-09):** Live-layout portions of this spec are superseded by [2026-05-04-full-width-progress-ui-design.md](./2026-05-04-full-width-progress-ui-design.md). Verification-first summary decisions here remain in force. Wide TTY live output still renders a right Run box today; see the May 4 spec for the target full-width live layout.
+
 ## Goal
 
 Improve the interactive run layout and end-of-run summary so `pathsync` clearly shows copy activity while the run is active, then clearly proves per-target verification when the run completes.

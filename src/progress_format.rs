@@ -4,7 +4,7 @@ use std::time::Duration;
 use crate::format::{human_bytes, human_rate};
 use crate::progress_model::{
     LiveScreenModel, PostRunScreenModel, ProgressBarModel, TargetProgressRowModel, WorkerRowModel,
-    overall_message,
+    overall_message, visible_worker_rows,
 };
 pub use crate::progress_model::{PhaseKind, ProgressSnapshot, phase_label};
 
@@ -139,14 +139,8 @@ fn render_live_screen_narrow(model: &LiveScreenModel, width: usize) -> Vec<Strin
     lines.push(blank_line(width));
     lines.push(phase_line(&model.phase_label, width));
 
-    for worker in model.workers.iter().take(VISIBLE_WORKER_ROWS) {
-        lines.push(render_worker_row(worker, width));
-    }
-    for worker in model.workers.len()..VISIBLE_WORKER_ROWS {
-        lines.push(render_worker_row(
-            &WorkerRowModel::idle(worker_tag(worker)),
-            width,
-        ));
+    for worker in visible_worker_rows(&model.workers, VISIBLE_WORKER_ROWS) {
+        lines.push(render_worker_row(&worker, width));
     }
     append_target_progress_lines(&mut lines, model, width);
     lines.push(divider(width));
@@ -174,14 +168,8 @@ fn render_live_screen_wide(model: &LiveScreenModel, width: usize) -> Vec<String>
         blank_line(left_width),
         pad_to_width("Workers", left_width),
     ];
-    for worker in model.workers.iter().take(VISIBLE_WORKER_ROWS) {
-        left.push(render_worker_row(worker, left_width));
-    }
-    for worker in model.workers.len()..VISIBLE_WORKER_ROWS {
-        left.push(render_worker_row(
-            &WorkerRowModel::idle(worker_tag(worker)),
-            left_width,
-        ));
+    for worker in visible_worker_rows(&model.workers, VISIBLE_WORKER_ROWS) {
+        left.push(render_worker_row(&worker, left_width));
     }
     if !model.target_progress.is_empty() {
         left.push(blank_line(left_width));
@@ -286,10 +274,9 @@ pub fn render_post_run_screen_with_width_and_glyphs(
         progress_line(
             &model.completion_label,
             &model.completion_progress,
-            Some(&format!(
-                "{} verified   ETA {}",
+            Some(&post_run_progress_trailing(
                 metric_value(&model.summary, "Bytes"),
-                metric_value(&model.summary, "ETA")
+                metric_value(&model.summary, "ETA"),
             )),
             width,
         ),
@@ -487,12 +474,43 @@ fn progress_line(
     width: usize,
 ) -> String {
     let bar = progress_bar_string(model.percent, model.width.max(LIVE_BAR_WIDTH));
+    let prefix = format!("{label}  {bar}");
     let trailing = trailing.unwrap_or("");
     if trailing.is_empty() {
-        return pad_to_width(&format!("{label}  {bar}"), width);
+        return pad_to_width(&prefix, width);
     }
 
-    pad_to_width(&format!("{label}  {bar}   {trailing}"), width)
+    let fitted = fit_progress_trailing(&prefix, trailing, width);
+    pad_to_width(&format!("{prefix}   {fitted}"), width)
+}
+
+fn post_run_progress_trailing(bytes: &str, eta: &str) -> String {
+    if eta == "--" {
+        format!("{bytes} verified")
+    } else {
+        format!("{bytes} verified   ETA {eta}")
+    }
+}
+
+fn fit_progress_trailing(prefix: &str, trailing: &str, width: usize) -> String {
+    let max_trailing = width.saturating_sub(prefix.chars().count() + 3);
+    if trailing.chars().count() <= max_trailing {
+        return trailing.to_string();
+    }
+
+    if let Some(pos) = trailing.find("   ETA ") {
+        let without_eta = trailing[..pos].trim_end();
+        if without_eta.chars().count() <= max_trailing {
+            return without_eta.to_string();
+        }
+        let compact = without_eta.replace(" copied of ", " / ");
+        if compact.chars().count() <= max_trailing {
+            return compact;
+        }
+        return truncate_right(&compact, max_trailing);
+    }
+
+    truncate_right(trailing, max_trailing)
 }
 
 fn phase_line(label: &str, width: usize) -> String {
@@ -500,33 +518,47 @@ fn phase_line(label: &str, width: usize) -> String {
 }
 
 fn render_worker_row(worker: &WorkerRowModel, width: usize) -> String {
-    let bar_width = if width < 100 { 4 } else { WORKER_BAR_WIDTH };
-    let bar = if worker.idle {
+    let show_rate = width >= 100;
+    let show_bar = width >= 90;
+    let bar_width = if width < 110 { 4 } else { WORKER_BAR_WIDTH };
+    let bar = if !show_bar {
+        String::new()
+    } else if worker.idle {
         worker_progress_bar_string(0, bar_width)
     } else {
         worker_progress_bar_string(worker.percent, bar_width)
     };
-    let detail = if worker.time.is_empty() {
-        "--".to_string()
-    } else {
+    let rate = if show_rate && !worker.time.is_empty() {
         worker.time.clone()
+    } else {
+        String::new()
     };
     let target = if worker.target.is_empty() {
-        "--"
+        "--".to_string()
     } else {
-        &worker.target
+        worker.target.clone()
     };
     let target_width = if width < 100 { 11 } else { 14 };
-    let target = truncate_middle(target, target_width);
+    let target = truncate_middle(&target, target_width);
     let phase = worker.phase.map(|phase| phase.as_label()).unwrap_or("");
     let phase_width = if width < 100 { 8 } else { 9 };
     let size_width = if width < 100 { 6 } else { 8 };
-    let rate_width = if width < 100 { 8 } else { 10 };
+    let rate_width = if show_rate { 10 } else { 0 };
     let phase = truncate_middle(phase, phase_width);
     let size = truncate_middle(&worker.size, size_width);
-    let detail = truncate_middle(&detail, rate_width);
+    let rate = truncate_right(&rate, rate_width);
 
     let spinner = worker.spinner_frame.unwrap_or(' ');
+    let bar_segment = if show_bar {
+        format!("{}  ", bar)
+    } else {
+        String::new()
+    };
+    let rate_segment = if show_rate {
+        format!("  {:>rate_width$}", rate, rate_width = rate_width)
+    } else {
+        String::new()
+    };
     let fixed_width = spinner.to_string().chars().count()
         + 1
         + worker.worker_tag.chars().count()
@@ -534,11 +566,10 @@ fn render_worker_row(worker: &WorkerRowModel, width: usize) -> String {
         + phase_width
         + 1
         + bar.chars().count()
-        + 2
+        + if show_bar { 2 } else { 0 }
         + 2
         + size_width
-        + 2
-        + rate_width
+        + if show_rate { 2 + rate_width } else { 0 }
         + 2
         + target.chars().count();
     let max_item_width = if worker.target.is_empty() { 21 } else { 52 };
@@ -546,13 +577,11 @@ fn render_worker_row(worker: &WorkerRowModel, width: usize) -> String {
 
     pad_to_width(
         &format!(
-            "{spinner} {}  {:<phase_width$} {}  {:<item_width$}  {:>size_width$}  {:>rate_width$}  {}",
+            "{spinner} {}  {:<phase_width$} {bar_segment}{:<item_width$}  {:>size_width$}{rate_segment}  {}",
             worker.worker_tag,
             phase,
-            bar,
             truncate_middle(&worker.item, item_width),
             size,
-            detail,
             target,
             phase_width = phase_width,
             item_width = item_width
@@ -562,18 +591,23 @@ fn render_worker_row(worker: &WorkerRowModel, width: usize) -> String {
 }
 
 fn render_target_progress_row(target: &TargetProgressRowModel, width: usize) -> String {
-    let bar = progress_bar_string_with_empty(target.percent, TARGET_BAR_WIDTH, ' ');
-    pad_to_width(
-        &format!(
+    let bar_width = if width < 90 { 16 } else { TARGET_BAR_WIDTH };
+    let bar = progress_bar_string_with_empty(target.percent, bar_width, ' ');
+    let label = truncate_middle(&target.target, 10);
+    let bytes = truncate_middle(&target.bytes, if width < 90 { 14 } else { 18 });
+
+    let line = if width < 85 {
+        format!("{:<10} {}  {}", label, bar, bytes)
+    } else if width < 100 {
+        format!("{:<10} {}  {:<14} {:>10}", label, bar, bytes, target.rate)
+    } else {
+        format!(
             "{:<10} {}  {:<18} {:>10}   {} active",
-            truncate_middle(&target.target, 10),
-            bar,
-            truncate_middle(&target.bytes, 18),
-            target.rate,
-            target.active_workers,
-        ),
-        width,
-    )
+            label, bar, bytes, target.rate, target.active_workers
+        )
+    };
+
+    pad_to_width(&line, width)
 }
 
 fn render_category_row(category: &crate::progress_model::CategoryRowModel, width: usize) -> String {
