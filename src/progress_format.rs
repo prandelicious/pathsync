@@ -148,6 +148,69 @@ fn render_live_screen_narrow(model: &LiveScreenModel, width: usize) -> Vec<Strin
     lines
 }
 
+pub fn render_may4_live_screen_with_width(model: &LiveScreenModel, width: usize) -> Vec<String> {
+    render_may4_live_screen_with_width_and_glyphs(model, width, GlyphSet::Unicode)
+}
+
+pub fn render_may4_live_screen_with_width_and_glyphs(
+    model: &LiveScreenModel,
+    width: usize,
+    glyphs: GlyphSet,
+) -> Vec<String> {
+    let width = width.max(CANONICAL_WIDTH);
+    apply_glyphs(render_may4_live_screen(model, width), glyphs)
+}
+
+fn render_may4_live_screen(model: &LiveScreenModel, width: usize) -> Vec<String> {
+    let mut lines = vec![
+        header_line(&model.job_name, &model.status, width),
+        divider(width),
+    ];
+    lines.extend(release_banner_lines(&model.release_banner, width));
+    lines.push(pad_to_width(&may4_primary_metrics_row(model, width), width));
+    lines.push(pad_to_width(
+        &may4_secondary_metrics_row(model, width),
+        width,
+    ));
+    lines.push(blank_line(width));
+    lines.push(pad_to_width(&may4_phase_title(&model.phase_label), width));
+    let bar = progress_bar_string(
+        model.overall_progress.percent,
+        model.overall_progress.width.max(LIVE_BAR_WIDTH),
+    );
+    lines.push(pad_to_width(
+        &format!(
+            "{}   {}",
+            bar,
+            may4_progress_bytes_text(metric_value(&model.summary, "Bytes"))
+        ),
+        width,
+    ));
+    lines.push(blank_line(width));
+    lines.push(pad_to_width("Active transfers", width));
+    for worker in visible_worker_rows(&model.workers, VISIBLE_WORKER_ROWS) {
+        lines.extend(render_may4_transfer_row(&worker, width));
+    }
+    if !model.target_progress.is_empty() {
+        lines.push(blank_line(width));
+        lines.push(pad_to_width("Targets", width));
+        for target in model.target_progress.iter().take(VISIBLE_TARGET_ROWS) {
+            lines.push(render_may4_target_progress_row(target, width));
+        }
+        if model.target_progress.len() > VISIBLE_TARGET_ROWS {
+            lines.push(pad_to_width(
+                &format!(
+                    "... {} more targets",
+                    model.target_progress.len() - VISIBLE_TARGET_ROWS
+                ),
+                width,
+            ));
+        }
+    }
+    lines.push(divider(width));
+    lines
+}
+
 fn render_live_screen_wide(model: &LiveScreenModel, width: usize) -> Vec<String> {
     let left_width = width.saturating_sub(WIDE_STATS_BOX_WIDTH + WIDE_LAYOUT_GUTTER);
     let mut lines = vec![
@@ -665,6 +728,487 @@ fn filled_cells(percent: usize, width: usize) -> usize {
 
     let rounded = ((percent * width) + 50) / 100;
     rounded.clamp(0, width.saturating_sub(1))
+}
+
+fn may4_primary_metrics_row(model: &LiveScreenModel, width: usize) -> String {
+    let bytes = compact_bytes_range(metric_value(&model.summary, "Bytes"));
+    let percent = model.overall_progress.percent;
+    let rate = metric_value(&model.summary, "Rate");
+    let eta = metric_value(&model.summary, "ETA");
+    let copied = metric_value(&model.summary, "Copied");
+    let verified = metric_value(&model.summary, "Verified");
+    let failed = metric_value(&model.summary, "Failed");
+
+    let variants = vec![
+        format!(
+            "{}   {}%   {}   ETA {}   copied {}   verified {}   failed {}",
+            bytes, percent, rate, eta, copied, verified, failed
+        ),
+        format!(
+            "{}   {}%   {}   ETA {}   copied {}   verified {}",
+            bytes, percent, rate, eta, copied, verified
+        ),
+        format!(
+            "{}   {}%   {}   copied {}   verified {}",
+            bytes, percent, rate, copied, verified
+        ),
+        format!("{}   {}%   {}   copied {}", bytes, percent, rate, copied),
+        format!("{}   {}%", bytes, percent),
+    ];
+    fit_first_variant(&variants, width)
+}
+
+fn may4_secondary_metrics_row(model: &LiveScreenModel, width: usize) -> String {
+    let scanned = metric_value(&model.summary, "Scanned");
+    let planned = metric_value(&model.summary, "Planned");
+    let failed = metric_value(&model.summary, "Failed");
+    let elapsed = metric_value(&model.summary, "Elapsed");
+    let targets = metric_value(&model.summary, "Targets");
+
+    let variants = vec![
+        format!(
+            "scanned {}     planned {}         failed {}     elapsed {}   targets {}",
+            scanned, planned, failed, elapsed, targets
+        ),
+        format!(
+            "scanned {}   planned {}   failed {}   elapsed {}   targets {}",
+            scanned, planned, failed, elapsed, targets
+        ),
+        format!(
+            "scanned {}   planned {}   elapsed {}   targets {}",
+            scanned, planned, elapsed, targets
+        ),
+        format!(
+            "scanned {}   planned {}   targets {}",
+            scanned, planned, targets
+        ),
+    ];
+    fit_first_variant(&variants, width)
+}
+
+fn may4_phase_title(phase_label: &str) -> String {
+    let title = phase_label.strip_prefix("overall ").unwrap_or(phase_label);
+    let mut chars = title.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+fn may4_progress_bytes_text(bytes_metric: &str) -> String {
+    bytes_metric.replace(" / ", " of ")
+}
+
+fn compact_bytes_range(bytes_metric: &str) -> String {
+    let parts: Vec<&str> = bytes_metric.split(" / ").collect();
+    if parts.len() != 2 {
+        return bytes_metric.to_string();
+    }
+
+    let left = parts[0].split_whitespace().next().unwrap_or(parts[0]);
+    format!("{} / {}", left, parts[1])
+}
+
+fn fit_first_variant(variants: &[String], width: usize) -> String {
+    for variant in variants {
+        if variant.chars().count() <= width {
+            return variant.clone();
+        }
+    }
+    truncate_right(variants.last().map(String::as_str).unwrap_or(""), width)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferFieldId {
+    Worker,
+    Phase,
+    Filename,
+    Size,
+    Rate,
+    Destination,
+}
+
+impl TransferFieldId {
+    fn index(self) -> usize {
+        match self {
+            Self::Worker => 0,
+            Self::Phase => 1,
+            Self::Filename => 2,
+            Self::Size => 3,
+            Self::Rate => 4,
+            Self::Destination => 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FieldSpec {
+    id: TransferFieldId,
+    min: usize,
+    preferred: usize,
+    max: usize,
+    /// lower = keep first
+    priority: u8,
+    required_for_oneline: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferRowMode {
+    OneLine,
+    Stacked,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FieldAllocation {
+    mode: TransferRowMode,
+    widths: [usize; FIELD_COUNT],
+}
+
+impl FieldAllocation {
+    fn width(self, id: TransferFieldId) -> usize {
+        self.widths[id.index()]
+    }
+}
+
+const FIELD_COUNT: usize = 6;
+const FILENAME_MIN: usize = 12;
+const FILENAME_MAX: usize = 72;
+const PHASE_WIDTH: usize = 9;
+const SIZE_PREFERRED: usize = 8;
+const SIZE_MAX: usize = 12;
+const RATE_PREFERRED: usize = 10;
+const RATE_MAX: usize = 12;
+const DESTINATION_MAX: usize = 24;
+const ONE_LINE_SEPARATORS_WITHOUT_RATE: usize = 10;
+const ONE_LINE_RATE_SEPARATOR: usize = 2;
+const STACK_LINE1_SEPARATORS: usize = 6;
+const STACK_INDENT: usize = 9;
+const STACK_LINE2_GAPS: usize = 7;
+
+fn transfer_field_specs(worker: &WorkerRowModel) -> [FieldSpec; FIELD_COUNT] {
+    let worker_len = worker.worker_tag.chars().count().max(1);
+    let filename_len = worker.item.chars().count();
+    let filename_min = filename_len
+        .min(FILENAME_MAX)
+        .max(filename_len.min(FILENAME_MIN));
+    let size_len = worker.size.chars().count().max(1);
+    let rate_len = worker.time.chars().count().max(1);
+    let dest_len = if worker.target.is_empty() {
+        2
+    } else {
+        worker.target.chars().count().max(1)
+    }
+    .min(DESTINATION_MAX);
+
+    [
+        FieldSpec {
+            id: TransferFieldId::Worker,
+            min: worker_len,
+            preferred: worker_len,
+            max: worker_len,
+            priority: 0,
+            required_for_oneline: true,
+        },
+        FieldSpec {
+            id: TransferFieldId::Phase,
+            min: PHASE_WIDTH,
+            preferred: PHASE_WIDTH,
+            max: PHASE_WIDTH,
+            priority: 1,
+            required_for_oneline: true,
+        },
+        FieldSpec {
+            id: TransferFieldId::Filename,
+            min: filename_min,
+            preferred: filename_len.min(FILENAME_MAX).max(filename_min),
+            max: FILENAME_MAX,
+            priority: 4,
+            required_for_oneline: true,
+        },
+        FieldSpec {
+            id: TransferFieldId::Size,
+            min: size_len,
+            preferred: size_len.max(SIZE_PREFERRED),
+            max: SIZE_MAX,
+            priority: 3,
+            required_for_oneline: true,
+        },
+        FieldSpec {
+            id: TransferFieldId::Rate,
+            min: rate_len,
+            preferred: rate_len.max(RATE_PREFERRED),
+            max: RATE_MAX,
+            priority: 5,
+            required_for_oneline: false,
+        },
+        FieldSpec {
+            id: TransferFieldId::Destination,
+            min: dest_len,
+            preferred: dest_len,
+            max: DESTINATION_MAX,
+            priority: 2,
+            required_for_oneline: true,
+        },
+    ]
+}
+
+fn spec_for(specs: &[FieldSpec; FIELD_COUNT], id: TransferFieldId) -> FieldSpec {
+    specs[id.index()]
+}
+
+fn grow_width(current: usize, remaining: usize, target: usize) -> (usize, usize) {
+    let add = target.saturating_sub(current).min(remaining);
+    (current + add, remaining - add)
+}
+
+fn allocate(specs: &[FieldSpec; FIELD_COUNT], width: usize) -> FieldAllocation {
+    let required_min: usize = specs
+        .iter()
+        .filter(|spec| spec.required_for_oneline)
+        .map(|spec| spec.min)
+        .sum();
+    let one_line_min = required_min + ONE_LINE_SEPARATORS_WITHOUT_RATE;
+    if one_line_min > width {
+        return allocate_stacked(specs, width);
+    }
+
+    let mut widths = [0usize; FIELD_COUNT];
+    for spec in specs {
+        if spec.required_for_oneline {
+            widths[spec.id.index()] = spec.min;
+        }
+    }
+
+    let mut remaining = width - one_line_min;
+    let filename = spec_for(specs, TransferFieldId::Filename);
+    let destination = spec_for(specs, TransferFieldId::Destination);
+    let size = spec_for(specs, TransferFieldId::Size);
+    let phase = spec_for(specs, TransferFieldId::Phase);
+
+    (widths[filename.id.index()], remaining) =
+        grow_width(widths[filename.id.index()], remaining, filename.preferred);
+    (widths[destination.id.index()], remaining) = grow_width(
+        widths[destination.id.index()],
+        remaining,
+        destination.preferred,
+    );
+
+    let mut optional: Vec<FieldSpec> = specs
+        .iter()
+        .copied()
+        .filter(|spec| !spec.required_for_oneline)
+        .collect();
+    optional.sort_by_key(|spec| spec.priority);
+    for spec in optional {
+        let needed = spec.min + ONE_LINE_RATE_SEPARATOR;
+        if remaining >= needed {
+            remaining -= needed;
+            widths[spec.id.index()] = spec.min;
+            (widths[spec.id.index()], remaining) =
+                grow_width(widths[spec.id.index()], remaining, spec.preferred);
+        }
+    }
+
+    (widths[filename.id.index()], remaining) =
+        grow_width(widths[filename.id.index()], remaining, filename.max);
+    (widths[destination.id.index()], remaining) =
+        grow_width(widths[destination.id.index()], remaining, destination.max);
+
+    let rate_idx = TransferFieldId::Rate.index();
+    if widths[rate_idx] > 0 {
+        let rate = spec_for(specs, TransferFieldId::Rate);
+        (widths[rate_idx], remaining) = grow_width(widths[rate_idx], remaining, rate.max);
+    }
+
+    (widths[phase.id.index()], remaining) =
+        grow_width(widths[phase.id.index()], remaining, phase.preferred);
+    (widths[size.id.index()], remaining) = grow_width(widths[size.id.index()], remaining, size.max);
+
+    debug_assert_eq!(
+        remaining,
+        width.saturating_sub(one_line_occupancy(&widths)),
+        "one-line allocation must reserve separators before padding"
+    );
+    FieldAllocation {
+        mode: TransferRowMode::OneLine,
+        widths,
+    }
+}
+
+fn one_line_occupancy(widths: &[usize; FIELD_COUNT]) -> usize {
+    let rate = widths[TransferFieldId::Rate.index()];
+    let rate_part = if rate > 0 {
+        ONE_LINE_RATE_SEPARATOR + rate
+    } else {
+        0
+    };
+    ONE_LINE_SEPARATORS_WITHOUT_RATE
+        + widths[TransferFieldId::Worker.index()]
+        + widths[TransferFieldId::Phase.index()]
+        + widths[TransferFieldId::Filename.index()]
+        + widths[TransferFieldId::Size.index()]
+        + widths[TransferFieldId::Destination.index()]
+        + rate_part
+}
+
+fn allocate_stacked(specs: &[FieldSpec; FIELD_COUNT], width: usize) -> FieldAllocation {
+    let worker = spec_for(specs, TransferFieldId::Worker);
+    let phase = spec_for(specs, TransferFieldId::Phase);
+    let filename = spec_for(specs, TransferFieldId::Filename);
+    let size = spec_for(specs, TransferFieldId::Size);
+    let rate = spec_for(specs, TransferFieldId::Rate);
+    let destination = spec_for(specs, TransferFieldId::Destination);
+
+    let mut widths = [0usize; FIELD_COUNT];
+    widths[worker.id.index()] = worker.min;
+    widths[phase.id.index()] = phase.min.min(phase.max);
+    let filename_budget = width.saturating_sub(
+        STACK_LINE1_SEPARATORS + widths[worker.id.index()] + widths[phase.id.index()],
+    );
+    widths[filename.id.index()] = filename_budget
+        .min(filename.max)
+        .max(1.min(filename_budget));
+
+    widths[size.id.index()] = size.preferred.min(size.max);
+    widths[rate.id.index()] = rate.preferred.min(rate.max);
+    let dest_budget = width.saturating_sub(
+        STACK_INDENT + STACK_LINE2_GAPS + widths[size.id.index()] + widths[rate.id.index()],
+    );
+    widths[destination.id.index()] = dest_budget.min(destination.max).max(1.min(dest_budget));
+
+    FieldAllocation {
+        mode: TransferRowMode::Stacked,
+        widths,
+    }
+}
+
+fn transfer_destination(worker: &WorkerRowModel) -> &str {
+    if worker.target.is_empty() {
+        "--"
+    } else {
+        &worker.target
+    }
+}
+
+fn render_may4_transfer_row(worker: &WorkerRowModel, width: usize) -> Vec<String> {
+    if worker.idle {
+        return vec![pad_to_width(
+            &format!(
+                "  {}           idle                          --       --          --",
+                worker.worker_tag
+            ),
+            width,
+        )];
+    }
+
+    let specs = transfer_field_specs(worker);
+    let alloc = allocate(&specs, width);
+    match alloc.mode {
+        TransferRowMode::OneLine => vec![render_may4_transfer_oneline(worker, alloc, width)],
+        TransferRowMode::Stacked => render_may4_transfer_stacked(worker, alloc, width),
+    }
+}
+
+fn render_may4_transfer_oneline(
+    worker: &WorkerRowModel,
+    alloc: FieldAllocation,
+    width: usize,
+) -> String {
+    let spinner = worker.spinner_frame.unwrap_or(' ');
+    let phase = worker
+        .phase
+        .map(|phase| phase.as_label())
+        .unwrap_or("copying");
+    let worker_width = alloc.width(TransferFieldId::Worker);
+    let phase_width = alloc.width(TransferFieldId::Phase);
+    let filename_width = alloc.width(TransferFieldId::Filename);
+    let size_width = alloc.width(TransferFieldId::Size);
+    let rate_width = alloc.width(TransferFieldId::Rate);
+    let dest_width = alloc.width(TransferFieldId::Destination);
+    let rate_segment = if rate_width > 0 {
+        format!(
+            "  {:>rate_width$}",
+            truncate_right(&worker.time, rate_width),
+            rate_width = rate_width
+        )
+    } else {
+        String::new()
+    };
+
+    pad_to_width(
+        &format!(
+            "{spinner} {:<worker_width$}  {:<phase_width$}  {:<filename_width$}  {:>size_width$}{rate_segment}  {:<dest_width$}",
+            worker.worker_tag,
+            truncate_middle(phase, phase_width),
+            truncate_middle(&worker.item, filename_width),
+            truncate_middle(&worker.size, size_width),
+            truncate_middle(transfer_destination(worker), dest_width),
+            worker_width = worker_width,
+            phase_width = phase_width,
+            filename_width = filename_width,
+            dest_width = dest_width
+        ),
+        width,
+    )
+}
+
+fn render_may4_transfer_stacked(
+    worker: &WorkerRowModel,
+    alloc: FieldAllocation,
+    width: usize,
+) -> Vec<String> {
+    let spinner = worker.spinner_frame.unwrap_or(' ');
+    let phase = worker
+        .phase
+        .map(|phase| phase.as_label())
+        .unwrap_or("copying");
+    let worker_width = alloc.width(TransferFieldId::Worker);
+    let phase_width = alloc.width(TransferFieldId::Phase);
+    let filename_width = alloc.width(TransferFieldId::Filename);
+    let size_width = alloc.width(TransferFieldId::Size);
+    let rate_width = alloc.width(TransferFieldId::Rate);
+    let dest_width = alloc.width(TransferFieldId::Destination);
+
+    let line1 = format!(
+        "{spinner} {:<worker_width$}  {:<phase_width$}  {:<filename_width$}",
+        worker.worker_tag,
+        truncate_middle(phase, phase_width),
+        truncate_middle(&worker.item, filename_width),
+        worker_width = worker_width,
+        phase_width = phase_width,
+        filename_width = filename_width
+    );
+    let line2 = format!(
+        "{}{:>size_width$}   {:>rate_width$}  → {}",
+        " ".repeat(STACK_INDENT),
+        truncate_middle(&worker.size, size_width),
+        truncate_right(&worker.time, rate_width),
+        truncate_middle(transfer_destination(worker), dest_width),
+        size_width = size_width,
+        rate_width = rate_width
+    );
+
+    vec![pad_to_width(&line1, width), pad_to_width(&line2, width)]
+}
+
+fn render_may4_target_progress_row(target: &TargetProgressRowModel, width: usize) -> String {
+    let bar_width = if width < 90 { 16 } else { TARGET_BAR_WIDTH };
+    let bar = progress_bar_string_with_empty(target.percent, bar_width, '-');
+    let label = truncate_middle(&target.target, if width < 100 { 8 } else { 10 });
+    let bytes = compact_bytes_range(&target.bytes);
+
+    let line = if width < 85 {
+        format!("{:<10} {}  {}", label, bar, bytes)
+    } else if width < 110 {
+        format!("{:<10} {}  {:<16} {:>10}", label, bar, bytes, target.rate)
+    } else {
+        format!(
+            "{:<10} {}  {:<16} {:>10}   {} active",
+            label, bar, bytes, target.rate, target.active_workers
+        )
+    };
+
+    pad_to_width(&line, width)
 }
 
 fn live_counts_row(metrics: &[crate::progress_model::SummaryMetric]) -> String {

@@ -53,6 +53,8 @@ enum PreviewUiArg {
     Live,
     PostCopy,
     All,
+    #[value(name = "may4-live")]
+    May4Live,
 }
 
 fn main() -> Result<()> {
@@ -62,6 +64,7 @@ fn main() -> Result<()> {
             PreviewUiArg::Live => pathsync::PreviewUiMode::Live,
             PreviewUiArg::PostCopy => pathsync::PreviewUiMode::PostCopy,
             PreviewUiArg::All => pathsync::PreviewUiMode::All,
+            PreviewUiArg::May4Live => pathsync::PreviewUiMode::May4Live,
         }),
         config: cli.config,
         list_jobs: cli.list_jobs,

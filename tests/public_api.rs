@@ -291,6 +291,7 @@ fn public_preview_ui_output_can_render_live_and_post_copy_screens() {
     let live = preview_ui_output(PreviewUiMode::Live);
     let post = preview_ui_output(PreviewUiMode::PostCopy);
     let all = preview_ui_output(PreviewUiMode::All);
+    let may4 = preview_ui_output(PreviewUiMode::May4Live);
 
     assert!(live.contains("LIVE / COPY-LARGE"));
     assert!(!live.contains("ATTENTION"));
@@ -298,4 +299,6 @@ fn public_preview_ui_output_can_render_live_and_post_copy_screens() {
     assert!(!post.contains("LIVE / COPY-LARGE"));
     assert!(all.contains("LIVE / COPY-LARGE"));
     assert!(all.contains("ATTENTION"));
+    assert!(may4.contains("Active transfers"));
+    assert!(!may4.contains("┌ Run "));
 }

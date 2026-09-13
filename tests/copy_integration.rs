@@ -182,6 +182,7 @@ fn preview_ui_flag_renders_canned_live_and_post_copy_screens_without_config() {
     let live = run_pathsync(&["--preview-ui", "live"]);
     let post = run_pathsync(&["--preview-ui", "post-copy"]);
     let all = run_pathsync(&["--preview-ui", "all"]);
+    let may4 = run_pathsync(&["--preview-ui", "may4-live"]);
 
     assert!(
         live.status.success(),
@@ -215,6 +216,16 @@ fn preview_ui_flag_renders_canned_live_and_post_copy_screens_without_config() {
     assert!(all.stdout.contains("LIVE / COPY-LARGE"));
     assert!(all.stdout.contains("ATTENTION"));
     assert!(all.stdout.contains("source released"));
+
+    assert!(
+        may4.status.success(),
+        "stdout={}\nstderr={}",
+        may4.stdout,
+        may4.stderr
+    );
+    assert!(may4.stdout.contains("LIVE / COPY-LARGE"));
+    assert!(may4.stdout.contains("Active transfers"));
+    assert!(!may4.stdout.contains("┌ Run "));
 }
 
 #[test]
