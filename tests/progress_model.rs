@@ -1,8 +1,8 @@
 use pathsync::progress_model::{
     CategoryRowModel, ErrorRowModel, PhaseKind, ProgressBarModel, ProgressSnapshot,
-    SourceReleaseState, SummaryMetric, TargetResultRowModel, TransferCategory, WorkerRowModel,
-    active_worker_slots, apply_source_released, eta, overall_message, phase_label,
-    source_release_banner,
+    SourceReleaseState, SummaryMetric, TargetResultRowModel, TransferCategory, TransferRowPhase,
+    WorkerRowModel, active_worker_slots, apply_source_released, eta, overall_message, phase_label,
+    source_release_banner, visible_worker_rows,
 };
 use std::time::Duration;
 
@@ -128,6 +128,31 @@ fn overall_message_reports_success_and_failure_outcomes() {
         ..in_progress
     };
     assert!(overall_message(&staging).contains("relaying via spool"));
+}
+
+#[test]
+fn visible_worker_rows_prefers_active_lane_workers_over_idle_staging_slots() {
+    let workers = vec![
+        WorkerRowModel::idle("T01"),
+        WorkerRowModel::idle("T02"),
+        WorkerRowModel::idle("T03"),
+        WorkerRowModel::idle("T04"),
+        WorkerRowModel::active_with_phase(
+            '⠋',
+            "T05",
+            TransferRowPhase::Copying,
+            40,
+            "lane-file.jpg",
+            "1.0 MB",
+            "10 MB/s",
+            "target-a",
+        ),
+    ];
+
+    let visible = visible_worker_rows(&workers, 1);
+
+    assert_eq!(visible[0].item, "lane-file.jpg");
+    assert!(!visible[0].idle);
 }
 
 #[test]

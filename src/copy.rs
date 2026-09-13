@@ -265,6 +265,7 @@ struct RenderContext {
     target_roots: Arc<Vec<PathBuf>>,
     target_display_labels: BTreeMap<PathBuf, String>,
     target_results: BTreeMap<PathBuf, TargetResult>,
+    quiet: bool,
 }
 
 impl RenderContext {
@@ -279,6 +280,7 @@ impl RenderContext {
         planning_stats: PlanningStats,
         target_roots: Arc<Vec<PathBuf>>,
         target_results: BTreeMap<PathBuf, TargetResult>,
+        quiet: bool,
     ) -> Self {
         Self {
             job_name,
@@ -291,6 +293,7 @@ impl RenderContext {
             target_display_labels: target_display_labels(target_roots.as_ref()),
             target_roots,
             target_results,
+            quiet,
         }
     }
 }
@@ -418,14 +421,20 @@ pub fn print_dry_run(job: &ResolvedJob, plans: &[TransferPlan]) {
 /// [`run_copy_staged`] and the functions it calls, kept structurally
 /// separate from the legacy body so reverting staged mode is a clean
 /// deletion.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CopyRunOptions {
+    pub quiet: bool,
+}
+
 pub fn run_copy(
     job: &ResolvedJob,
     plans: Vec<TransferPlan>,
     planning_stats: PlanningStats,
+    options: CopyRunOptions,
 ) -> Result<(), CopyError> {
     match &job.staging {
-        Some(staging) => run_copy_staged(job, staging, plans, planning_stats),
-        None => run_copy_direct(job, plans, planning_stats),
+        Some(staging) => run_copy_staged(job, staging, plans, planning_stats, options),
+        None => run_copy_direct(job, plans, planning_stats, options),
     }
 }
 
@@ -438,6 +447,7 @@ fn run_copy_direct(
     job: &ResolvedJob,
     plans: Vec<TransferPlan>,
     planning_stats: PlanningStats,
+    options: CopyRunOptions,
 ) -> Result<(), CopyError> {
     let total_bytes: u64 = plans.iter().map(|plan| plan.size).sum();
     let task_count = plans.len();
@@ -467,11 +477,14 @@ fn run_copy_direct(
         planning_stats,
         target_roots,
         target_results,
+        options.quiet,
     );
     let ui_handle = if use_tty {
         thread::spawn(move || render_progress_tty(event_rx, render_context, None))
     } else {
-        print_header_lines_plain(job, task_count, total_bytes, large_file_count);
+        if !options.quiet {
+            print_header_lines_plain(job, task_count, total_bytes, large_file_count);
+        }
         thread::spawn(move || render_progress_plain(event_rx, render_context, None))
     };
     let verify_parallel = std::cmp::min(job.targets.len().max(1), 2);
@@ -1044,6 +1057,7 @@ fn run_copy_staged(
     staging: &ResolvedStaging,
     plans: Vec<TransferPlan>,
     planning_stats: PlanningStats,
+    options: CopyRunOptions,
 ) -> Result<(), CopyError> {
     validate_staging_before_run(job, staging, &plans)?;
 
@@ -1084,12 +1098,15 @@ fn run_copy_staged(
         planning_stats,
         target_roots.clone(),
         target_results,
+        options.quiet,
     );
     let render_spool = Some(Arc::clone(&spool));
     let ui_handle = if use_tty {
         thread::spawn(move || render_progress_tty(event_rx, render_context, render_spool))
     } else {
-        print_header_lines_plain(job, task_count, total_bytes, large_file_count);
+        if !options.quiet {
+            print_header_lines_plain(job, task_count, total_bytes, large_file_count);
+        }
         thread::spawn(move || render_progress_plain(event_rx, render_context, render_spool))
     };
 
@@ -2182,6 +2199,7 @@ fn render_progress_plain(
     let mut permission_failures = 0_usize;
     let mut worker_states: Vec<WorkerState> = Vec::new();
     let mut last_progress_line = Instant::now();
+    let quiet = context.quiet;
 
     for event in rx {
         match event {
@@ -2192,7 +2210,9 @@ fn render_progress_plain(
                 state.phase = phase;
                 worker_states = (0..worker_count).map(|_| WorkerState::default()).collect();
                 println!("phase    : {}", phase_label(phase));
-                println!("{}", plain_progress_line(&state.snapshot()));
+                if !quiet {
+                    println!("{}", plain_progress_line(&state.snapshot()));
+                }
                 last_progress_line = Instant::now();
             }
             WorkerEvent::Started {
@@ -2217,11 +2237,13 @@ fn render_progress_plain(
                 worker_state.total = _total;
                 worker_state.started = Some(Instant::now());
                 state.active_workers += 1;
-                println!(
-                    "{}: {}",
-                    worker_state.tag,
-                    worker_line(&label, 0, Duration::ZERO)
-                );
+                if !quiet {
+                    println!(
+                        "{}: {}",
+                        worker_state.tag,
+                        worker_line(&label, 0, Duration::ZERO)
+                    );
+                }
             }
             WorkerEvent::PhaseChanged {
                 worker,
@@ -2236,7 +2258,7 @@ fn render_progress_plain(
             WorkerEvent::Progress { worker, copied } => {
                 let worker_state = &mut worker_states[worker];
                 worker_state.copied = copied;
-                if last_progress_line.elapsed() >= PLAIN_PROGRESS_UPDATE_INTERVAL {
+                if !quiet && last_progress_line.elapsed() >= PLAIN_PROGRESS_UPDATE_INTERVAL {
                     println!("{}", plain_progress_line(&state.snapshot()));
                     last_progress_line = Instant::now();
                 }
@@ -2279,9 +2301,11 @@ fn render_progress_plain(
                 } else {
                     report.record_staged(bytes);
                 }
-                println!("{worker_tag}: done: {label}");
-                println!("{}", plain_progress_line(&state.snapshot()));
-                last_progress_line = Instant::now();
+                if !quiet {
+                    println!("{worker_tag}: done: {label}");
+                    println!("{}", plain_progress_line(&state.snapshot()));
+                    last_progress_line = Instant::now();
+                }
             }
             WorkerEvent::Verified {
                 worker,
@@ -2297,13 +2321,15 @@ fn render_progress_plain(
                 state.bytes_done += size;
                 state.completed += 1;
                 report.record_target_verified(&target, size);
-                for line in plain_target_progress_lines(
-                    &report,
-                    &worker_states,
-                    state.snapshot().elapsed,
-                    &context.target_display_labels,
-                ) {
-                    println!("{line}");
+                if !quiet {
+                    for line in plain_target_progress_lines(
+                        &report,
+                        &worker_states,
+                        state.snapshot().elapsed,
+                        &context.target_display_labels,
+                    ) {
+                        println!("{line}");
+                    }
                 }
             }
             WorkerEvent::VerificationFailed {
@@ -2323,8 +2349,10 @@ fn render_progress_plain(
                 state.failed = true;
                 report.record_failure(failure.clone());
                 println!("verify error: {}", failure.message);
-                println!("{}", plain_progress_line(&state.snapshot()));
-                last_progress_line = Instant::now();
+                if !quiet {
+                    println!("{}", plain_progress_line(&state.snapshot()));
+                    last_progress_line = Instant::now();
+                }
             }
             WorkerEvent::Error {
                 worker,
@@ -2357,8 +2385,10 @@ fn render_progress_plain(
                 }
                 report.record_failure(failure.clone());
                 println!("{} error: {label}: {}", worker_tag, failure.message);
-                println!("{}", plain_progress_line(&state.snapshot()));
-                last_progress_line = Instant::now();
+                if !quiet {
+                    println!("{}", plain_progress_line(&state.snapshot()));
+                    last_progress_line = Instant::now();
+                }
             }
             WorkerEvent::SourceReleased { had_failures } => {
                 state.release = apply_source_released(state.release, had_failures);
@@ -2366,8 +2396,10 @@ fn render_progress_plain(
                 if let Some(banner) = source_release_banner(state.release) {
                     println!("{banner}");
                 }
-                println!("{}", plain_progress_line(&state.snapshot()));
-                last_progress_line = Instant::now();
+                if !quiet {
+                    println!("{}", plain_progress_line(&state.snapshot()));
+                    last_progress_line = Instant::now();
+                }
             }
         }
 
@@ -2376,17 +2408,19 @@ fn render_progress_plain(
         }
     }
 
-    println!("{}", plain_progress_line(&state.snapshot()));
     report.duration = state.started.elapsed();
     report.bytes_done = state.bytes_done;
     report.failed = state.failed;
-    for line in plain_target_progress_lines(
-        &report,
-        &worker_states,
-        report.duration,
-        &context.target_display_labels,
-    ) {
-        println!("{line}");
+    if !quiet {
+        println!("{}", plain_progress_line(&state.snapshot()));
+        for line in plain_target_progress_lines(
+            &report,
+            &worker_states,
+            report.duration,
+            &context.target_display_labels,
+        ) {
+            println!("{line}");
+        }
     }
     print_copy_report_plain(summary_lines(
         &context.job_name,
@@ -2684,12 +2718,12 @@ fn build_live_screen_model(
             30,
         ),
         overall_progress_text: format!(
-            "{} verified of {}   ETA {}",
+            "{} copied of {}   ETA {}",
             human_bytes(snapshot.bytes_done),
             human_bytes(snapshot.bytes_total),
             eta_value
         ),
-        phase_label: format!("overall  {phase_text}"),
+        phase_label: format!("overall {phase_text}"),
         workers,
         target_progress: build_target_progress_rows(
             report,
@@ -4411,6 +4445,7 @@ mod tests {
             },
             Arc::new(vec![PathBuf::from("/target")]),
             BTreeMap::new(),
+            false,
         );
 
         let render_now = Instant::now();
@@ -4462,6 +4497,7 @@ mod tests {
             },
             Arc::new(vec![PathBuf::from("/target")]),
             BTreeMap::new(),
+            false,
         );
 
         let report = CopyReport {
@@ -4471,7 +4507,7 @@ mod tests {
         let model = build_live_screen_model(&context, &state, &worker_states, &report, render_now);
 
         assert_eq!(model.status, "LIVE / COPY-LARGE");
-        assert_eq!(model.phase_label, "overall  copying large files");
+        assert_eq!(model.phase_label, "overall copying large files");
         assert_eq!(model.workers[0].spinner_frame, Some('⠋'));
         assert_eq!(model.workers[0].size, "1000 B");
         assert_eq!(model.workers[0].time, "150 B/s");
@@ -4508,6 +4544,7 @@ mod tests {
             },
             Arc::new(vec![PathBuf::from("/target")]),
             BTreeMap::new(),
+            false,
         );
 
         let report = CopyReport {
@@ -4517,7 +4554,7 @@ mod tests {
         let model = build_live_screen_model(&context, &state, &worker_states, &report, render_now);
 
         assert_eq!(model.status, "LIVE / COPY-LARGE");
-        assert_eq!(model.phase_label, "overall  copying large files");
+        assert_eq!(model.phase_label, "overall copying large files");
     }
 
     #[test]
@@ -4556,6 +4593,7 @@ mod tests {
             },
             Arc::new(vec![PathBuf::from("/target")]),
             BTreeMap::new(),
+            false,
         );
         let report = CopyReport {
             duration: Duration::from_secs(8),
@@ -5051,6 +5089,7 @@ mod tests {
             },
             Arc::new(vec![PathBuf::from("/target")]),
             BTreeMap::new(),
+            false,
         )
     }
 

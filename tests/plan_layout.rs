@@ -434,13 +434,13 @@ fn should_skip_existing_supports_size_mtime() {
 
     let source_meta = fs::metadata(&source).unwrap();
     let should_skip =
-        should_skip_existing(ComparePolicy::SizeMtime, &source_meta, &target).unwrap();
+        should_skip_existing(ComparePolicy::SizeMtime, &source, &source_meta, &target).unwrap();
     assert!(should_skip);
 
     let later = FileTime::from_unix_time(1_700_000_001, 0);
     set_file_mtime(&target, later).unwrap();
     let should_skip =
-        should_skip_existing(ComparePolicy::SizeMtime, &source_meta, &target).unwrap();
+        should_skip_existing(ComparePolicy::SizeMtime, &source, &source_meta, &target).unwrap();
     assert!(!should_skip);
 }
 
@@ -454,6 +454,27 @@ fn should_skip_existing_path_policy_treats_existing_destination_as_match() {
     write_file(&target, b"wxyz");
 
     let source_meta = fs::metadata(&source).unwrap();
-    let should_skip = should_skip_existing(ComparePolicy::Path, &source_meta, &target).unwrap();
+    let should_skip =
+        should_skip_existing(ComparePolicy::Path, &source, &source_meta, &target).unwrap();
     assert!(should_skip);
+}
+
+#[test]
+fn should_skip_existing_hash_policy_compares_file_contents() {
+    let temp = TempDir::new();
+    let source = temp.path().join("source.jpg");
+    let target = temp.path().join("target.jpg");
+
+    write_file(&source, b"same-content");
+    write_file(&target, b"same-content");
+
+    let source_meta = fs::metadata(&source).unwrap();
+    let should_skip =
+        should_skip_existing(ComparePolicy::Hash, &source, &source_meta, &target).unwrap();
+    assert!(should_skip);
+
+    write_file(&target, b"diff-content");
+    let should_skip =
+        should_skip_existing(ComparePolicy::Hash, &source, &source_meta, &target).unwrap();
+    assert!(!should_skip);
 }

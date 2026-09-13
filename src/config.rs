@@ -295,6 +295,7 @@ pub fn resolve_compare_policy(
         "path" => Ok(ComparePolicy::Path),
         "path_size" => Ok(ComparePolicy::PathSize),
         "size_mtime" => Ok(ComparePolicy::SizeMtime),
+        "hash" => Ok(ComparePolicy::Hash),
         other => Err(ConfigError::UnsupportedCompareMode {
             mode: other.to_string(),
         }),

@@ -65,6 +65,18 @@ fn explicit_compare_modes_are_preserved() {
         config::resolve_compare_policy(Some(&size_mtime)).unwrap(),
         ComparePolicy::SizeMtime
     );
+
+    let hash: config::CompareConfig = toml::Value::Table({
+        let mut table = toml::map::Map::new();
+        table.insert("mode".to_string(), toml::Value::String("hash".to_string()));
+        table
+    })
+    .try_into()
+    .unwrap();
+    assert_eq!(
+        config::resolve_compare_policy(Some(&hash)).unwrap(),
+        ComparePolicy::Hash
+    );
 }
 
 #[test]

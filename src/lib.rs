@@ -3,6 +3,7 @@ pub mod copy;
 mod copy_fast_path;
 pub mod date;
 pub mod error;
+mod file_hash;
 pub mod format;
 mod lanes;
 pub mod plan;
@@ -45,6 +46,7 @@ pub struct RunOptions {
     pub extensions: Option<Vec<String>>,
     pub job: Option<String>,
     pub preview_ui: Option<PreviewUiMode>,
+    pub quiet: bool,
 }
 
 pub fn run(options: RunOptions) -> Result<(), PathsyncError> {
@@ -80,7 +82,14 @@ pub fn run(options: RunOptions) -> Result<(), PathsyncError> {
         return Ok(());
     }
 
-    Ok(copy::run_copy(&job, plans, plan_build.stats)?)
+    Ok(copy::run_copy(
+        &job,
+        plans,
+        plan_build.stats,
+        copy::CopyRunOptions {
+            quiet: options.quiet,
+        },
+    )?)
 }
 
 fn preview_terminal_width() -> usize {
@@ -314,8 +323,8 @@ fn preview_live_screen_model() -> LiveScreenModel {
         ],
         overall_label: "Copying".to_string(),
         overall_progress: ProgressBarModel::new(43, 30),
-        overall_progress_text: "58.2 GB verified of 133.0 GB   ETA 8m46s".to_string(),
-        phase_label: "overall  copying large files".to_string(),
+        overall_progress_text: "58.2 GB copied of 133.0 GB   ETA 8m46s".to_string(),
+        phase_label: "overall copying large files".to_string(),
         workers: vec![
             WorkerRowModel::active(
                 '⠋',

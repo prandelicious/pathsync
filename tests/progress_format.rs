@@ -29,8 +29,8 @@ fn live_model() -> LiveScreenModel {
         ],
         overall_label: "Copying".to_string(),
         overall_progress: ProgressBarModel::new(43, 30),
-        overall_progress_text: "58.2 GB verified of 133.0 GB   ETA 8m46s".to_string(),
-        phase_label: "overall  copying large files".to_string(),
+        overall_progress_text: "58.2 GB copied of 133.0 GB   ETA 8m46s".to_string(),
+        phase_label: "overall copying large files".to_string(),
         workers: vec![
             WorkerRowModel::active_with_phase(
                 '⠋',
@@ -134,6 +134,25 @@ fn worker_labels_use_relative_path_to_disambiguate_duplicates() {
 }
 
 #[test]
+fn narrow_live_progress_line_drops_eta_before_truncating_byte_counts() {
+    let lines = render_live_screen_with_width(&live_model(), 80);
+    let progress = lines
+        .iter()
+        .find(|line| line.contains("Copying  ["))
+        .expect("overall progress line");
+    assert!(progress.contains("copied of"));
+    assert!(!progress.ends_with("ETA 8"));
+    assert!(progress.contains("133.0 GB"));
+}
+
+#[test]
+fn post_run_completion_line_omits_dead_eta_placeholder() {
+    let rendered = render_post_run_screen(&post_run_model()).join("\n");
+    assert!(rendered.contains("verified"));
+    assert!(!rendered.contains("ETA --"));
+}
+
+#[test]
 fn narrow_live_screen_renders_stacked_80_column_layout() {
     let lines = render_live_screen(&live_model());
     let rendered = lines.join("\n");
@@ -146,7 +165,7 @@ fn narrow_live_screen_renders_stacked_80_column_layout() {
     assert_eq!(lines[0], exact_header("vlog-sync", "LIVE / COPY-LARGE"));
     assert!(rendered.contains("Scanned: 2,941"));
     assert!(rendered.contains("Copying  ["));
-    assert!(rendered.contains("overall  copying large files"));
+    assert!(rendered.contains("overall copying large files"));
     assert!(rendered.contains("⠋ T01"));
     assert!(rendered.contains("hashing"));
     assert!(rendered.contains("A001_C014_0101AB.MP4"));

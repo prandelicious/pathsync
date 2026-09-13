@@ -420,6 +420,34 @@ pub fn source_release_banner(state: SourceReleaseState) -> Option<String> {
     }
 }
 
+/// Picks up to `limit` worker rows for display, preferring active transfers
+/// over idle slots. Staged mode allocates worker ids past the visible window
+/// (staging workers first, lane workers later), so the first `limit` indices
+/// are often idle while lane workers are active.
+pub fn visible_worker_rows(workers: &[WorkerRowModel], limit: usize) -> Vec<WorkerRowModel> {
+    let mut visible = workers
+        .iter()
+        .filter(|worker| !worker.idle)
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if visible.len() < limit {
+        let idle_slots = workers
+            .iter()
+            .filter(|worker| worker.idle)
+            .take(limit - visible.len())
+            .cloned();
+        visible.extend(idle_slots);
+    }
+
+    while visible.len() < limit {
+        visible.push(WorkerRowModel::idle(format!("T{:02}", visible.len() + 1)));
+    }
+
+    visible
+}
+
 pub fn active_worker_slots(configured_parallel: usize, phase_task_count: usize) -> usize {
     if phase_task_count == 0 {
         0
