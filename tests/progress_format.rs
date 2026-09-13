@@ -2,8 +2,8 @@ use std::path::Path;
 
 use pathsync::progress_format::{
     CANONICAL_WIDTH, GlyphSet, render_live_screen, render_live_screen_with_width,
-    render_live_screen_with_width_and_glyphs, render_post_run_screen,
-    render_post_run_screen_with_glyphs, worker_label,
+    render_live_screen_with_width_and_glyphs, render_may4_live_screen_with_width,
+    render_post_run_screen, render_post_run_screen_with_glyphs, worker_label,
 };
 use pathsync::progress_model::{
     CategoryRowModel, ErrorRowModel, LiveScreenModel, ProgressBarModel, SummaryMetric,
@@ -131,6 +131,142 @@ fn worker_labels_use_relative_path_to_disambiguate_duplicates() {
 
     assert!(label.contains("nested"));
     assert!(label.contains("photo.jpg"));
+}
+
+fn may4_transfer_section(lines: &[String]) -> Vec<&String> {
+    let start = lines
+        .iter()
+        .position(|line| line.contains("Active transfers"))
+        .expect("Active transfers heading")
+        + 1;
+    lines[start..]
+        .iter()
+        .take_while(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.contains("Targets") && !line.contains("─")
+        })
+        .collect()
+}
+
+fn is_may4_stacked_metrics_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    line.starts_with(' ') && trimmed.contains('→')
+}
+
+fn may4_transfer_block<'a>(section: &[&'a String], tag: &str) -> Vec<&'a String> {
+    let idx = section
+        .iter()
+        .position(|line| line.contains(tag))
+        .unwrap_or_else(|| panic!("{tag} transfer row"));
+    let mut block = vec![section[idx]];
+    if let Some(next) = section.get(idx + 1)
+        && is_may4_stacked_metrics_line(next)
+    {
+        block.push(*next);
+    }
+    block
+}
+
+#[test]
+fn may4_live_preview_uses_full_width_metrics_without_run_box() {
+    let lines = render_may4_live_screen_with_width(&live_model(), 140);
+    let rendered = lines.join("\n");
+
+    assert!(lines.iter().all(|line| line.chars().count() == 140));
+    assert!(rendered.contains("58.2 / 133.0 GB"));
+    assert!(rendered.contains("Active transfers"));
+    assert!(rendered.contains("Copying large files"));
+    assert!(!rendered.contains("┌ Run "));
+    assert!(!rendered.contains("Workers"));
+}
+
+#[test]
+fn may4_live_preview_keeps_full_archive_destination_at_width_90() {
+    let lines = render_may4_live_screen_with_width(&live_model(), 90);
+    let section = may4_transfer_section(&lines);
+    let t02 = may4_transfer_block(&section, "T02");
+    let t02_text = t02
+        .iter()
+        .map(|line| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        t02_text.contains("Archive"),
+        "T02 destination must keep full Archive, got:\n{t02_text}"
+    );
+}
+
+#[test]
+fn may4_live_preview_stacks_long_filename_transfer_when_oneline_mins_do_not_fit() {
+    let mut model = live_model();
+    model.workers[0].item =
+        "DCIM/100GOPRO/very_long_clip_directory_name/A001_C014_0101AB.MP4".to_string();
+
+    let lines = render_may4_live_screen_with_width(&model, 80);
+    assert!(lines.iter().all(|line| line.chars().count() == 80));
+
+    let section = may4_transfer_section(&lines);
+    let t01 = may4_transfer_block(&section, "T01");
+    assert_eq!(
+        t01.len(),
+        2,
+        "long filename transfer must occupy two lines: {t01:?}"
+    );
+    assert!(t01[0].contains("T01"), "line 1 worker: {}", t01[0]);
+    assert!(t01[0].contains("hashing"), "line 1 phase: {}", t01[0]);
+    assert!(
+        t01[0].contains("A001_C014_0101AB.MP4") || t01[0].contains('…'),
+        "line 1 filename: {}",
+        t01[0]
+    );
+    assert!(
+        !t01[0].contains('→'),
+        "destination stays on line 2, got: {}",
+        t01[0]
+    );
+    assert!(t01[1].contains("8.2 GB"), "line 2 size: {}", t01[1]);
+    assert!(t01[1].contains("78.4 MB/s"), "line 2 rate: {}", t01[1]);
+    assert!(t01[1].contains('→'), "line 2 arrow: {}", t01[1]);
+    assert!(t01[1].contains("T7"), "line 2 destination: {}", t01[1]);
+
+    let t04 = may4_transfer_block(&section, "T04");
+    assert_eq!(t04.len(), 1, "idle workers stay one line: {t04:?}");
+    assert!(t04[0].contains("idle"), "idle label: {}", t04[0]);
+}
+
+#[test]
+fn may4_live_preview_keeps_oneline_transfers_with_rate_at_width_140() {
+    let lines = render_may4_live_screen_with_width(&live_model(), 140);
+    assert!(lines.iter().all(|line| line.chars().count() == 140));
+
+    let section = may4_transfer_section(&lines);
+    let t01 = may4_transfer_block(&section, "T01");
+    let t02 = may4_transfer_block(&section, "T02");
+    let t03 = may4_transfer_block(&section, "T03");
+
+    for block in [&t01, &t02, &t03] {
+        assert_eq!(
+            block.len(),
+            1,
+            "active transfers stay one-line at 140: {block:?}"
+        );
+    }
+    assert!(
+        t01[0].contains("78.4 MB/s") && t01[0].contains("T7"),
+        "{}",
+        t01[0]
+    );
+    assert!(
+        t02[0].contains("64.0 MB/s") && t02[0].contains("Archive"),
+        "{}",
+        t02[0]
+    );
+    assert!(
+        t03[0].contains("41.8 MB/s") && t03[0].contains("T7"),
+        "{}",
+        t03[0]
+    );
 }
 
 #[test]

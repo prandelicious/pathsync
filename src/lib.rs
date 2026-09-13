@@ -20,12 +20,13 @@ use config::{CompareConfig, Config, LayoutConfig, ResolvedJob, TransferConfig};
 use error::PathsyncError;
 use plan::{FileContext, PlanBuild, PlanJob, TransferPlan};
 use progress_format::{
-    CANONICAL_WIDTH, render_live_screen_with_width, render_post_run_screen_with_width,
+    CANONICAL_WIDTH, render_live_screen_with_width, render_may4_live_screen_with_width,
+    render_post_run_screen_with_width,
 };
 use progress_model::{
     CategoryRowModel, ErrorRowModel, LiveScreenModel, PostRunScreenModel, ProgressBarModel,
     SourceReleaseState, SummaryMetric, TargetProgressRowModel, TargetResultRowModel,
-    WorkerRowModel, source_release_banner,
+    TransferRowPhase, WorkerRowModel, source_release_banner,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +34,7 @@ pub enum PreviewUiMode {
     Live,
     PostCopy,
     All,
+    May4Live,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -106,10 +108,14 @@ pub fn preview_ui_output(mode: PreviewUiMode) -> String {
     let post =
         render_post_run_screen_with_width(&preview_post_run_screen_model(), width).join("\n");
 
+    let may4 =
+        render_may4_live_screen_with_width(&preview_may4_live_screen_model(), width).join("\n");
+
     match mode {
         PreviewUiMode::Live => format!("{live}\n"),
         PreviewUiMode::PostCopy => format!("{post}\n"),
         PreviewUiMode::All => format!("{live}\n\n{post}\n"),
+        PreviewUiMode::May4Live => format!("{may4}\n"),
     }
 }
 
@@ -303,6 +309,48 @@ fn staging_config_summary(job: &config::JobConfig, config: &Config) -> Option<St
     } else {
         Some(parts.join(", "))
     }
+}
+
+fn preview_may4_live_screen_model() -> LiveScreenModel {
+    let mut model = preview_live_screen_model();
+    model.workers = vec![
+        WorkerRowModel::active_with_phase(
+            '⠋',
+            "T01",
+            TransferRowPhase::Copying,
+            64,
+            "A001_C014_0101AB.MP4",
+            "8.2 GB",
+            "78.4 MB/s",
+            "T7",
+        ),
+        WorkerRowModel::active_with_phase(
+            '⠙',
+            "T02",
+            TransferRowPhase::Copying,
+            51,
+            "A001_C015_0101AB.MP4",
+            "7.9 GB",
+            "64.0 MB/s",
+            "Archive",
+        ),
+        WorkerRowModel::active_with_phase(
+            '⠹',
+            "T03",
+            TransferRowPhase::Verifying,
+            12,
+            "GX010193.MP4",
+            "2.1 GB",
+            "41.8 MB/s",
+            "T7",
+        ),
+        WorkerRowModel::idle("T04"),
+    ];
+    model.target_progress = vec![
+        TargetProgressRowModel::new("T7", 47, "31.0 GB / 66.5 GB", "78.4 MB/s", 2),
+        TargetProgressRowModel::new("Archive", 41, "27.2 GB / 66.5 GB", "64.0 MB/s", 1),
+    ];
+    model
 }
 
 fn preview_live_screen_model() -> LiveScreenModel {
