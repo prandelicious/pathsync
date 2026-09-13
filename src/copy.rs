@@ -263,7 +263,36 @@ struct RenderContext {
     total_bytes: u64,
     planning_stats: PlanningStats,
     target_roots: Arc<Vec<PathBuf>>,
+    target_display_labels: BTreeMap<PathBuf, String>,
     target_results: BTreeMap<PathBuf, TargetResult>,
+}
+
+impl RenderContext {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        job_name: String,
+        target: PathBuf,
+        target_count: usize,
+        source_root: PathBuf,
+        task_count: usize,
+        total_bytes: u64,
+        planning_stats: PlanningStats,
+        target_roots: Arc<Vec<PathBuf>>,
+        target_results: BTreeMap<PathBuf, TargetResult>,
+    ) -> Self {
+        Self {
+            job_name,
+            target,
+            target_count,
+            source_root,
+            task_count,
+            total_bytes,
+            planning_stats,
+            target_display_labels: target_display_labels(target_roots.as_ref()),
+            target_roots,
+            target_results,
+        }
+    }
 }
 
 impl CopyReport {
@@ -428,17 +457,17 @@ fn run_copy_direct(
     let job_name = job.name.clone();
     let target = job.primary_target().to_path_buf();
     let use_tty = io::stdout().is_terminal();
-    let render_context = RenderContext {
+    let render_context = RenderContext::new(
         job_name,
         target,
-        target_count: job.targets.len(),
+        job.targets.len(),
         source_root,
         task_count,
         total_bytes,
         planning_stats,
         target_roots,
         target_results,
-    };
+    );
     let ui_handle = if use_tty {
         thread::spawn(move || render_progress_tty(event_rx, render_context, None))
     } else {
@@ -1045,17 +1074,17 @@ fn run_copy_staged(
     let job_name = job.name.clone();
     let target = job.primary_target().to_path_buf();
     let use_tty = io::stdout().is_terminal();
-    let render_context = RenderContext {
+    let render_context = RenderContext::new(
         job_name,
         target,
-        target_count: job.targets.len(),
+        job.targets.len(),
         source_root,
         task_count,
         total_bytes,
         planning_stats,
-        target_roots: target_roots.clone(),
+        target_roots.clone(),
         target_results,
-    };
+    );
     let render_spool = Some(Arc::clone(&spool));
     let ui_handle = if use_tty {
         thread::spawn(move || render_progress_tty(event_rx, render_context, render_spool))
@@ -2272,7 +2301,7 @@ fn render_progress_plain(
                     &report,
                     &worker_states,
                     state.snapshot().elapsed,
-                    context.target_roots.as_ref(),
+                    &context.target_display_labels,
                 ) {
                     println!("{line}");
                 }
@@ -2355,7 +2384,7 @@ fn render_progress_plain(
         &report,
         &worker_states,
         report.duration,
-        context.target_roots.as_ref(),
+        &context.target_display_labels,
     ) {
         println!("{line}");
     }
@@ -2366,7 +2395,8 @@ fn render_progress_plain(
         &report,
         context.task_count,
         context.total_bytes,
-        &context.target_roots,
+        context.target_roots.as_ref(),
+        &context.target_display_labels,
     ));
 
     if report.failures.is_empty() {
@@ -2384,9 +2414,9 @@ fn plain_target_progress_lines(
     report: &CopyReport,
     worker_states: &[WorkerState],
     elapsed: Duration,
-    target_roots: &[PathBuf],
+    display_labels: &BTreeMap<PathBuf, String>,
 ) -> Vec<String> {
-    build_target_progress_rows(report, worker_states, elapsed, target_roots)
+    build_target_progress_rows(report, worker_states, elapsed, display_labels)
         .into_iter()
         .map(|target| {
             format!(
@@ -2425,27 +2455,6 @@ fn relative_file_label(source_root: &Path, source: &Path) -> String {
                 .unwrap_or("<unknown>")
         })
         .to_string()
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn target_volume_label(dest: &Path) -> String {
-    let mut components = dest.components();
-    if components.next() != Some(std::path::Component::RootDir) {
-        return String::new();
-    }
-
-    let Some(std::path::Component::Normal(first)) = components.next() else {
-        return String::new();
-    };
-    if first != "Volumes" {
-        return String::new();
-    }
-
-    let Some(std::path::Component::Normal(volume)) = components.next() else {
-        return String::new();
-    };
-
-    volume.to_string_lossy().into_owned()
 }
 
 fn target_label_component(target: &Path, depth: usize) -> String {
@@ -2500,7 +2509,34 @@ fn target_display_labels(targets: &[PathBuf]) -> BTreeMap<PathBuf, String> {
         }
     }
 
+    relabel_duplicate_target_labels(&mut labels, |target, _index| target.display().to_string());
+    relabel_duplicate_target_labels(&mut labels, |_target, index| {
+        format!("target-{}", index + 1)
+    });
+
     labels.into_iter().collect()
+}
+
+fn relabel_duplicate_target_labels(
+    labels: &mut [(PathBuf, String)],
+    relabel: impl Fn(&Path, usize) -> String,
+) {
+    let mut indices_by_label = std::collections::HashMap::<String, Vec<usize>>::new();
+    for (index, (_, label)) in labels.iter().enumerate() {
+        indices_by_label
+            .entry(label.clone())
+            .or_default()
+            .push(index);
+    }
+
+    for indices in indices_by_label.values() {
+        if indices.len() <= 1 {
+            continue;
+        }
+        for &index in indices {
+            labels[index].1 = relabel(&labels[index].0, index);
+        }
+    }
 }
 
 fn initial_target_results(
@@ -2567,7 +2603,6 @@ fn build_live_screen_model(
         PhaseKind::Staging => "staging to spool",
     };
 
-    let display_labels = target_display_labels(context.target_roots.as_ref());
     let workers = worker_states
         .iter()
         .enumerate()
@@ -2588,7 +2623,7 @@ fn build_live_screen_model(
                 let target_label = worker_state
                     .target_root
                     .as_ref()
-                    .and_then(|root| display_labels.get(root))
+                    .and_then(|root| context.target_display_labels.get(root))
                     .cloned()
                     .unwrap_or_else(|| "--".to_string());
                 WorkerRowModel::active_with_phase(
@@ -2660,7 +2695,7 @@ fn build_live_screen_model(
             report,
             worker_states,
             snapshot.elapsed,
-            context.target_roots.as_ref(),
+            &context.target_display_labels,
         ),
         release_banner: source_release_banner(state.release),
     }
@@ -2670,9 +2705,8 @@ fn build_target_progress_rows(
     report: &CopyReport,
     worker_states: &[WorkerState],
     elapsed: Duration,
-    target_roots: &[PathBuf],
+    display_labels: &BTreeMap<PathBuf, String>,
 ) -> Vec<TargetProgressRowModel> {
-    let display_labels = target_display_labels(target_roots);
     report
         .target_results
         .iter()
@@ -2834,7 +2868,11 @@ fn build_post_run_screen_model(
     let errors = group_failures(&report.failures)
         .into_iter()
         .map(|group| {
-            let target = grouped_target_label(&group.dests, &context.target_roots);
+            let target = grouped_target_label(
+                &group.dests,
+                context.target_roots.as_ref(),
+                &context.target_display_labels,
+            );
             let failure = group.representative;
             ErrorRowModel::new(
                 target,
@@ -2848,12 +2886,12 @@ fn build_post_run_screen_model(
             )
         })
         .collect();
-    let display_labels = target_display_labels(context.target_roots.as_ref());
     let target_results = report
         .target_results
         .iter()
         .map(|(target, result)| {
-            let label = display_labels
+            let label = context
+                .target_display_labels
                 .get(target)
                 .cloned()
                 .unwrap_or_else(|| target.display().to_string());
@@ -2976,6 +3014,7 @@ fn print_copy_report_plain(lines: Vec<String>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn summary_lines(
     job_name: &str,
     target: &Path,
@@ -2984,6 +3023,7 @@ fn summary_lines(
     task_count: usize,
     total_bytes: u64,
     target_roots: &[PathBuf],
+    display_labels: &BTreeMap<PathBuf, String>,
 ) -> Vec<String> {
     let title = if report.systemic_detected {
         "FAILED"
@@ -3024,7 +3064,6 @@ fn summary_lines(
         ),
     ];
 
-    let display_labels = target_display_labels(target_roots);
     for (target, result) in &report.target_results {
         let label = display_labels
             .get(target)
@@ -3079,7 +3118,7 @@ fn summary_lines(
             "Target", "Phase", "File", "Error"
         ));
         for group in failure_groups.iter().take(SUMMARY_FAILURE_PREVIEW_LIMIT) {
-            let target = grouped_target_label(&group.dests, target_roots);
+            let target = grouped_target_label(&group.dests, target_roots, display_labels);
             let failure = group.representative;
             lines.push(format!(
                 "{:<18} {:<8} {:<28} {}",
@@ -3565,11 +3604,14 @@ fn group_failures(failures: &[CopyFailure]) -> Vec<FailureGroup<'_>> {
 /// single-failure fallback chain used elsewhere (resolved target root's
 /// label, else the raw `dest`'s label, else `"--"` when there's no `dest`
 /// at all) but joining every affected destination.
-fn grouped_target_label(dests: &[&Path], target_roots: &[PathBuf]) -> String {
+fn grouped_target_label(
+    dests: &[&Path],
+    target_roots: &[PathBuf],
+    display_labels: &BTreeMap<PathBuf, String>,
+) -> String {
     if dests.is_empty() {
         return "--".to_string();
     }
-    let display_labels = target_display_labels(target_roots);
     dests
         .iter()
         .map(|dest| {
@@ -4218,15 +4260,6 @@ mod tests {
     }
 
     #[test]
-    fn target_volume_label_uses_macos_volume_root_when_available() {
-        assert_eq!(
-            target_volume_label(Path::new("/Volumes/T7/Videos/clip.mp4")),
-            "T7"
-        );
-        assert_eq!(target_volume_label(Path::new("/tmp/target/clip.mp4")), "");
-    }
-
-    #[test]
     fn target_display_labels_disambiguate_same_volume_multi_target_roots() {
         let targets = vec![
             PathBuf::from("/Volumes/T7/Videos/Vlog"),
@@ -4240,6 +4273,18 @@ mod tests {
         assert_eq!(labels[&targets[1]], "Archive/Vlog");
         assert_eq!(labels[&targets[2]], "ta");
         assert_eq!(labels[&targets[3]], "tb");
+    }
+
+    #[test]
+    fn target_display_labels_falls_back_to_full_path_when_depth_extension_is_insufficient() {
+        let targets = vec![
+            PathBuf::from("/a/b/c/d/e/f/g/h/i/j/k"),
+            PathBuf::from("/z/b/c/d/e/f/g/h/i/j/k"),
+        ];
+        let labels = target_display_labels(&targets);
+
+        assert_eq!(labels[&targets[0]], targets[0].display().to_string());
+        assert_eq!(labels[&targets[1]], targets[1].display().to_string());
     }
 
     #[test]
@@ -4350,23 +4395,23 @@ mod tests {
         worker_states[0].total = 1_000;
         worker_states[0].started = Some(Instant::now() - Duration::from_secs(4));
 
-        let context = RenderContext {
-            job_name: "demo".to_string(),
-            target: PathBuf::from("/target"),
-            target_count: 1,
-            source_root: PathBuf::from("/source"),
-            task_count: 3,
-            total_bytes: 1_300,
-            planning_stats: PlanningStats {
+        let context = RenderContext::new(
+            "demo".to_string(),
+            PathBuf::from("/target"),
+            1,
+            PathBuf::from("/source"),
+            3,
+            1_300,
+            PlanningStats {
                 scanned_files: 3,
                 planned_files: 3,
                 planned_bytes: 1_300,
                 skipped_existing_files: 0,
                 skipped_existing_bytes: 0,
             },
-            target_roots: Arc::new(vec![PathBuf::from("/target")]),
-            target_results: BTreeMap::new(),
-        };
+            Arc::new(vec![PathBuf::from("/target")]),
+            BTreeMap::new(),
+        );
 
         let render_now = Instant::now();
         worker_states[0].started = Some(render_now - Duration::from_secs(4));
@@ -4401,23 +4446,23 @@ mod tests {
         let render_now = Instant::now();
         worker_states[0].started = Some(render_now - Duration::from_secs(4));
 
-        let context = RenderContext {
-            job_name: "demo".to_string(),
-            target: PathBuf::from("/target"),
-            target_count: 1,
-            source_root: PathBuf::from("/source"),
-            task_count: 3,
-            total_bytes: 1_300,
-            planning_stats: PlanningStats {
+        let context = RenderContext::new(
+            "demo".to_string(),
+            PathBuf::from("/target"),
+            1,
+            PathBuf::from("/source"),
+            3,
+            1_300,
+            PlanningStats {
                 scanned_files: 3,
                 planned_files: 3,
                 planned_bytes: 1_300,
                 skipped_existing_files: 0,
                 skipped_existing_bytes: 0,
             },
-            target_roots: Arc::new(vec![PathBuf::from("/target")]),
-            target_results: BTreeMap::new(),
-        };
+            Arc::new(vec![PathBuf::from("/target")]),
+            BTreeMap::new(),
+        );
 
         let report = CopyReport {
             target_results: context.target_results.clone(),
@@ -4447,23 +4492,23 @@ mod tests {
         let render_now = Instant::now();
         worker_states[0].started = Some(render_now - Duration::from_secs(4));
 
-        let context = RenderContext {
-            job_name: "demo".to_string(),
-            target: PathBuf::from("/target"),
-            target_count: 1,
-            source_root: PathBuf::from("/source"),
-            task_count: 3,
-            total_bytes: 1_300,
-            planning_stats: PlanningStats {
+        let context = RenderContext::new(
+            "demo".to_string(),
+            PathBuf::from("/target"),
+            1,
+            PathBuf::from("/source"),
+            3,
+            1_300,
+            PlanningStats {
                 scanned_files: 3,
                 planned_files: 3,
                 planned_bytes: 1_300,
                 skipped_existing_files: 0,
                 skipped_existing_bytes: 0,
             },
-            target_roots: Arc::new(vec![PathBuf::from("/target")]),
-            target_results: BTreeMap::new(),
-        };
+            Arc::new(vec![PathBuf::from("/target")]),
+            BTreeMap::new(),
+        );
 
         let report = CopyReport {
             target_results: context.target_results.clone(),
@@ -4495,23 +4540,23 @@ mod tests {
 
     #[test]
     fn post_run_screen_model_groups_categories_and_errors() {
-        let context = RenderContext {
-            job_name: "demo".to_string(),
-            target: PathBuf::from("/target"),
-            target_count: 1,
-            source_root: PathBuf::from("/source"),
-            task_count: 4,
-            total_bytes: 2_000,
-            planning_stats: PlanningStats {
+        let context = RenderContext::new(
+            "demo".to_string(),
+            PathBuf::from("/target"),
+            1,
+            PathBuf::from("/source"),
+            4,
+            2_000,
+            PlanningStats {
                 scanned_files: 4,
                 planned_files: 4,
                 planned_bytes: 2_000,
                 skipped_existing_files: 2,
                 skipped_existing_bytes: 800,
             },
-            target_roots: Arc::new(vec![PathBuf::from("/target")]),
-            target_results: BTreeMap::new(),
-        };
+            Arc::new(vec![PathBuf::from("/target")]),
+            BTreeMap::new(),
+        );
         let report = CopyReport {
             duration: Duration::from_secs(8),
             bytes_done: 1_200,
@@ -4579,6 +4624,8 @@ mod tests {
             ..CopyReport::default()
         };
 
+        let target_roots = vec![target.clone()];
+        let display_labels = target_display_labels(&target_roots);
         let lines = summary_lines(
             "demo",
             &target,
@@ -4586,7 +4633,8 @@ mod tests {
             &report,
             21,
             210,
-            std::slice::from_ref(&target),
+            &target_roots,
+            &display_labels,
         );
 
         assert!(
@@ -4884,8 +4932,9 @@ mod tests {
             Path::new("/target-b/bad.jpg"),
         ];
 
+        let display_labels = target_display_labels(&target_roots);
         assert_eq!(
-            grouped_target_label(&dests, &target_roots),
+            grouped_target_label(&dests, &target_roots, &display_labels),
             "target-a, target-b"
         );
     }
@@ -4902,6 +4951,8 @@ mod tests {
             ..CopyReport::default()
         };
 
+        let target_roots = vec![target.clone()];
+        let display_labels = target_display_labels(&target_roots);
         let lines = summary_lines(
             "demo",
             &target,
@@ -4909,7 +4960,8 @@ mod tests {
             &report,
             3,
             3_000,
-            std::slice::from_ref(&target),
+            &target_roots,
+            &display_labels,
         );
 
         assert!(lines.iter().any(|line| line == "Staging"));
@@ -4940,6 +4992,8 @@ mod tests {
             ..CopyReport::default()
         };
 
+        let target_roots = vec![target.clone()];
+        let display_labels = target_display_labels(&target_roots);
         let lines = summary_lines(
             "demo",
             &target,
@@ -4947,7 +5001,8 @@ mod tests {
             &report,
             1,
             1_000,
-            std::slice::from_ref(&target),
+            &target_roots,
+            &display_labels,
         );
 
         assert!(
@@ -4963,6 +5018,8 @@ mod tests {
         let target = PathBuf::from("/target");
         let report = CopyReport::default();
 
+        let target_roots = vec![target.clone()];
+        let display_labels = target_display_labels(&target_roots);
         let lines = summary_lines(
             "demo",
             &target,
@@ -4970,30 +5027,31 @@ mod tests {
             &report,
             0,
             0,
-            std::slice::from_ref(&target),
+            &target_roots,
+            &display_labels,
         );
 
         assert!(!lines.iter().any(|line| line == "Staging"));
     }
 
     fn staging_render_context() -> RenderContext {
-        RenderContext {
-            job_name: "demo".to_string(),
-            target: PathBuf::from("/target"),
-            target_count: 1,
-            source_root: PathBuf::from("/source"),
-            task_count: 1,
-            total_bytes: 1_000,
-            planning_stats: PlanningStats {
+        RenderContext::new(
+            "demo".to_string(),
+            PathBuf::from("/target"),
+            1,
+            PathBuf::from("/source"),
+            1,
+            1_000,
+            PlanningStats {
                 scanned_files: 1,
                 planned_files: 1,
                 planned_bytes: 1_000,
                 skipped_existing_files: 0,
                 skipped_existing_bytes: 0,
             },
-            target_roots: Arc::new(vec![PathBuf::from("/target")]),
-            target_results: BTreeMap::new(),
-        }
+            Arc::new(vec![PathBuf::from("/target")]),
+            BTreeMap::new(),
+        )
     }
 
     #[test]

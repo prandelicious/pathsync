@@ -250,7 +250,30 @@ fn resolve_targets(job_name: &str, job: &JobConfig) -> Result<Vec<PathBuf>, Conf
         }
     }
 
+    validate_non_overlapping_targets(job_name, &targets)?;
+
     Ok(targets)
+}
+
+fn validate_non_overlapping_targets(
+    job_name: &str,
+    targets: &[PathBuf],
+) -> Result<(), ConfigError> {
+    for left_index in 0..targets.len() {
+        for right_index in (left_index + 1)..targets.len() {
+            let left = &targets[left_index];
+            let right = &targets[right_index];
+            if left == right || left.starts_with(right) || right.starts_with(left) {
+                return Err(ConfigError::OverlappingTargets {
+                    name: job_name.to_string(),
+                    left: left.clone(),
+                    right: right.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub fn normalize_extensions_public(extensions: &[String]) -> Vec<String> {

@@ -38,6 +38,12 @@ pub enum ConfigError {
     MissingTargetSetting { name: String },
     #[error("job `{name}` must include at least one target path")]
     EmptyTargets { name: String },
+    #[error("job `{name}` has overlapping target paths: {left} and {right}")]
+    OverlappingTargets {
+        name: String,
+        left: PathBuf,
+        right: PathBuf,
+    },
     #[error("job `{name}` has no valid extensions")]
     NoValidExtensions { name: String },
     #[error("unsupported compare mode: {mode}")]

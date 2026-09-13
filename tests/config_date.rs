@@ -459,6 +459,40 @@ layout = "flat"
 }
 
 #[test]
+fn resolve_job_rejects_overlapping_target_roots() {
+    let root = unique_temp_dir("pathsync-config-overlapping-targets");
+    let input = root.join("input");
+    let parent = root.join("output");
+    let child = parent.join("nested");
+    fs::create_dir_all(&input).unwrap();
+    fs::create_dir_all(&child).unwrap();
+
+    let raw = r#"
+default_job = "vlog"
+
+[jobs.vlog]
+enabled = true
+source = "{input}"
+targets = ["{parent}", "{child}"]
+extensions = ["jpg"]
+layout = "flat"
+"#;
+    let raw = raw
+        .replace("{input}", &input.display().to_string())
+        .replace("{parent}", &parent.display().to_string())
+        .replace("{child}", &child.display().to_string());
+
+    let config: config::Config = toml::from_str(&raw).unwrap();
+    let err = config::resolve_job(&config, None, None, false, None).unwrap_err();
+
+    assert!(matches!(
+        err,
+        ConfigError::OverlappingTargets { name, left, right }
+            if name == "vlog" && left == parent && right == child
+    ));
+}
+
+#[test]
 fn resolve_job_reports_missing_directory_from_targets_list() {
     let root = unique_temp_dir("pathsync-config-missing-target");
     let input = root.join("input");
