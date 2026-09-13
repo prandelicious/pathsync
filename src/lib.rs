@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 use config::{CompareConfig, Config, LayoutConfig, ResolvedJob, TransferConfig};
 use error::PathsyncError;
 use plan::{FileContext, PlanBuild, PlanJob, TransferPlan};
-use progress_format::{render_live_screen, render_post_run_screen};
+use progress_format::{
+    CANONICAL_WIDTH, render_live_screen_with_width, render_post_run_screen_with_width,
+};
 use progress_model::{
     CategoryRowModel, ErrorRowModel, LiveScreenModel, PostRunScreenModel, ProgressBarModel,
     SourceReleaseState, SummaryMetric, TargetProgressRowModel, TargetResultRowModel,
@@ -81,9 +83,19 @@ pub fn run(options: RunOptions) -> Result<(), PathsyncError> {
     Ok(copy::run_copy(&job, plans, plan_build.stats)?)
 }
 
+fn preview_terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|width| *width >= CANONICAL_WIDTH)
+        .unwrap_or(CANONICAL_WIDTH)
+}
+
 pub fn preview_ui_output(mode: PreviewUiMode) -> String {
-    let live = render_live_screen(&preview_live_screen_model()).join("\n");
-    let post = render_post_run_screen(&preview_post_run_screen_model()).join("\n");
+    let width = preview_terminal_width();
+    let live = render_live_screen_with_width(&preview_live_screen_model(), width).join("\n");
+    let post =
+        render_post_run_screen_with_width(&preview_post_run_screen_model(), width).join("\n");
 
     match mode {
         PreviewUiMode::Live => format!("{live}\n"),
@@ -330,14 +342,7 @@ fn preview_live_screen_model() -> LiveScreenModel {
             TargetProgressRowModel::new("T7", 47, "31.0 GB / 66.5 GB", "78.4 MB/s", 2),
             TargetProgressRowModel::new("Archive", 41, "27.2 GB / 66.5 GB", "64.0 MB/s", 1),
         ],
-        // Illustrates the staged relay milestone (R2) so `--preview-ui`
-        // stays reviewable without a real staged config: this canned run
-        // is "mid-copy" everywhere else, but the source-released banner
-        // doesn't depend on the rest of the snapshot, so showing it here
-        // costs nothing and needs no second canned model.
-        release_banner: source_release_banner(SourceReleaseState::Released {
-            had_failures: false,
-        }),
+        release_banner: None,
     }
 }
 
@@ -373,6 +378,16 @@ fn preview_post_run_screen_model() -> PostRunScreenModel {
         errors: vec![
             ErrorRowModel::new("Archive", "copy", "GX010194.MP4", "permission denied"),
             ErrorRowModel::new("Archive", "verify", "GX010193.MP4", "signature mismatch"),
+        ],
+        copied_preview: vec![
+            progress_model::CopiedPreviewRowModel {
+                file: "GX010193.MP4".to_string(),
+                size: "2.1 GB".to_string(),
+            },
+            progress_model::CopiedPreviewRowModel {
+                file: "GX010194.MP4".to_string(),
+                size: "14.2 MB".to_string(),
+            },
         ],
         copied_preview_count: 20,
         copied_preview_total: 316,

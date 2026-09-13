@@ -14,5 +14,11 @@ install: build
 clean:
     cargo clean
 
+# Run format, clippy, and tests
+check:
+    cargo fmt --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test
+
 # Default recipe
 default: build

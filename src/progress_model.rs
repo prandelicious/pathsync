@@ -314,6 +314,12 @@ pub struct LiveScreenModel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopiedPreviewRowModel {
+    pub file: String,
+    pub size: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostRunScreenModel {
     pub job_name: String,
     pub status: String,
@@ -323,6 +329,7 @@ pub struct PostRunScreenModel {
     pub categories: Vec<CategoryRowModel>,
     pub target_results: Vec<TargetResultRowModel>,
     pub errors: Vec<ErrorRowModel>,
+    pub copied_preview: Vec<CopiedPreviewRowModel>,
     pub copied_preview_count: usize,
     pub copied_preview_total: usize,
     /// Staged mode only (R12, display half): the same release milestone

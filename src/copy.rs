@@ -21,7 +21,7 @@ use crate::plan::{PlanningStats, TransferPlan};
 use crate::policy::TransferPolicy;
 use crate::progress_format::{
     GlyphSet, plain_progress_line, render_live_screen_with_width_and_glyphs,
-    render_post_run_screen_with_glyphs, worker_label, worker_line, worker_prefix,
+    render_post_run_screen_with_width_and_glyphs, worker_label, worker_line, worker_prefix,
 };
 use crate::progress_model::{
     CategoryRowModel, ErrorRowModel, LiveScreenModel, PhaseKind, PostRunScreenModel,
@@ -176,7 +176,7 @@ pub(crate) enum SizeBucket {
 struct WorkerState {
     tag: String,
     label: String,
-    target: String,
+    target_root: Option<PathBuf>,
     phase: TransferRowPhase,
     copied: u64,
     total: u64,
@@ -233,7 +233,7 @@ struct CopyReport {
     failures: Vec<CopyFailure>,
     large: PhaseTotals,
     small: PhaseTotals,
-    target_results: BTreeMap<String, TargetResult>,
+    target_results: BTreeMap<PathBuf, TargetResult>,
     failed: bool,
     systemic_detected: bool,
     /// Staged mode only (R12): count/bytes of the source->spool staging hop,
@@ -263,7 +263,7 @@ struct RenderContext {
     total_bytes: u64,
     planning_stats: PlanningStats,
     target_roots: Arc<Vec<PathBuf>>,
-    target_results: BTreeMap<String, TargetResult>,
+    target_results: BTreeMap<PathBuf, TargetResult>,
 }
 
 impl CopyReport {
@@ -326,9 +326,7 @@ impl CopyReport {
     }
 
     fn target_entry_mut(&mut self, target: &Path) -> &mut TargetResult {
-        self.target_results
-            .entry(target_result_label(target))
-            .or_default()
+        self.target_results.entry(target.to_path_buf()).or_default()
     }
 }
 
@@ -1958,13 +1956,13 @@ fn render_progress_tty(
                 } => {
                     let label =
                         worker_label(&name, &source, &context.source_root, WORKER_NAME_WIDTH);
-                    let target = target_volume_label(&dest);
+                    let target_root = target_root_for_dest(&dest, &context.target_roots);
                     let worker_state = &mut worker_states[worker];
                     worker_state.tag = worker_prefix(transfer_id.saturating_sub(1));
                     worker_state.bucket = bucket;
                     worker_state.phase = phase;
                     worker_state.label = label.clone();
-                    worker_state.target = target;
+                    worker_state.target_root = target_root;
                     worker_state.copied = 0;
                     worker_state.total = total;
                     worker_state.started = Some(Instant::now());
@@ -1999,7 +1997,7 @@ fn render_progress_tty(
                     worker_state.copied = 0;
                     worker_state.total = 0;
                     worker_state.label.clear();
-                    worker_state.target.clear();
+                    worker_state.target_root = None;
                     worker_state.started = None;
                     state.active_workers = state.active_workers.saturating_sub(1);
                     // `dest` matching a real target root means this is a
@@ -2032,7 +2030,7 @@ fn render_progress_tty(
                     worker_state.copied = 0;
                     worker_state.total = 0;
                     worker_state.label.clear();
-                    worker_state.target.clear();
+                    worker_state.target_root = None;
                     worker_state.started = None;
                     state.active_workers = state.active_workers.saturating_sub(1);
                     state.bytes_done += size;
@@ -2049,7 +2047,7 @@ fn render_progress_tty(
                     worker_state.copied = 0;
                     worker_state.total = 0;
                     worker_state.label.clear();
-                    worker_state.target.clear();
+                    worker_state.target_root = None;
                     worker_state.started = None;
                     state.active_workers = state.active_workers.saturating_sub(1);
                     if let Some(target) = failure_target_root(&failure, &context.target_roots) {
@@ -2069,7 +2067,7 @@ fn render_progress_tty(
                     worker_state.copied = 0;
                     worker_state.total = 0;
                     worker_state.label.clear();
-                    worker_state.target.clear();
+                    worker_state.target_root = None;
                     worker_state.started = None;
                     state.active_workers = state.active_workers.saturating_sub(1);
                     state.failed = true;
@@ -2108,7 +2106,8 @@ fn render_progress_tty(
     report.duration = state.started.elapsed();
     report.bytes_done = state.bytes_done;
     report.failed = state.failed;
-    let lines = render_post_run_screen_with_glyphs(
+    let (_, columns) = term.size();
+    let lines = render_post_run_screen_with_width_and_glyphs(
         &build_post_run_screen_model(
             &context,
             &report,
@@ -2116,6 +2115,7 @@ fn render_progress_tty(
             context.planning_stats.skipped_existing_bytes,
             state.release,
         ),
+        usize::from(columns),
         glyphs,
     );
     draw_frame(&term, &lines, &mut last_line_count)?;
@@ -2177,13 +2177,13 @@ fn render_progress_plain(
                 total: _total,
             } => {
                 let label = worker_label(&name, &source, &context.source_root, WORKER_NAME_WIDTH);
-                let target = target_volume_label(&dest);
+                let target_root = target_root_for_dest(&dest, &context.target_roots);
                 let worker_state = &mut worker_states[worker];
                 worker_state.tag = worker_prefix(transfer_id.saturating_sub(1));
                 worker_state.bucket = bucket;
                 worker_state.phase = phase;
                 worker_state.label = label.clone();
-                worker_state.target = target;
+                worker_state.target_root = target_root;
                 worker_state.copied = 0;
                 worker_state.total = _total;
                 worker_state.started = Some(Instant::now());
@@ -2231,7 +2231,7 @@ fn render_progress_plain(
                 let worker_tag = worker_state.tag.clone();
                 worker_state.copied = 0;
                 worker_state.label.clear();
-                worker_state.target.clear();
+                worker_state.target_root = None;
                 worker_state.started = None;
                 state.active_workers = state.active_workers.saturating_sub(1);
                 // See the matching comment in `render_progress_tty`: only a
@@ -2262,15 +2262,18 @@ fn render_progress_plain(
                 let worker_state = &mut worker_states[worker];
                 worker_state.copied = 0;
                 worker_state.label.clear();
-                worker_state.target.clear();
+                worker_state.target_root = None;
                 worker_state.started = None;
                 state.active_workers = state.active_workers.saturating_sub(1);
                 state.bytes_done += size;
                 state.completed += 1;
                 report.record_target_verified(&target, size);
-                for line in
-                    plain_target_progress_lines(&report, &worker_states, state.snapshot().elapsed)
-                {
+                for line in plain_target_progress_lines(
+                    &report,
+                    &worker_states,
+                    state.snapshot().elapsed,
+                    context.target_roots.as_ref(),
+                ) {
                     println!("{line}");
                 }
             }
@@ -2282,7 +2285,7 @@ fn render_progress_plain(
                 let worker_state = &mut worker_states[worker];
                 worker_state.copied = 0;
                 worker_state.label.clear();
-                worker_state.target.clear();
+                worker_state.target_root = None;
                 worker_state.started = None;
                 state.active_workers = state.active_workers.saturating_sub(1);
                 if let Some(target) = failure_target_root(&failure, &context.target_roots) {
@@ -2316,7 +2319,7 @@ fn render_progress_plain(
                 let worker_tag = worker_state.tag.clone();
                 worker_state.copied = 0;
                 worker_state.label.clear();
-                worker_state.target.clear();
+                worker_state.target_root = None;
                 worker_state.started = None;
                 state.active_workers = state.active_workers.saturating_sub(1);
                 state.failed = true;
@@ -2348,7 +2351,12 @@ fn render_progress_plain(
     report.duration = state.started.elapsed();
     report.bytes_done = state.bytes_done;
     report.failed = state.failed;
-    for line in plain_target_progress_lines(&report, &worker_states, report.duration) {
+    for line in plain_target_progress_lines(
+        &report,
+        &worker_states,
+        report.duration,
+        context.target_roots.as_ref(),
+    ) {
         println!("{line}");
     }
     print_copy_report_plain(summary_lines(
@@ -2376,8 +2384,9 @@ fn plain_target_progress_lines(
     report: &CopyReport,
     worker_states: &[WorkerState],
     elapsed: Duration,
+    target_roots: &[PathBuf],
 ) -> Vec<String> {
-    build_target_progress_rows(report, worker_states, elapsed)
+    build_target_progress_rows(report, worker_states, elapsed, target_roots)
         .into_iter()
         .map(|target| {
             format!(
@@ -2418,6 +2427,7 @@ fn relative_file_label(source_root: &Path, source: &Path) -> String {
         .to_string()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn target_volume_label(dest: &Path) -> String {
     let mut components = dest.components();
     if components.next() != Some(std::path::Component::RootDir) {
@@ -2438,39 +2448,75 @@ fn target_volume_label(dest: &Path) -> String {
     volume.to_string_lossy().into_owned()
 }
 
-fn target_result_label(target: &Path) -> String {
-    let volume = target_volume_label(target);
-    if !volume.is_empty() {
-        return volume;
+fn target_label_component(target: &Path, depth: usize) -> String {
+    use std::path::Component;
+
+    let components: Vec<_> = target
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .collect();
+    if components.is_empty() {
+        return target.display().to_string();
     }
 
-    target
-        .file_name()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| target.display().to_string())
+    let depth = depth.max(1);
+    let start = components.len().saturating_sub(depth);
+    components[start..]
+        .iter()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Builds a stable, human-readable label per configured target root.
+/// Basenames are preferred; when two targets share a basename the label
+/// grows to include more trailing path components until every label is
+/// unique (e.g. `ta`/`tb`, or `Videos/Vlog`/`Archive/Vlog` on one volume).
+fn target_display_labels(targets: &[PathBuf]) -> BTreeMap<PathBuf, String> {
+    let mut labels: Vec<(PathBuf, String)> = targets
+        .iter()
+        .map(|target| (target.clone(), target_label_component(target, 1)))
+        .collect();
+
+    for depth in 2..=8 {
+        let mut counts = std::collections::HashMap::new();
+        for (_, label) in &labels {
+            *counts.entry(label.clone()).or_insert(0) += 1;
+        }
+        let mut duplicate = false;
+        for (_, label) in &labels {
+            if counts.get(label).copied().unwrap_or(0) > 1 {
+                duplicate = true;
+                break;
+            }
+        }
+        if !duplicate {
+            break;
+        }
+        for (target, label) in &mut labels {
+            if counts.get(label).copied().unwrap_or(0) > 1 {
+                *label = target_label_component(target, depth);
+            }
+        }
+    }
+
+    labels.into_iter().collect()
 }
 
 fn initial_target_results(
     plans: &[TransferPlan],
     targets: &[PathBuf],
-) -> BTreeMap<String, TargetResult> {
+) -> BTreeMap<PathBuf, TargetResult> {
     let mut results = BTreeMap::new();
     for target in targets {
-        results.insert(target_result_label(target), TargetResult::default());
+        results.insert(target.clone(), TargetResult::default());
     }
 
     for plan in plans {
         if let Some(target) = target_root_for_plan(plan, targets) {
-            results
-                .entry(target_result_label(&target))
-                .or_default()
-                .planned += 1;
-            results
-                .entry(target_result_label(&target))
-                .or_default()
-                .planned_bytes += plan.size;
+            let entry = results.entry(target).or_default();
+            entry.planned += 1;
+            entry.planned_bytes += plan.size;
         }
     }
 
@@ -2517,9 +2563,11 @@ fn build_live_screen_model(
         PhaseKind::LargeFiles => "copying large files",
         PhaseKind::SmallFiles => "copying small files",
         PhaseKind::Adaptive => "copying files",
-        PhaseKind::Staging => "relaying via spool",
+        PhaseKind::Staging if state.release.is_released() => "draining to targets",
+        PhaseKind::Staging => "staging to spool",
     };
 
+    let display_labels = target_display_labels(context.target_roots.as_ref());
     let workers = worker_states
         .iter()
         .enumerate()
@@ -2537,6 +2585,12 @@ fn build_live_screen_model(
                 } else {
                     human_rate(worker_state.copied, elapsed)
                 };
+                let target_label = worker_state
+                    .target_root
+                    .as_ref()
+                    .and_then(|root| display_labels.get(root))
+                    .cloned()
+                    .unwrap_or_else(|| "--".to_string());
                 WorkerRowModel::active_with_phase(
                     worker_spinner_frame(worker_state.started, worker, render_now),
                     if worker_state.tag.is_empty() {
@@ -2549,7 +2603,7 @@ fn build_live_screen_model(
                     worker_state.label.clone(),
                     human_bytes(worker_state.total),
                     worker_rate,
-                    worker_state.target.clone(),
+                    target_label,
                 )
             }
         })
@@ -2561,6 +2615,7 @@ fn build_live_screen_model(
             PhaseKind::LargeFiles => "LIVE / COPY-LARGE".to_string(),
             PhaseKind::SmallFiles => "LIVE / COPY-SMALL".to_string(),
             PhaseKind::Adaptive => "LIVE / COPY".to_string(),
+            PhaseKind::Staging if state.release.is_released() => "LIVE / DRAIN".to_string(),
             PhaseKind::Staging => "LIVE / RELAY".to_string(),
         },
         summary: vec![
@@ -2572,7 +2627,7 @@ fn build_live_screen_model(
                 "Planned",
                 format_count(context.planning_stats.planned_files),
             ),
-            SummaryMetric::new("Copied", format_count(snapshot.completed)),
+            SummaryMetric::new("Copied", format_count(report.copied_files.len())),
             SummaryMetric::new("Verified", format_count(snapshot.completed)),
             SummaryMetric::new("Failed", format_count(report.failures.len())),
             SummaryMetric::new(
@@ -2601,7 +2656,12 @@ fn build_live_screen_model(
         ),
         phase_label: format!("overall  {phase_text}"),
         workers,
-        target_progress: build_target_progress_rows(report, worker_states, snapshot.elapsed),
+        target_progress: build_target_progress_rows(
+            report,
+            worker_states,
+            snapshot.elapsed,
+            context.target_roots.as_ref(),
+        ),
         release_banner: source_release_banner(state.release),
     }
 }
@@ -2610,17 +2670,25 @@ fn build_target_progress_rows(
     report: &CopyReport,
     worker_states: &[WorkerState],
     elapsed: Duration,
+    target_roots: &[PathBuf],
 ) -> Vec<TargetProgressRowModel> {
+    let display_labels = target_display_labels(target_roots);
     report
         .target_results
         .iter()
         .map(|(target, result)| {
             let active_workers = worker_states
                 .iter()
-                .filter(|worker| !worker.label.is_empty() && worker.target == *target)
+                .filter(|worker| {
+                    !worker.label.is_empty() && worker.target_root.as_ref() == Some(target)
+                })
                 .count();
+            let label = display_labels
+                .get(target)
+                .cloned()
+                .unwrap_or_else(|| target.display().to_string());
             TargetProgressRowModel::new(
-                target,
+                label,
                 progress_percent(result.verified_bytes, result.planned_bytes),
                 format!(
                     "{} / {}",
@@ -2780,18 +2848,32 @@ fn build_post_run_screen_model(
             )
         })
         .collect();
+    let display_labels = target_display_labels(context.target_roots.as_ref());
     let target_results = report
         .target_results
         .iter()
         .map(|(target, result)| {
+            let label = display_labels
+                .get(target)
+                .cloned()
+                .unwrap_or_else(|| target.display().to_string());
             TargetResultRowModel::new(
-                target,
+                label,
                 result.planned,
                 result.copied,
                 result.verified,
                 result.copy_failed,
                 result.verify_failed,
             )
+        })
+        .collect();
+    let copied_preview = report
+        .copied_files
+        .iter()
+        .take(SUMMARY_FILE_PREVIEW_LIMIT)
+        .map(|file| crate::progress_model::CopiedPreviewRowModel {
+            file: file.file.clone(),
+            size: human_bytes(file.size),
         })
         .collect();
 
@@ -2837,6 +2919,7 @@ fn build_post_run_screen_model(
         categories,
         target_results,
         errors,
+        copied_preview,
         copied_preview_count: report.copied_files.len().min(SUMMARY_FILE_PREVIEW_LIMIT),
         copied_preview_total: report.copied_files.len(),
         release_banner: source_release_banner(release),
@@ -2941,7 +3024,12 @@ fn summary_lines(
         ),
     ];
 
+    let display_labels = target_display_labels(target_roots);
     for (target, result) in &report.target_results {
+        let label = display_labels
+            .get(target)
+            .cloned()
+            .unwrap_or_else(|| target.display().to_string());
         let result_label = if result.copy_failed == 0
             && result.verify_failed == 0
             && result.planned == result.copied
@@ -2953,7 +3041,7 @@ fn summary_lines(
         };
         lines.push(format!(
             "{:<22} {:>7} {:>7} {:>8} {:>9} {:>11}   {}",
-            truncate_right(target, 22),
+            truncate_right(&label, 22),
             result.planned,
             result.copied,
             result.verified,
@@ -3481,12 +3569,13 @@ fn grouped_target_label(dests: &[&Path], target_roots: &[PathBuf]) -> String {
     if dests.is_empty() {
         return "--".to_string();
     }
+    let display_labels = target_display_labels(target_roots);
     dests
         .iter()
         .map(|dest| {
             target_root_for_dest(dest, target_roots)
-                .map(|target| target_result_label(&target))
-                .unwrap_or_else(|| target_result_label(dest))
+                .and_then(|root| display_labels.get(&root).cloned())
+                .unwrap_or_else(|| target_label_component(dest, 1))
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -4138,6 +4227,49 @@ mod tests {
     }
 
     #[test]
+    fn target_display_labels_disambiguate_same_volume_multi_target_roots() {
+        let targets = vec![
+            PathBuf::from("/Volumes/T7/Videos/Vlog"),
+            PathBuf::from("/Volumes/T7/Archive/Vlog"),
+            PathBuf::from("/Volumes/T7/ta"),
+            PathBuf::from("/Volumes/T7/tb"),
+        ];
+        let labels = target_display_labels(&targets);
+
+        assert_eq!(labels[&targets[0]], "Videos/Vlog");
+        assert_eq!(labels[&targets[1]], "Archive/Vlog");
+        assert_eq!(labels[&targets[2]], "ta");
+        assert_eq!(labels[&targets[3]], "tb");
+    }
+
+    #[test]
+    fn initial_target_results_keeps_same_volume_targets_separate() {
+        let targets = vec![
+            PathBuf::from("/Volumes/T7/ta"),
+            PathBuf::from("/Volumes/T7/tb"),
+        ];
+        let plans = vec![
+            TransferPlan {
+                source: PathBuf::from("/source/a.jpg"),
+                dest: PathBuf::from("/Volumes/T7/ta/a.jpg"),
+                size: 10,
+                display_name: "a.jpg".to_string(),
+            },
+            TransferPlan {
+                source: PathBuf::from("/source/b.jpg"),
+                dest: PathBuf::from("/Volumes/T7/tb/b.jpg"),
+                size: 20,
+                display_name: "b.jpg".to_string(),
+            },
+        ];
+
+        let results = initial_target_results(&plans, &targets);
+
+        assert_eq!(results[&targets[0]].planned, 1);
+        assert_eq!(results[&targets[1]].planned, 1);
+    }
+
+    #[test]
     fn initial_target_results_counts_planned_files_by_target() {
         let targets = vec![PathBuf::from("/target-a"), PathBuf::from("/target-b")];
         let plans = vec![
@@ -4163,8 +4295,8 @@ mod tests {
 
         let results = initial_target_results(&plans, &targets);
 
-        assert_eq!(results["target-a"].planned, 1);
-        assert_eq!(results["target-b"].planned, 2);
+        assert_eq!(results[&PathBuf::from("/target-a")].planned, 1);
+        assert_eq!(results[&PathBuf::from("/target-b")].planned, 2);
     }
 
     #[test]
@@ -4194,7 +4326,7 @@ mod tests {
         report.record_target_copy_failure(&target);
         report.record_target_verify_failure(&target);
 
-        let result = &report.target_results["target"];
+        let result = &report.target_results[&target];
         assert_eq!(result.planned, 2);
         assert_eq!(result.planned_bytes, 30);
         assert_eq!(result.copied, 1);
