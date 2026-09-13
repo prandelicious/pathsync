@@ -149,8 +149,15 @@ fn may4_transfer_section(lines: &[String]) -> Vec<&String> {
 }
 
 fn is_may4_stacked_metrics_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    line.starts_with(' ') && trimmed.contains('→')
+    let indent = line.chars().take_while(|ch| *ch == ' ').count();
+    indent >= 4 && !line.contains("idle")
+}
+
+fn char_index(haystack: &str, needle: &str) -> usize {
+    haystack
+        .find(needle)
+        .map(|byte_index| haystack[..byte_index].chars().count())
+        .unwrap_or_else(|| panic!("{needle:?} not found in {haystack:?}"))
 }
 
 fn may4_transfer_block<'a>(section: &[&'a String], tag: &str) -> Vec<&'a String> {
@@ -198,7 +205,67 @@ fn may4_live_preview_keeps_full_archive_destination_at_width_90() {
 }
 
 #[test]
-fn may4_live_preview_stacks_long_filename_transfer_when_oneline_mins_do_not_fit() {
+fn may4_live_preview_keeps_size_and_rate_unit_columns_stable_when_qty_grows() {
+    for width in [100usize, 140] {
+        let mut small = live_model();
+        small.workers[0].size = "9.9 GB".to_string();
+        small.workers[0].time = "99.0 MB/s".to_string();
+        let mut large = small.clone();
+        large.workers[0].size = "10.0 GB".to_string();
+        large.workers[0].time = "101.0 MB/s".to_string();
+
+        let small_line = may4_transfer_block(
+            &may4_transfer_section(&render_may4_live_screen_with_width(&small, width)),
+            "T01",
+        )[0]
+        .clone();
+        let large_line = may4_transfer_block(
+            &may4_transfer_section(&render_may4_live_screen_with_width(&large, width)),
+            "T01",
+        )[0]
+        .clone();
+
+        assert_eq!(
+            char_index(&small_line, "GB"),
+            char_index(&large_line, "GB"),
+            "GB shifted at width {width}:\n{small_line}\n{large_line}"
+        );
+        assert_eq!(
+            char_index(&small_line, "MB/s"),
+            char_index(&large_line, "MB/s"),
+            "MB/s shifted at width {width}:\n{small_line}\n{large_line}"
+        );
+        assert_eq!(
+            char_index(&small_line, "T7"),
+            char_index(&large_line, "T7"),
+            "dest shifted at width {width}:\n{small_line}\n{large_line}"
+        );
+        assert_eq!(
+            char_index(&small_line, "A001_C014"),
+            char_index(&large_line, "A001_C014"),
+            "filename shifted at width {width}:\n{small_line}\n{large_line}"
+        );
+
+        let idle_line = may4_transfer_block(
+            &may4_transfer_section(&render_may4_live_screen_with_width(&small, width)),
+            "T04",
+        )[0]
+        .clone();
+        let gb = char_index(&small_line, "GB");
+        let idle_qty: String = idle_line
+            .chars()
+            .skip(gb.saturating_sub(6))
+            .take(5)
+            .collect();
+        assert_eq!(
+            idle_qty, "   --",
+            "idle size qty should share the active size slot at width {width}:\n{small_line}\n{idle_line}"
+        );
+    }
+}
+
+#[test]
+fn may4_live_preview_keeps_oneline_truncated_filename_and_visible_dest_at_width_80() {
     let mut model = live_model();
     model.workers[0].item =
         "DCIM/100GOPRO/very_long_clip_directory_name/A001_C014_0101AB.MP4".to_string();
@@ -210,29 +277,75 @@ fn may4_live_preview_stacks_long_filename_transfer_when_oneline_mins_do_not_fit(
     let t01 = may4_transfer_block(&section, "T01");
     assert_eq!(
         t01.len(),
-        2,
-        "long filename transfer must occupy two lines: {t01:?}"
+        1,
+        "long filename stays one-line when dest and filename mins fit: {t01:?}"
     );
-    assert!(t01[0].contains("T01"), "line 1 worker: {}", t01[0]);
-    assert!(t01[0].contains("hashing"), "line 1 phase: {}", t01[0]);
+    let line = t01[0];
+    assert!(line.contains("T01"), "worker: {line}");
+    assert!(line.contains("hashing"), "phase: {line}");
+    assert!(line.contains("T7"), "destination stays visible: {line}");
     assert!(
-        t01[0].contains("A001_C014_0101AB.MP4") || t01[0].contains('…'),
-        "line 1 filename: {}",
-        t01[0]
+        line.contains('…') || line.contains("MP4"),
+        "filename truncated or tail visible: {line}"
     );
     assert!(
-        !t01[0].contains('→'),
-        "destination stays on line 2, got: {}",
-        t01[0]
+        char_index(line, "T7") < char_index(line, "DCIM").min(char_index(line, "MP4")),
+        "dest before filename: {line}"
     );
-    assert!(t01[1].contains("8.2 GB"), "line 2 size: {}", t01[1]);
-    assert!(t01[1].contains("78.4 MB/s"), "line 2 rate: {}", t01[1]);
-    assert!(t01[1].contains('→'), "line 2 arrow: {}", t01[1]);
-    assert!(t01[1].contains("T7"), "line 2 destination: {}", t01[1]);
 
     let t04 = may4_transfer_block(&section, "T04");
     assert_eq!(t04.len(), 1, "idle workers stay one line: {t04:?}");
     assert!(t04[0].contains("idle"), "idle label: {}", t04[0]);
+}
+
+#[test]
+fn may4_live_preview_phase_width_does_not_shift_later_columns() {
+    let mut model = live_model();
+    model.workers[1] = WorkerRowModel::active(
+        '⠙',
+        "T02",
+        51,
+        "A001_C015_0101AB.MP4",
+        "7.9 GB",
+        "64.0 MB/s",
+        "Archive",
+    );
+    model.workers[2] = WorkerRowModel::active_with_phase(
+        '⠹',
+        "T03",
+        TransferRowPhase::Verifying,
+        12,
+        "A001_C015_0101AB.MP4",
+        "7.9 GB",
+        "64.0 MB/s",
+        "Archive",
+    );
+
+    let lines = render_may4_live_screen_with_width(&model, 100);
+    let section = may4_transfer_section(&lines);
+    let copying = may4_transfer_block(&section, "T02")[0];
+    let verifying = may4_transfer_block(&section, "T03")[0];
+
+    assert!(copying.contains("copying"), "copying phase: {copying}");
+    assert!(
+        verifying.contains("verifying"),
+        "verifying phase: {verifying}"
+    );
+    assert_eq!(
+        char_index(copying, "Archive"),
+        char_index(verifying, "Archive"),
+        "dest shifted:\n{copying}\n{verifying}"
+    );
+    assert_eq!(
+        char_index(copying, "A001_C015_0101AB.MP4"),
+        char_index(verifying, "A001_C015_0101AB.MP4"),
+        "filename shifted:\n{copying}\n{verifying}"
+    );
+    assert_eq!(
+        char_index(copying, "GB"),
+        char_index(verifying, "GB"),
+        "size shifted:\n{copying}\n{verifying}"
+    );
 }
 
 #[test]
@@ -258,8 +371,18 @@ fn may4_live_preview_keeps_oneline_transfers_with_rate_at_width_140() {
         t01[0]
     );
     assert!(
+        char_index(t01[0], "T7") < char_index(t01[0], "A001_C014"),
+        "dest before filename: {}",
+        t01[0]
+    );
+    assert!(
         t02[0].contains("64.0 MB/s") && t02[0].contains("Archive"),
         "{}",
+        t02[0]
+    );
+    assert!(
+        char_index(t02[0], "Archive") < char_index(t02[0], "A001_C015"),
+        "dest before filename: {}",
         t02[0]
     );
     assert!(
