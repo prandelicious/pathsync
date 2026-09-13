@@ -148,6 +148,7 @@ fn render_live_screen_narrow(model: &LiveScreenModel, width: usize) -> Vec<Strin
             width,
         ));
     }
+    append_target_progress_lines(&mut lines, model, width);
     lines.push(divider(width));
 
     lines
@@ -256,18 +257,31 @@ fn stats_box_row(label: &str, value: &str, inner_width: usize) -> String {
 }
 
 pub fn render_post_run_screen(model: &PostRunScreenModel) -> Vec<String> {
-    render_post_run_screen_with_glyphs(model, GlyphSet::Unicode)
+    render_post_run_screen_with_width(model, CANONICAL_WIDTH)
+}
+
+pub fn render_post_run_screen_with_width(model: &PostRunScreenModel, width: usize) -> Vec<String> {
+    render_post_run_screen_with_width_and_glyphs(model, width, GlyphSet::Unicode)
 }
 
 pub fn render_post_run_screen_with_glyphs(
     model: &PostRunScreenModel,
     glyphs: GlyphSet,
 ) -> Vec<String> {
+    render_post_run_screen_with_width_and_glyphs(model, CANONICAL_WIDTH, glyphs)
+}
+
+pub fn render_post_run_screen_with_width_and_glyphs(
+    model: &PostRunScreenModel,
+    width: usize,
+    glyphs: GlyphSet,
+) -> Vec<String> {
+    let width = width.max(CANONICAL_WIDTH);
     let mut lines = vec![
-        header_line(&model.job_name, &model.status, CANONICAL_WIDTH),
-        divider(CANONICAL_WIDTH),
+        header_line(&model.job_name, &model.status, width),
+        divider(width),
     ];
-    lines.extend(release_banner_lines(&model.release_banner, CANONICAL_WIDTH));
+    lines.extend(release_banner_lines(&model.release_banner, width));
     lines.extend([
         progress_line(
             &model.completion_label,
@@ -277,90 +291,130 @@ pub fn render_post_run_screen_with_glyphs(
                 metric_value(&model.summary, "Bytes"),
                 metric_value(&model.summary, "ETA")
             )),
-            CANONICAL_WIDTH,
+            width,
         ),
-        blank_line(CANONICAL_WIDTH),
-        pad_to_width("Target Results", CANONICAL_WIDTH),
-        divider(CANONICAL_WIDTH),
+        blank_line(width),
+        pad_to_width("Target Results", width),
+        divider(width),
         pad_to_width(
             &format!(
                 "{:<12} {:>7} {:>7} {:>8} {:>9} {:>11}   {}",
                 "Target", "Planned", "Copied", "Verified", "Copy Fail", "Verify Fail", "Result"
             ),
-            CANONICAL_WIDTH,
+            width,
         ),
     ]);
 
     for target in &model.target_results {
-        lines.push(render_target_result_row(target));
+        lines.push(render_target_result_row(target, width));
     }
 
     if let Some(staging) = &model.staging {
-        lines.push(blank_line(CANONICAL_WIDTH));
-        lines.push(pad_to_width("Staging", CANONICAL_WIDTH));
-        lines.push(divider(CANONICAL_WIDTH));
+        lines.push(blank_line(width));
+        lines.push(pad_to_width("Staging", width));
+        lines.push(divider(width));
         lines.push(pad_to_width(
             &format!(
                 "Staged       {:>7} files   {:>10}",
                 format_count(staging.staged_files),
                 staging.staged_bytes
             ),
-            CANONICAL_WIDTH,
+            width,
         ));
         lines.push(pad_to_width(
             &format!("Peak spool usage   {}", staging.peak_spool_bytes),
-            CANONICAL_WIDTH,
+            width,
         ));
         if let Some(released) = &staging.released_after {
             lines.push(pad_to_width(
                 &format!("Source released    {released}"),
-                CANONICAL_WIDTH,
+                width,
             ));
         }
     }
 
     if !model.errors.is_empty() {
-        lines.push(blank_line(CANONICAL_WIDTH));
-        lines.push(pad_to_width("Failures", CANONICAL_WIDTH));
-        lines.push(divider(CANONICAL_WIDTH));
+        lines.push(blank_line(width));
+        lines.push(pad_to_width("Failures", width));
+        lines.push(divider(width));
         lines.push(pad_to_width(
             &format!("{:<10} {:<8} {:<24} {}", "Target", "Phase", "File", "Error"),
-            CANONICAL_WIDTH,
+            width,
         ));
         for error in &model.errors {
-            lines.push(render_error_row(error));
+            lines.push(render_error_row(error, width));
         }
     }
 
-    lines.push(blank_line(CANONICAL_WIDTH));
-    lines.push(pad_to_width("Breakdown", CANONICAL_WIDTH));
-    lines.push(divider(CANONICAL_WIDTH));
+    lines.push(blank_line(width));
+    lines.push(pad_to_width("Breakdown", width));
+    lines.push(divider(width));
     lines.push(pad_to_width(
         &format!(
             "{:<20} {:>7} {:>12} {:>9}",
             "Bucket", "Files", "Bytes", "Share"
         ),
-        CANONICAL_WIDTH,
+        width,
     ));
 
     for category in &model.categories {
-        lines.push(render_category_row(category));
+        lines.push(render_category_row(category, width));
     }
 
     if model.copied_preview_total > 0 {
-        lines.push(blank_line(CANONICAL_WIDTH));
-        lines.push(pad_to_width("Copied file preview", CANONICAL_WIDTH));
+        lines.push(blank_line(width));
+        lines.push(pad_to_width("Copied file preview", width));
+        lines.push(divider(width));
         lines.push(pad_to_width(
-            &format!(
-                "showing {} of {} copied files",
-                format_count(model.copied_preview_count.min(model.copied_preview_total)),
-                format_count(model.copied_preview_total),
-            ),
-            CANONICAL_WIDTH,
+            &format!("{:<3} {:<44} {:>10}", "#", "File", "Size"),
+            width,
         ));
+        for (index, file) in model.copied_preview.iter().enumerate() {
+            lines.push(pad_to_width(
+                &format!(
+                    "{:<3} {:<44} {:>10}",
+                    index + 1,
+                    truncate_middle(&file.file, 44),
+                    file.size
+                ),
+                width,
+            ));
+        }
+        if model.copied_preview_total > model.copied_preview.len() {
+            lines.push(blank_line(width));
+            lines.push(pad_to_width(
+                &format!(
+                    "showing {} of {} copied files",
+                    format_count(model.copied_preview_count.min(model.copied_preview_total)),
+                    format_count(model.copied_preview_total),
+                ),
+                width,
+            ));
+        }
     }
 
     apply_glyphs(lines, glyphs)
+}
+
+fn append_target_progress_lines(lines: &mut Vec<String>, model: &LiveScreenModel, width: usize) {
+    if model.target_progress.is_empty() {
+        return;
+    }
+
+    lines.push(blank_line(width));
+    lines.push(pad_to_width("Targets", width));
+    for target in model.target_progress.iter().take(VISIBLE_TARGET_ROWS) {
+        lines.push(render_target_progress_row(target, width));
+    }
+    if model.target_progress.len() > VISIBLE_TARGET_ROWS {
+        lines.push(pad_to_width(
+            &format!(
+                "... {} more targets",
+                model.target_progress.len() - VISIBLE_TARGET_ROWS
+            ),
+            width,
+        ));
+    }
 }
 
 fn apply_glyphs(lines: Vec<String>, glyphs: GlyphSet) -> Vec<String> {
@@ -384,7 +438,10 @@ fn ascii_line(line: String) -> String {
         .collect()
 }
 
-fn render_target_result_row(target: &crate::progress_model::TargetResultRowModel) -> String {
+fn render_target_result_row(
+    target: &crate::progress_model::TargetResultRowModel,
+    width: usize,
+) -> String {
     let result = if target.copy_failed == 0
         && target.verify_failed == 0
         && target.planned == target.copied
@@ -405,7 +462,7 @@ fn render_target_result_row(target: &crate::progress_model::TargetResultRowModel
             format_count(target.verify_failed),
             result,
         ),
-        CANONICAL_WIDTH,
+        width,
     )
 }
 
@@ -519,7 +576,7 @@ fn render_target_progress_row(target: &TargetProgressRowModel, width: usize) -> 
     )
 }
 
-fn render_category_row(category: &crate::progress_model::CategoryRowModel) -> String {
+fn render_category_row(category: &crate::progress_model::CategoryRowModel, width: usize) -> String {
     pad_to_width(
         &format!(
             "{:<20} {:>7} {:>12} {:>9}",
@@ -528,13 +585,13 @@ fn render_category_row(category: &crate::progress_model::CategoryRowModel) -> St
             category.bytes,
             category.percent,
         ),
-        CANONICAL_WIDTH,
+        width,
     )
 }
 
-fn render_error_row(error: &crate::progress_model::ErrorRowModel) -> String {
+fn render_error_row(error: &crate::progress_model::ErrorRowModel, width: usize) -> String {
     let fixed_width = 10 + 1 + 8 + 1 + 24 + 1;
-    let error_width = CANONICAL_WIDTH.saturating_sub(fixed_width);
+    let error_width = width.saturating_sub(fixed_width);
     pad_to_width(
         &format!(
             "{:<10} {:<8} {:<24} {}",
@@ -543,7 +600,7 @@ fn render_error_row(error: &crate::progress_model::ErrorRowModel) -> String {
             truncate_middle(&error.file, 24),
             truncate_middle(&error.error, error_width),
         ),
-        CANONICAL_WIDTH,
+        width,
     )
 }
 

@@ -191,7 +191,10 @@ fn preview_ui_flag_renders_canned_live_and_post_copy_screens_without_config() {
     );
     assert!(live.stdout.contains("LIVE / COPY-LARGE"));
     assert!(!live.stdout.contains("ATTENTION"));
-    assert!(live.stdout.contains("source released"));
+    assert!(
+        !live.stdout.contains("source released"),
+        "mid-copy live preview must not show the release milestone"
+    );
 
     assert!(
         post.status.success(),

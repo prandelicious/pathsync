@@ -104,6 +104,7 @@ fn post_run_model() -> PostRunScreenModel {
             ErrorRowModel::new("Archive", "copy", "GX010194.MP4", "permission denied"),
             ErrorRowModel::new("Archive", "verify", "GX010193.MP4", "signature mismatch"),
         ],
+        copied_preview: vec![],
         copied_preview_count: 20,
         copied_preview_total: 316,
         release_banner: None,
@@ -151,7 +152,7 @@ fn narrow_live_screen_renders_stacked_80_column_layout() {
     assert!(rendered.contains("A001_C014_0101AB.MP4"));
     assert!(rendered.contains("T7"));
     assert!(!rendered.contains("┌ Run "));
-    assert!(!rendered.contains("\nTargets"));
+    assert!(rendered.contains("Targets"));
 }
 
 #[test]
@@ -192,7 +193,7 @@ fn ascii_glyph_fallback_reuses_layout_without_unicode_symbols() {
 }
 
 #[test]
-fn narrow_live_screen_uses_stacked_fallback_without_run_box_or_target_strip() {
+fn narrow_live_screen_uses_stacked_fallback_without_run_box() {
     let mut model = live_model();
     model.workers[0].item = "VID_20260420_4609_121.mp4".to_string();
     model.workers[0].target = "My Passport".to_string();
@@ -202,7 +203,7 @@ fn narrow_live_screen_uses_stacked_fallback_without_run_box_or_target_strip() {
 
     assert!(lines.iter().all(|line| line.chars().count() == 80));
     assert!(!rendered.contains("┌ Run "));
-    assert!(!rendered.contains("\nTargets"));
+    assert!(rendered.contains("Targets"));
     assert!(rendered.contains("VID_20260420"));
     assert!(rendered.contains("My Passport"));
     assert!(rendered.contains("hashing"));
