@@ -818,14 +818,71 @@ fn fit_first_variant(variants: &[String], width: usize) -> String {
     truncate_right(variants.last().map(String::as_str).unwrap_or(""), width)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct QtyUnitSlots {
+    qty_width: usize,
+    unit_width: usize,
+}
+
+impl QtyUnitSlots {
+    const SIZE: Self = Self {
+        qty_width: 5,
+        unit_width: 2,
+    };
+    const RATE: Self = Self {
+        qty_width: 5,
+        unit_width: 4,
+    };
+
+    const fn total(self) -> usize {
+        self.qty_width + 1 + self.unit_width
+    }
+
+    fn format(self, value: &str) -> String {
+        let (qty, unit) = split_qty_unit(value);
+        let qty = truncate_right(qty, self.qty_width);
+        let unit = truncate_right(unit, self.unit_width);
+        format!(
+            "{qty:>qty_width$} {unit:<unit_width$}",
+            qty_width = self.qty_width,
+            unit_width = self.unit_width
+        )
+    }
+}
+
+fn split_qty_unit(value: &str) -> (&str, &str) {
+    match value.rsplit_once(' ') {
+        Some((qty, unit)) if !qty.is_empty() && !unit.is_empty() => (qty, unit),
+        _ => (value, ""),
+    }
+}
+
+fn format_bytes_range(bytes_metric: &str) -> String {
+    let parts: Vec<&str> = bytes_metric.split(" / ").collect();
+    if parts.len() != 2 {
+        return QtyUnitSlots::SIZE.format(bytes_metric);
+    }
+
+    let (left_qty, _) = split_qty_unit(parts[0]);
+    let (right_qty, right_unit) = split_qty_unit(parts[1]);
+    let left_qty = truncate_right(left_qty, QtyUnitSlots::SIZE.qty_width);
+    let right_qty = truncate_right(right_qty, QtyUnitSlots::SIZE.qty_width);
+    let unit = truncate_right(right_unit, QtyUnitSlots::SIZE.unit_width);
+    format!(
+        "{left_qty:>qty_width$} / {right_qty:>qty_width$} {unit:<unit_width$}",
+        qty_width = QtyUnitSlots::SIZE.qty_width,
+        unit_width = QtyUnitSlots::SIZE.unit_width
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransferFieldId {
     Worker,
     Phase,
+    Destination,
     Filename,
     Size,
     Rate,
-    Destination,
 }
 
 impl TransferFieldId {
@@ -833,10 +890,10 @@ impl TransferFieldId {
         match self {
             Self::Worker => 0,
             Self::Phase => 1,
-            Self::Filename => 2,
-            Self::Size => 3,
-            Self::Rate => 4,
-            Self::Destination => 5,
+            Self::Destination => 2,
+            Self::Filename => 3,
+            Self::Size => 4,
+            Self::Rate => 5,
         }
     }
 }
@@ -847,9 +904,6 @@ struct FieldSpec {
     min: usize,
     preferred: usize,
     max: usize,
-    /// lower = keep first
-    priority: u8,
-    required_for_oneline: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -871,83 +925,57 @@ impl FieldAllocation {
 }
 
 const FIELD_COUNT: usize = 6;
+const WORKER_TAG_WIDTH: usize = 3;
 const FILENAME_MIN: usize = 12;
 const FILENAME_MAX: usize = 72;
 const PHASE_WIDTH: usize = 9;
-const SIZE_PREFERRED: usize = 8;
-const SIZE_MAX: usize = 12;
-const RATE_PREFERRED: usize = 10;
-const RATE_MAX: usize = 12;
+const DESTINATION_MIN: usize = 12;
 const DESTINATION_MAX: usize = 24;
-const ONE_LINE_SEPARATORS_WITHOUT_RATE: usize = 10;
-const ONE_LINE_RATE_SEPARATOR: usize = 2;
-const STACK_LINE1_SEPARATORS: usize = 6;
-const STACK_INDENT: usize = 9;
-const STACK_LINE2_GAPS: usize = 7;
+const TARGET_LABEL_WIDTH: usize = 12;
+const ONE_LINE_SEPARATORS: usize = 12;
+const STACK_LINE1_SEPARATORS: usize = 8;
+const STACK_INDENT: usize = 1 + 1 + WORKER_TAG_WIDTH + 2 + PHASE_WIDTH + 2;
+const STACK_LINE2_GAPS: usize = 4;
 
-fn transfer_field_specs(worker: &WorkerRowModel) -> [FieldSpec; FIELD_COUNT] {
-    let worker_len = worker.worker_tag.chars().count().max(1);
-    let filename_len = worker.item.chars().count();
-    let filename_min = filename_len
-        .min(FILENAME_MAX)
-        .max(filename_len.min(FILENAME_MIN));
-    let size_len = worker.size.chars().count().max(1);
-    let rate_len = worker.time.chars().count().max(1);
-    let dest_len = if worker.target.is_empty() {
-        2
-    } else {
-        worker.target.chars().count().max(1)
-    }
-    .min(DESTINATION_MAX);
-
+fn transfer_field_specs() -> [FieldSpec; FIELD_COUNT] {
+    let size = QtyUnitSlots::SIZE.total();
+    let rate = QtyUnitSlots::RATE.total();
     [
         FieldSpec {
             id: TransferFieldId::Worker,
-            min: worker_len,
-            preferred: worker_len,
-            max: worker_len,
-            priority: 0,
-            required_for_oneline: true,
+            min: WORKER_TAG_WIDTH,
+            preferred: WORKER_TAG_WIDTH,
+            max: WORKER_TAG_WIDTH,
         },
         FieldSpec {
             id: TransferFieldId::Phase,
             min: PHASE_WIDTH,
             preferred: PHASE_WIDTH,
             max: PHASE_WIDTH,
-            priority: 1,
-            required_for_oneline: true,
-        },
-        FieldSpec {
-            id: TransferFieldId::Filename,
-            min: filename_min,
-            preferred: filename_len.min(FILENAME_MAX).max(filename_min),
-            max: FILENAME_MAX,
-            priority: 4,
-            required_for_oneline: true,
-        },
-        FieldSpec {
-            id: TransferFieldId::Size,
-            min: size_len,
-            preferred: size_len.max(SIZE_PREFERRED),
-            max: SIZE_MAX,
-            priority: 3,
-            required_for_oneline: true,
-        },
-        FieldSpec {
-            id: TransferFieldId::Rate,
-            min: rate_len,
-            preferred: rate_len.max(RATE_PREFERRED),
-            max: RATE_MAX,
-            priority: 5,
-            required_for_oneline: false,
         },
         FieldSpec {
             id: TransferFieldId::Destination,
-            min: dest_len,
-            preferred: dest_len,
+            min: DESTINATION_MIN,
+            preferred: DESTINATION_MAX,
             max: DESTINATION_MAX,
-            priority: 2,
-            required_for_oneline: true,
+        },
+        FieldSpec {
+            id: TransferFieldId::Filename,
+            min: FILENAME_MIN,
+            preferred: FILENAME_MIN,
+            max: FILENAME_MAX,
+        },
+        FieldSpec {
+            id: TransferFieldId::Size,
+            min: size,
+            preferred: size,
+            max: size,
+        },
+        FieldSpec {
+            id: TransferFieldId::Rate,
+            min: rate,
+            preferred: rate,
+            max: rate,
         },
     ]
 }
@@ -962,67 +990,32 @@ fn grow_width(current: usize, remaining: usize, target: usize) -> (usize, usize)
 }
 
 fn allocate(specs: &[FieldSpec; FIELD_COUNT], width: usize) -> FieldAllocation {
-    let required_min: usize = specs
-        .iter()
-        .filter(|spec| spec.required_for_oneline)
-        .map(|spec| spec.min)
-        .sum();
-    let one_line_min = required_min + ONE_LINE_SEPARATORS_WITHOUT_RATE;
+    let one_line_min: usize =
+        specs.iter().map(|spec| spec.min).sum::<usize>() + ONE_LINE_SEPARATORS;
     if one_line_min > width {
         return allocate_stacked(specs, width);
     }
 
     let mut widths = [0usize; FIELD_COUNT];
     for spec in specs {
-        if spec.required_for_oneline {
-            widths[spec.id.index()] = spec.min;
-        }
+        widths[spec.id.index()] = spec.min;
     }
 
     let mut remaining = width - one_line_min;
-    let filename = spec_for(specs, TransferFieldId::Filename);
     let destination = spec_for(specs, TransferFieldId::Destination);
-    let size = spec_for(specs, TransferFieldId::Size);
-    let phase = spec_for(specs, TransferFieldId::Phase);
+    let filename = spec_for(specs, TransferFieldId::Filename);
 
-    (widths[filename.id.index()], remaining) =
-        grow_width(widths[filename.id.index()], remaining, filename.preferred);
     (widths[destination.id.index()], remaining) = grow_width(
         widths[destination.id.index()],
         remaining,
         destination.preferred,
     );
-
-    let mut optional: Vec<FieldSpec> = specs
-        .iter()
-        .copied()
-        .filter(|spec| !spec.required_for_oneline)
-        .collect();
-    optional.sort_by_key(|spec| spec.priority);
-    for spec in optional {
-        let needed = spec.min + ONE_LINE_RATE_SEPARATOR;
-        if remaining >= needed {
-            remaining -= needed;
-            widths[spec.id.index()] = spec.min;
-            (widths[spec.id.index()], remaining) =
-                grow_width(widths[spec.id.index()], remaining, spec.preferred);
-        }
-    }
-
     (widths[filename.id.index()], remaining) =
-        grow_width(widths[filename.id.index()], remaining, filename.max);
+        grow_width(widths[filename.id.index()], remaining, filename.preferred);
     (widths[destination.id.index()], remaining) =
         grow_width(widths[destination.id.index()], remaining, destination.max);
-
-    let rate_idx = TransferFieldId::Rate.index();
-    if widths[rate_idx] > 0 {
-        let rate = spec_for(specs, TransferFieldId::Rate);
-        (widths[rate_idx], remaining) = grow_width(widths[rate_idx], remaining, rate.max);
-    }
-
-    (widths[phase.id.index()], remaining) =
-        grow_width(widths[phase.id.index()], remaining, phase.preferred);
-    (widths[size.id.index()], remaining) = grow_width(widths[size.id.index()], remaining, size.max);
+    (widths[filename.id.index()], remaining) =
+        grow_width(widths[filename.id.index()], remaining, filename.max);
 
     debug_assert_eq!(
         remaining,
@@ -1036,19 +1029,13 @@ fn allocate(specs: &[FieldSpec; FIELD_COUNT], width: usize) -> FieldAllocation {
 }
 
 fn one_line_occupancy(widths: &[usize; FIELD_COUNT]) -> usize {
-    let rate = widths[TransferFieldId::Rate.index()];
-    let rate_part = if rate > 0 {
-        ONE_LINE_RATE_SEPARATOR + rate
-    } else {
-        0
-    };
-    ONE_LINE_SEPARATORS_WITHOUT_RATE
+    ONE_LINE_SEPARATORS
         + widths[TransferFieldId::Worker.index()]
         + widths[TransferFieldId::Phase.index()]
+        + widths[TransferFieldId::Destination.index()]
         + widths[TransferFieldId::Filename.index()]
         + widths[TransferFieldId::Size.index()]
-        + widths[TransferFieldId::Destination.index()]
-        + rate_part
+        + widths[TransferFieldId::Rate.index()]
 }
 
 fn allocate_stacked(specs: &[FieldSpec; FIELD_COUNT], width: usize) -> FieldAllocation {
@@ -1062,19 +1049,29 @@ fn allocate_stacked(specs: &[FieldSpec; FIELD_COUNT], width: usize) -> FieldAllo
     let mut widths = [0usize; FIELD_COUNT];
     widths[worker.id.index()] = worker.min;
     widths[phase.id.index()] = phase.min.min(phase.max);
-    let filename_budget = width.saturating_sub(
+    widths[size.id.index()] = size.min;
+    widths[rate.id.index()] = rate.min;
+
+    let dest_and_file_budget = width.saturating_sub(
         STACK_LINE1_SEPARATORS + widths[worker.id.index()] + widths[phase.id.index()],
     );
+    let dest_width = DESTINATION_MIN
+        .min(destination.max)
+        .min(dest_and_file_budget.saturating_sub(1))
+        .max(1.min(dest_and_file_budget));
+    widths[destination.id.index()] = dest_width;
+    let filename_budget = dest_and_file_budget.saturating_sub(dest_width);
     widths[filename.id.index()] = filename_budget
         .min(filename.max)
         .max(1.min(filename_budget));
 
-    widths[size.id.index()] = size.preferred.min(size.max);
-    widths[rate.id.index()] = rate.preferred.min(rate.max);
-    let dest_budget = width.saturating_sub(
+    let dest_line2_budget = width.saturating_sub(
         STACK_INDENT + STACK_LINE2_GAPS + widths[size.id.index()] + widths[rate.id.index()],
     );
-    widths[destination.id.index()] = dest_budget.min(destination.max).max(1.min(dest_budget));
+    widths[destination.id.index()] = dest_width
+        .min(dest_line2_budget)
+        .min(destination.max)
+        .max(1.min(dest_line2_budget));
 
     FieldAllocation {
         mode: TransferRowMode::Stacked,
@@ -1090,18 +1087,63 @@ fn transfer_destination(worker: &WorkerRowModel) -> &str {
     }
 }
 
-fn render_may4_transfer_row(worker: &WorkerRowModel, width: usize) -> Vec<String> {
+fn transfer_phase(worker: &WorkerRowModel) -> &str {
     if worker.idle {
-        return vec![pad_to_width(
-            &format!(
-                "  {}           idle                          --       --          --",
-                worker.worker_tag
-            ),
-            width,
-        )];
+        "idle"
+    } else {
+        worker
+            .phase
+            .map(|phase| phase.as_label())
+            .unwrap_or("copying")
     }
+}
 
-    let specs = transfer_field_specs(worker);
+fn transfer_filename(worker: &WorkerRowModel) -> &str {
+    if worker.idle { "--" } else { &worker.item }
+}
+
+fn pad_left(value: &str, width: usize) -> String {
+    format!("{value:<width$}", width = width)
+}
+
+fn fit_end(value: &str, width: usize) -> String {
+    pad_left(&truncate_end(value, width), width)
+}
+
+fn fit_middle(value: &str, width: usize) -> String {
+    pad_left(&truncate_middle(value, width), width)
+}
+
+struct TransferCells {
+    spinner: char,
+    worker_tag: String,
+    phase: String,
+    dest: String,
+    filename: String,
+    size: String,
+    rate: String,
+}
+
+fn transfer_cells(worker: &WorkerRowModel, alloc: FieldAllocation) -> TransferCells {
+    TransferCells {
+        spinner: worker.spinner_frame.unwrap_or(' '),
+        worker_tag: fit_end(&worker.worker_tag, alloc.width(TransferFieldId::Worker)),
+        phase: fit_end(transfer_phase(worker), alloc.width(TransferFieldId::Phase)),
+        dest: fit_end(
+            transfer_destination(worker),
+            alloc.width(TransferFieldId::Destination),
+        ),
+        filename: fit_middle(
+            transfer_filename(worker),
+            alloc.width(TransferFieldId::Filename),
+        ),
+        size: QtyUnitSlots::SIZE.format(&worker.size),
+        rate: QtyUnitSlots::RATE.format(&worker.time),
+    }
+}
+
+fn render_may4_transfer_row(worker: &WorkerRowModel, width: usize) -> Vec<String> {
+    let specs = transfer_field_specs();
     let alloc = allocate(&specs, width);
     match alloc.mode {
         TransferRowMode::OneLine => vec![render_may4_transfer_oneline(worker, alloc, width)],
@@ -1114,39 +1156,17 @@ fn render_may4_transfer_oneline(
     alloc: FieldAllocation,
     width: usize,
 ) -> String {
-    let spinner = worker.spinner_frame.unwrap_or(' ');
-    let phase = worker
-        .phase
-        .map(|phase| phase.as_label())
-        .unwrap_or("copying");
-    let worker_width = alloc.width(TransferFieldId::Worker);
-    let phase_width = alloc.width(TransferFieldId::Phase);
-    let filename_width = alloc.width(TransferFieldId::Filename);
-    let size_width = alloc.width(TransferFieldId::Size);
-    let rate_width = alloc.width(TransferFieldId::Rate);
-    let dest_width = alloc.width(TransferFieldId::Destination);
-    let rate_segment = if rate_width > 0 {
-        format!(
-            "  {:>rate_width$}",
-            truncate_right(&worker.time, rate_width),
-            rate_width = rate_width
-        )
-    } else {
-        String::new()
-    };
-
+    let cells = transfer_cells(worker, alloc);
     pad_to_width(
         &format!(
-            "{spinner} {:<worker_width$}  {:<phase_width$}  {:<filename_width$}  {:>size_width$}{rate_segment}  {:<dest_width$}",
-            worker.worker_tag,
-            truncate_middle(phase, phase_width),
-            truncate_middle(&worker.item, filename_width),
-            truncate_middle(&worker.size, size_width),
-            truncate_middle(transfer_destination(worker), dest_width),
-            worker_width = worker_width,
-            phase_width = phase_width,
-            filename_width = filename_width,
-            dest_width = dest_width
+            "{} {}  {}  {}  {}  {}  {}",
+            cells.spinner,
+            cells.worker_tag,
+            cells.phase,
+            cells.dest,
+            cells.filename,
+            cells.size,
+            cells.rate
         ),
         width,
     )
@@ -1157,35 +1177,17 @@ fn render_may4_transfer_stacked(
     alloc: FieldAllocation,
     width: usize,
 ) -> Vec<String> {
-    let spinner = worker.spinner_frame.unwrap_or(' ');
-    let phase = worker
-        .phase
-        .map(|phase| phase.as_label())
-        .unwrap_or("copying");
-    let worker_width = alloc.width(TransferFieldId::Worker);
-    let phase_width = alloc.width(TransferFieldId::Phase);
-    let filename_width = alloc.width(TransferFieldId::Filename);
-    let size_width = alloc.width(TransferFieldId::Size);
-    let rate_width = alloc.width(TransferFieldId::Rate);
-    let dest_width = alloc.width(TransferFieldId::Destination);
-
+    let cells = transfer_cells(worker, alloc);
     let line1 = format!(
-        "{spinner} {:<worker_width$}  {:<phase_width$}  {:<filename_width$}",
-        worker.worker_tag,
-        truncate_middle(phase, phase_width),
-        truncate_middle(&worker.item, filename_width),
-        worker_width = worker_width,
-        phase_width = phase_width,
-        filename_width = filename_width
+        "{} {}  {}  {}  {}",
+        cells.spinner, cells.worker_tag, cells.phase, cells.dest, cells.filename
     );
     let line2 = format!(
-        "{}{:>size_width$}   {:>rate_width$}  → {}",
+        "{}{}  {}  {}",
         " ".repeat(STACK_INDENT),
-        truncate_middle(&worker.size, size_width),
-        truncate_right(&worker.time, rate_width),
-        truncate_middle(transfer_destination(worker), dest_width),
-        size_width = size_width,
-        rate_width = rate_width
+        cells.dest,
+        cells.size,
+        cells.rate
     );
 
     vec![pad_to_width(&line1, width), pad_to_width(&line2, width)]
@@ -1194,17 +1196,18 @@ fn render_may4_transfer_stacked(
 fn render_may4_target_progress_row(target: &TargetProgressRowModel, width: usize) -> String {
     let bar_width = if width < 90 { 16 } else { TARGET_BAR_WIDTH };
     let bar = progress_bar_string_with_empty(target.percent, bar_width, '-');
-    let label = truncate_middle(&target.target, if width < 100 { 8 } else { 10 });
-    let bytes = compact_bytes_range(&target.bytes);
+    let label = fit_end(&target.target, TARGET_LABEL_WIDTH);
+    let bytes = format_bytes_range(&target.bytes);
+    let rate = QtyUnitSlots::RATE.format(&target.rate);
 
     let line = if width < 85 {
-        format!("{:<10} {}  {}", label, bar, bytes)
+        format!("{label} {bar}  {bytes}")
     } else if width < 110 {
-        format!("{:<10} {}  {:<16} {:>10}", label, bar, bytes, target.rate)
+        format!("{label} {bar}  {bytes}  {rate}")
     } else {
         format!(
-            "{:<10} {}  {:<16} {:>10}   {} active",
-            label, bar, bytes, target.rate, target.active_workers
+            "{label} {bar}  {bytes}  {rate}   {} active",
+            target.active_workers
         )
     };
 
@@ -1281,6 +1284,20 @@ fn truncate_middle(value: &str, max_chars: usize) -> String {
     let head: String = chars[..head_len].iter().collect();
     let tail: String = chars[chars.len() - tail_len..].iter().collect();
     format!("{head}…{tail}")
+}
+
+fn truncate_end(value: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= max_chars {
+        return value.to_string();
+    }
+
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+
+    let head: String = chars[..max_chars - 1].iter().collect();
+    format!("{head}…")
 }
 
 fn truncate_right(value: &str, max_chars: usize) -> String {
