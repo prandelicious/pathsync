@@ -294,10 +294,16 @@ fn public_preview_ui_output_can_render_live_and_post_copy_screens() {
     let may4 = preview_ui_output(PreviewUiMode::May4Live);
 
     assert!(live.contains("LIVE / COPY-LARGE"));
+    assert!(live.contains("Active transfers"));
+    assert!(!live.contains("┌ Run "));
+    assert!(!live.contains("overall copying large files"));
     assert!(!live.contains("ATTENTION"));
     assert!(post.contains("ATTENTION"));
     assert!(!post.contains("LIVE / COPY-LARGE"));
     assert!(all.contains("LIVE / COPY-LARGE"));
+    assert!(all.contains("Active transfers"));
+    assert!(!all.contains("┌ Run "));
+    assert!(!all.contains("overall copying large files"));
     assert!(all.contains("ATTENTION"));
     assert!(may4.contains("Active transfers"));
     assert!(!may4.contains("┌ Run "));

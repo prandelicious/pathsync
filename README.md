@@ -38,11 +38,19 @@ This repo defines the common workflows in `Justfile`:
 just build
 just install
 just clean
+just cleanup
+just bump patch   # or: minor | major
+just release      # bump patch, commit, tag, push (optional: just release minor)
 ```
 
 - `just build` builds `target/release/pathsync`
 - `just install` copies that binary to `~/.local/bin/pathsync`
-- `just clean` removes build artifacts
+- `just clean` removes Cargo build artifacts only
+- `just cleanup` runs `clean`, drops local scratch (`.superpowers/brainstorm`), removes `.DS_Store` files, and prunes stale git worktree metadata
+- `just bump <level>` updates `version` in `Cargo.toml` via `cargo set-version` (needs [cargo-edit](https://github.com/killercup/cargo-edit))
+- `just release [level]` runs a clean-tree bump, commits `chore: release vX.Y.Z`, tags `vX.Y.Z`, and pushes branch + tag
+
+`pathsync --version` reads that same `Cargo.toml` field through clap.
 
 ### Using Cargo directly
 

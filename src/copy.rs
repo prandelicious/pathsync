@@ -20,7 +20,7 @@ use crate::lanes::{self, LaneEntry, LaneWorkerLayout};
 use crate::plan::{PlanningStats, TransferPlan};
 use crate::policy::TransferPolicy;
 use crate::progress_format::{
-    GlyphSet, plain_progress_line, render_live_screen_with_width_and_glyphs,
+    GlyphSet, plain_progress_line, render_may4_live_screen_with_width_and_glyphs,
     render_post_run_screen_with_width_and_glyphs, worker_label, worker_line, worker_prefix,
 };
 use crate::progress_model::{
@@ -2140,7 +2140,7 @@ fn render_progress_tty(
 
         if should_redraw {
             let (_, columns) = term.size();
-            let lines = render_live_screen_with_width_and_glyphs(
+            let lines = render_may4_live_screen_with_width_and_glyphs(
                 &build_live_screen_model(&context, &state, &worker_states, &report, Instant::now()),
                 usize::from(columns),
                 glyphs,

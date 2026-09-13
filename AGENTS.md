@@ -169,7 +169,8 @@ For this Rust project, use `just` to invoke common tasks:
 |---------|-------------|
 | `just build` | Build release binary to `target/release/pathsync` |
 | `just install` | Build and install binary to `~/.local/bin/` |
-| `just clean` | Remove build artifacts |
+| `just clean` | Remove Cargo build artifacts |
+| `just cleanup` | Workspace hygiene: `clean` + scratch/worktree prune |
 
 For code quality checks, run these directly:
 
